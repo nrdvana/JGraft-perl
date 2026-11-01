@@ -1,0 +1,3 @@
+[submodule "jgraft-spec"]
+	path = jgraft-spec
+	url = git@github.com:nrdvana/JGraft
