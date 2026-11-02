@@ -9,6 +9,10 @@ RUN apt-get update && apt-get install -y \
       bzip2 gzip unzip zip curl gosu jq lsof procps git \
       gcc-12 libc6-dev make patch \
       perl libdatetime-perl libpath-tiny-perl libio-all-perl libtest2-suite-perl \
+      libdist-zilla-perl libdist-zilla-plugin-git-perl \
+      libdist-zilla-plugin-ourpkgversion-perl libdist-zilla-plugin-podweaver-perl \
+      libdist-zilla-plugin-makemaker-awesome-perl \
+      libtest-pod-perl libtest-pod-coverage-perl libpod-coverage-trustpod-perl \
  && ln -s /usr/bin/gcc-12 /usr/local/bin/gcc \
  && rm -rf /var/lib/apt/lists/*
 
@@ -20,6 +24,7 @@ RUN apt-get update && apt-get install -y \
 # that would not be visible to the separate Perl 5.8 installation.
 # Test2's tests need parent. Bootstrap with a release whose tests work with
 # Perl 5.8's bundled Test::More, before Test2 installs the newer Test::More.
+# Test::Pod::Coverage::Configurable is the author plugin not packaged by Debian.
 RUN cd /tmp \
  && curl -fL https://cpan.metacpan.org/authors/id/M/MI/MIYAGAWA/App-cpanminus-1.7048.tar.gz \
       -o cpanminus.tar.gz \
@@ -27,7 +32,7 @@ RUN cd /tmp \
       | sha256sum -c - \
  && tar xzf cpanminus.tar.gz \
  && perl App-cpanminus-1.7048/bin/cpanm --mirror https://cpan.metacpan.org --mirror-only \
-      Devel::PatchPerl@2.14 \
+      Devel::PatchPerl@2.14 Dist::Zilla::Plugin::Test::Pod::Coverage::Configurable \
  && curl -fL https://www.cpan.org/src/5.0/perl-5.8.9.tar.gz -o perl-5.8.9.tar.gz \
  && echo '60dfe024286299b547895b6bc8f41c20c7e83d292f3a406e113ba1951aa38da1  perl-5.8.9.tar.gz' \
       | sha256sum -c - \
@@ -47,5 +52,5 @@ RUN cd /tmp \
  && rm -rf /tmp/perl-5.8.9 /tmp/perl-5.8.9.tar.gz \
       /tmp/App-cpanminus-1.7048 /tmp/cpanminus.tar.gz /root/.cpanm
 
-# Run legacy tests with: PATH=/opt/perl-5.8.9/bin:$PATH prove -lr t
+# Run legacy tests with: perl5.8 Makefile.PL && make test
 # Or invoke perl5.8 / prove5.8 directly. The system Perl remains the default.
