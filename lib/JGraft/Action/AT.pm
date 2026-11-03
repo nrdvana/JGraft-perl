@@ -19,7 +19,7 @@ An arrayref of pre-parsed action objects.
 
 =attribute path
 
-A NODE reference, or a scalar shorthand for one.
+A NODE reference, a scalar shorthand for one, or an EXPR alias resolving to NODE.
 
 =constructor new
 

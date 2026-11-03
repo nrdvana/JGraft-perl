@@ -4,7 +4,7 @@ package JGraft::_Node;
 use strict;
 use warnings;
 use Scalar::Util qw(blessed refaddr);
-use JGraft::Util ();
+use JGraft::Util ':types';
 use JSON::PP ();
 
 # Keep the constructor's private names while sharing predicates with execution.
@@ -168,6 +168,9 @@ sub _argument {
       }
       _is_expr($value) && $value->is_ref or _bad('Path must be a reference expression');
       my $name= $value->_name;
+      # A common expression can name a reference in any lexical scope. Check
+      # the resolved namespace and path restrictions when it is invoked.
+      return $value if $name eq 'EXPR';
       $context eq 'node_path' && $name ne 'NODE' and _bad('This path must use NODE');
       if ($context =~ /^(?:write_path|move_src|move_dst)$/) {
          $name =~ /^(?:NODE|TEMP|STASH)$/ or _bad("Read-only path namespace $name");
@@ -182,7 +185,7 @@ sub _argument {
    else { $value= _tree($value, $parse, $seen) }
    if ($context eq 'int' || $context eq 'nonneg_int' || $context eq 'rep_max' || $context eq 'nullable_int') {
       return $value if !defined $value && $context eq 'nullable_int';
-      _expect($value, 4, 'integer');
+      _expect($value, TYPE_NUMBER, 'integer');
       unless (_is_expr($value)) {
          _integer($value) or _bad('Expected a finite integer');
          $context eq 'nonneg_int' && $value < 0 and _bad('Expected a non-negative integer');
@@ -190,30 +193,30 @@ sub _argument {
       }
    }
    elsif ($context eq 'bound') {
-      _expect($value, 1|4, 'number or null');
+      _expect($value, TYPE_NULL | TYPE_NUMBER, 'number or null');
       !defined $value || _is_expr($value) || _finite($value) or _bad('Range bounds must be finite');
    }
    elsif ($context eq 'name') {
-      _expect($value, 4|8, 'string or integer name');
-      _is_expr($value) || _type($value) == 8 || _integer($value) or _bad('Name must be a string or integer');
+      _expect($value, TYPE_NUMBER | TYPE_STRING, 'string or integer name');
+      _is_expr($value) || _type($value) == TYPE_STRING || _integer($value) or _bad('Name must be a string or integer');
    }
    elsif ($context eq 'capture_name') {
-      _expect($value, 1|4|8, 'capture name or null');
-      !defined $value || _is_expr($value) || _type($value) == 8 || _integer($value)
+      _expect($value, TYPE_NULL | TYPE_NUMBER | TYPE_STRING, 'capture name or null');
+      !defined $value || _is_expr($value) || _type($value) == TYPE_STRING || _integer($value)
          or _bad('Capture name must be a string or integer');
    }
    elsif ($context eq 'prop' || $context eq 'numeric_prop') {
       my $type= _type($value);
-      ($type == 8 || ($type == 4 && ($context ne 'prop'? _finite($value) : _integer($value))))
+      ($type == TYPE_STRING || ($type == TYPE_NUMBER && ($context ne 'prop'? _finite($value) : _integer($value))))
          or _bad('Invalid literal property name');
    }
    elsif ($context eq 'level') {
       my $type= _type($value);
-      (($type == 8 && $value =~ /\A(?:info|warn|fail)\z/) || ($type == 4 && _integer($value) && $value >= 0 && $value <= 2))
+      (($type == TYPE_STRING && $value =~ /\A(?:info|warn|fail)\z/) || ($type == TYPE_NUMBER && _integer($value) && $value >= 0 && $value <= 2))
          or _bad('RAISE level must be info, warn, fail, 0, 1, or 2');
    }
    elsif ($context eq 'message' && !_is_expr($value)) {
-      _type($value) == 8 or _bad('RAISE message must be a string');
+      _type($value) == TYPE_STRING or _bad('RAISE message must be a string');
       for my $char (split //, $value) {
          my $cp= ord $char;
          ($cp < 32 || ($cp >= 127 && $cp <= 159) || ($cp >= 0xd800 && $cp <= 0xdfff)
@@ -222,7 +225,7 @@ sub _argument {
       }
    }
    elsif ($context eq 'options') {
-      _type($value) == 4 && ($value == 1 || $value == 2) or _bad('PROPS options must be numeric 1 or 2');
+      _type($value) == TYPE_NUMBER && ($value == 1 || $value == 2) or _bad('PROPS options must be numeric 1 or 2');
    }
    elsif ($context eq 'regex') { _regex_value($value) }
    elsif ($context eq 'chars') { _chars_value($value) }
@@ -282,10 +285,10 @@ sub _path_elements {
    }
    for my $i (0..$#elements) {
       my $v= $elements[$i];
-      if (_is_expr($v)) { _expect($v, 2|4|8|16, 'path selector'); next }
+      if (_is_expr($v)) { _expect($v, TYPE_BOOLEAN | TYPE_NUMBER | TYPE_STRING | TYPE_ARRAY, 'path selector'); next }
       my $type= _type($v);
-      next if $type == 8 || ($type == 2 && !$v);
-      if ($type == 4 && _finite($v)) {
+      next if $type == TYPE_STRING || ($type == TYPE_BOOLEAN && !$v);
+      if ($type == TYPE_NUMBER && _finite($v)) {
          next if _integer($v) || ($half && $i == $#elements && $v * 2 == int($v * 2));
       }
       _bad('Invalid literal path selector');
@@ -296,7 +299,7 @@ sub _regex_value {
    my $v= shift;
    return if _is_expr($v);
    my $type= _type($v);
-   return if $type == 8 || ($type == 4 && _integer($v) && $v >= 0 && $v <= 0x10ffff);
+   return if $type == TYPE_STRING || ($type == TYPE_NUMBER && _integer($v) && $v >= 0 && $v <= 0x10ffff);
    _bad('Regex operands must be strings, codepoints, or expressions');
 }
 
@@ -307,8 +310,8 @@ sub _chars_value {
       return;
    }
    my $type= _type($v);
-   return if $type == 1 || $type == 2 || $type == 8;
-   return if $type == 4 && _integer($v) && $v >= 0 && $v <= 0x10ffff;
+   return if $type == TYPE_NULL || $type == TYPE_BOOLEAN || $type == TYPE_STRING;
+   return if $type == TYPE_NUMBER && _integer($v) && $v >= 0 && $v <= 0x10ffff;
    _bad('Invalid CHARS operand');
 }
 
@@ -336,7 +339,7 @@ sub _metadata {
       _integer($copy{v}) && $copy{v} >= 1 or _bad('Metadata v must be a positive integer');
    }
    for my $key ('writer', 'comment') {
-      !exists $copy{$key} || _type($copy{$key}) == 8 or _bad("Metadata $key must be a string");
+      !exists $copy{$key} || _type($copy{$key}) == TYPE_STRING or _bad("Metadata $key must be a string");
    }
    return \%copy;
 }
@@ -345,7 +348,7 @@ sub _split_spec {
    my ($value, $parse, $seen)= @_;
    unless (ref $value eq 'HASH') {
       $value= _tree($value, $parse, $seen);
-      return $value if _type($value) == 8 || (_is_expr($value) && ($value->is_match || $value->is_ref));
+      return $value if _type($value) == TYPE_STRING || (_is_expr($value) && ($value->is_match || $value->is_ref));
       _bad('Split specification must be a string, match/reference expression, or literal object');
    }
    my $addr= refaddr($value);
@@ -364,11 +367,11 @@ sub _split_spec {
          $copy{$key}= _tree($value->{$key}, $parse, $seen);
       }
       elsif ($key eq 'discard') {
-         _type($value->{$key}) == 2 or _bad('discard must be a literal boolean');
+         _type($value->{$key}) == TYPE_BOOLEAN or _bad('discard must be a literal boolean');
          $copy{$key}= $value->{$key};
       }
       elsif ($key eq 'keep') {
-         _type($value->{$key}) == 8 && $value->{$key} =~ /\A[<>\@]\z/ or _bad('Invalid keep value');
+         _type($value->{$key}) == TYPE_STRING && $value->{$key} =~ /\A[<>\@]\z/ or _bad('Invalid keep value');
          $copy{$key}= $value->{$key};
       }
       else { _bad("Unknown split property '$key'") }

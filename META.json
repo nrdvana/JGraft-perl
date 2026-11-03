@@ -35,6 +35,7 @@
             "JSON::PP" : "0",
             "POSIX" : "0",
             "Scalar::Util" : "0",
+            "constant" : "0",
             "overload" : "0",
             "perl" : "5.008009",
             "strict" : "0",

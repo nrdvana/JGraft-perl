@@ -260,7 +260,7 @@ use experimental 'signatures';
 #use warnings;
 #__end__
 use Carp;
-use JGraft::Util qw(is_expr type_mask invalid_graft);
+use JGraft::Util qw(:types is_expr type_mask invalid_graft);
 require JGraft::_Node;
 our @ISA= ('JGraft::_Node');
 
@@ -292,11 +292,10 @@ The ID number of this expression
 
 =attribute returns
 
-The declared result-type bitmask for a concrete class: null=1, boolean=2,
-number=4, string=8, array=16, object=32, and date=64. Zero means no successful
-result; 127 permits any type. Class calls return the declared capabilities;
+The result-type bitmask using L<JGraft::Util/TYPE CONSTANTS>. C<TYPE_NONE> means
+no successful result; C<TYPE_ANY> permits any type. Class calls return the declared capabilities;
 instance calls may refine these using their operands. LOCAL instances return
-the type of their return-value operand, while LOCAL class calls return 127.
+the type of their return-value operand, while LOCAL class calls return C<TYPE_ANY>.
 
 =attribute forms
 
@@ -431,37 +430,37 @@ sub _define_expr {
 }
 
 # Name, protocol ID, potential result types, operand forms.
-_define_expr(EXPR => -5, 127,
+_define_expr(EXPR => -5, TYPE_ANY,
    {  fields => [[ name => 'name' ]],
       min => 1
    }
 );
-_define_expr(CAP => -4, 127,
+_define_expr(CAP => -4, TYPE_ANY,
    {  repeat => [ path => 'value' ],
       min => 0
    }
 );
-_define_expr(TEMP => -3, 127,
+_define_expr(TEMP => -3, TYPE_ANY,
    {  repeat => [ path => 'value' ],
       min => 1
    }
 );
-_define_expr(STASH => -2, 127,
+_define_expr(STASH => -2, TYPE_ANY,
    {  repeat => [ path => 'value' ],
       min => 0
    }
 );
-_define_expr(CONST => -1, 127,
+_define_expr(CONST => -1, TYPE_ANY,
    {  repeat => [ path => 'value' ],
       min => 0
    }
 );
-_define_expr(NODE => 0, 127,
+_define_expr(NODE => 0, TYPE_ANY,
    {  repeat => [ path => 'value' ],
       min => 0
    }
 );
-_define_expr(HAS => 1, 2,
+_define_expr(HAS => 1, TYPE_BOOLEAN,
    {  fields => [[ match_spec => 'match' ]],
       min => 1
    },
@@ -470,7 +469,7 @@ _define_expr(HAS => 1, 2,
       min => 2
    }
 );
-_define_expr(IS => 2, 2,
+_define_expr(IS => 2, TYPE_BOOLEAN,
    {  fields => [[ match_spec => 'match' ]],
       min => 1
    },
@@ -479,27 +478,27 @@ _define_expr(IS => 2, 2,
       min => 2
    }
 );
-_define_expr(NONE => 3, 2,
+_define_expr(NONE => 3, TYPE_BOOLEAN,
    {  repeat => [ match_exprs => 'match' ],
       min => 0
    }
 );
-_define_expr(ANY => 4, 2,
+_define_expr(ANY => 4, TYPE_BOOLEAN,
    {  repeat => [ match_exprs => 'match' ],
       min => 1
    }
 );
-_define_expr(ALL => 5, 2,
+_define_expr(ALL => 5, TYPE_BOOLEAN,
    {  repeat => [ match_exprs => 'match' ],
       min => 1
    }
 );
-_define_expr(EXISTS => 6, 2,
+_define_expr(EXISTS => 6, TYPE_BOOLEAN,
    {  fields => [],
       min => 0
    }
 );
-_define_expr(ARRAY => 7, 2,
+_define_expr(ARRAY => 7, TYPE_BOOLEAN,
    {  fields => [],
       min => 0
    },
@@ -511,109 +510,109 @@ _define_expr(ARRAY => 7, 2,
       min => 2
    }
 );
-_define_expr(STR => 8, 2,
+_define_expr(STR => 8, TYPE_BOOLEAN,
    {  fields => [[ regex_expr => 'regex' ]],
       min => 0
    }
 );
-_define_expr(NUM => 9, 2,
+_define_expr(NUM => 9, TYPE_BOOLEAN,
    {  fields => [[ min => 'bound', undef ],
                  [ max => 'bound' ]],
       min => 0
    }
 );
-_define_expr(BOOL => 10, 2,
+_define_expr(BOOL => 10, TYPE_BOOLEAN,
    {  fields => [],
       min => 0
    }
 );
-_define_expr(DATE => 11, 2,
+_define_expr(DATE => 11, TYPE_BOOLEAN,
    {  fields => [],
       min => 0
    }
 );
-_define_expr(WITH => 12, 2,
+_define_expr(WITH => 12, TYPE_BOOLEAN,
    {  repeat => [ bindings => 'prop', 'value' ],
       tail =>   [ match_expr => 'match' ],
       min => 3
    }
 );
-_define_expr(SEQ => 13, 2,
+_define_expr(SEQ => 13, TYPE_BOOLEAN,
    {  repeat => [ match_exprs => 'match' ],
       min => 0
    }
 );
-_define_expr(SEQMAX => 14, 2,
+_define_expr(SEQMAX => 14, TYPE_BOOLEAN,
    {  fields => [[ capture_name => 'capture_name' ]],
       repeat =>  [ match_exprs => 'match' ],
       min => 1
    }
 );
-_define_expr(SEQMIN => 15, 2,
+_define_expr(SEQMIN => 15, TYPE_BOOLEAN,
    {  fields => [[ capture_name => 'capture_name' ]],
       repeat =>  [ match_exprs => 'match' ],
       min => 1
    }
 );
-_define_expr(REP => 16, 2,
+_define_expr(REP => 16, TYPE_BOOLEAN,
    {  fields => [[ min => 'nonneg_int', 0 ],
                  [ max => 'rep_max', -1 ],
                  [ match_expr => 'match' ]],
       min => 0
    }
 );
-_define_expr(START => 17, 2,
+_define_expr(START => 17, TYPE_BOOLEAN,
    {  fields => [],
       min => 0
    }
 );
-_define_expr(END => 18, 2,
+_define_expr(END => 18, TYPE_BOOLEAN,
    {  fields => [],
       min => 0
    }
 );
-_define_expr(CHARS => 19, 2,
+_define_expr(CHARS => 19, TYPE_BOOLEAN,
    {  repeat => [ entries => 'chars' ],
       min => 0
    }
 );
-_define_expr(CAPTURE => 50, 34,
+_define_expr(CAPTURE => 50, TYPE_BOOLEAN | TYPE_OBJECT,
    {  fields => [[ match_expr => 'match' ]],
       min => 1
    }
 );
-_define_expr(LOCAL => 51, 127,
+_define_expr(LOCAL => 51, TYPE_ANY,
    {  repeat => [ bindings => 'local_prop', 'value' ],
       tail =>   [ return_value_expr => 'value' ],
       min => 1
    }
 );
-_define_expr(NOT => 52, 2,
+_define_expr(NOT => 52, TYPE_BOOLEAN,
    {  repeat => [ value_exprs => 'value' ],
       min => 1
    }
 );
-_define_expr(AND => 53, 2,
+_define_expr(AND => 53, TYPE_BOOLEAN,
    {  repeat => [ value_exprs => 'value' ],
       min => 1
    }
 );
-_define_expr(OR => 54, 2,
+_define_expr(OR => 54, TYPE_BOOLEAN,
    {  repeat => [ value_exprs => 'value' ],
       min => 1
    }
 );
-_define_expr(LENGTH => 55, 4,
+_define_expr(LENGTH => 55, TYPE_NUMBER,
    {  fields => [[ value_expr => 'value' ]],
       min => 0
    }
 );
-_define_expr(CURPROP => 56, 13,
+_define_expr(CURPROP => 56, TYPE_NULL | TYPE_NUMBER | TYPE_STRING,
    {  fields => [],
       min => 0
    }
 );
-_define_expr(SLICE => 57, 24,
+_define_expr(SLICE => 57, TYPE_STRING | TYPE_ARRAY,
    {  fields => [[ config_obj => 'value' ]],
       min => 1
    },
@@ -623,12 +622,12 @@ _define_expr(SLICE => 57, 24,
       min => 2
    }
 );
-_define_expr(CONCAT => 58, 24,
+_define_expr(CONCAT => 58, TYPE_STRING | TYPE_ARRAY,
    {  repeat => [ value_exprs => 'value' ],
       min => 1
    }
 );
-_define_expr(REDUCE => 59, 127,
+_define_expr(REDUCE => 59, TYPE_ANY,
    {  fields => [[ reduce_expr => 'value' ],
                  [ temp_prop => 'numeric_prop' ],
                  [ initial_value => 'value' ],
@@ -636,37 +635,37 @@ _define_expr(REDUCE => 59, 127,
       min => 3
    }
 );
-_define_expr(FILTER => 60, 16,
+_define_expr(FILTER => 60, TYPE_ARRAY,
    {  fields => [[ match_expr => 'match' ],
                  [ array_expr => 'value' ]],
       min => 1
    }
 );
-_define_expr(MAP => 61, 16,
+_define_expr(MAP => 61, TYPE_ARRAY,
    {  fields => [[ transform_expr => 'value' ],
                  [ array_expr => 'value' ]],
       min => 1
    }
 );
-_define_expr(SPLIT => 62, 16,
+_define_expr(SPLIT => 62, TYPE_ARRAY,
    {  fields => [[ split_spec => 'split' ],
                  [ string_expr => 'value' ]],
       min => 1
    }
 );
-_define_expr(JOIN => 63, 8,
+_define_expr(JOIN => 63, TYPE_STRING,
    {  fields => [[ split_spec => 'split' ],
                  [ array_expr => 'value' ]],
       min => 1
    }
 );
-_define_expr(PROPS => 64, 16,
+_define_expr(PROPS => 64, TYPE_ARRAY,
    {  fields => [[ object_expr => 'value' ],
                  [ options => 'options' ]],
       min => 0
    }
 );
-_define_expr(MKOBJ => 65, 32,
+_define_expr(MKOBJ => 65, TYPE_OBJECT,
    {  fields => [[ prop_array_expr => 'value' ]],
       min => 1
    },
@@ -674,39 +673,39 @@ _define_expr(MKOBJ => 65, 32,
       min => 0
    }
 );
-_define_expr(CASE => 66, 127,
+_define_expr(CASE => 66, TYPE_ANY,
    {  repeat => [ branches => 'match', 'value' ],
       tail =>   [ else_value_expr => 'value' ],
       optional_tail => 1,
       min => 2
    }
 );
-_define_expr(FAIL => 67, 0,
+_define_expr(FAIL => 67, TYPE_NONE,
    {  fields => [],
       min => 0
    }
 );
-_define_expr(CASTBOOL => 68, 2,
+_define_expr(CASTBOOL => 68, TYPE_BOOLEAN,
    {  fields => [[ value_expr => 'value' ]],
       min => 0
    }
 );
-_define_expr(CASTNUM => 69, 4,
+_define_expr(CASTNUM => 69, TYPE_NUMBER,
    {  fields => [[ value_expr => 'value' ]],
       min => 0
    }
 );
-_define_expr(CASTSTR => 70, 8,
+_define_expr(CASTSTR => 70, TYPE_STRING,
    {  fields => [[ value_expr => 'value' ]],
       min => 0
    }
 );
-_define_expr(CASTDATE => 71, 64,
+_define_expr(CASTDATE => 71, TYPE_DATE,
    {  fields => [[ value_expr => 'value' ]],
       min => 0
    }
 );
-_define_expr(LESS => 72, 2,
+_define_expr(LESS => 72, TYPE_BOOLEAN,
    {  fields => [[ expr_b => 'value' ]],
       min => 1
    },
@@ -715,7 +714,7 @@ _define_expr(LESS => 72, 2,
       min => 2
    }
 );
-_define_expr(LESSEQ => 73, 2,
+_define_expr(LESSEQ => 73, TYPE_BOOLEAN,
    {  fields => [[ expr_b => 'value' ]],
       min => 1
    },
@@ -724,29 +723,29 @@ _define_expr(LESSEQ => 73, 2,
       min => 2
    }
 );
-_define_expr(ADD => 74, 4,
+_define_expr(ADD => 74, TYPE_NUMBER,
    {  repeat => [ value_exprs => 'value' ],
       min => 0
    }
 );
-_define_expr(SUB => 75, 4,
+_define_expr(SUB => 75, TYPE_NUMBER,
    {  fields => [[ value_expr1 => 'value' ],
                  [ value_expr2 => 'value' ]],
       min => 2
    }
 );
-_define_expr(MUL => 76, 4,
+_define_expr(MUL => 76, TYPE_NUMBER,
    {  repeat => [ value_exprs => 'value' ],
       min => 0
    }
 );
-_define_expr(DIV => 77, 4,
+_define_expr(DIV => 77, TYPE_NUMBER,
    {  fields => [[ value_expr1 => 'value' ],
                  [ value_expr2 => 'value' ]],
       min => 2
    }
 );
-_define_expr(MOD => 78, 4,
+_define_expr(MOD => 78, TYPE_NUMBER,
    {  fields => [[ value_expr1 => 'value' ],
                  [ value_expr2 => 'value' ]],
       min => 2
@@ -755,7 +754,7 @@ _define_expr(MOD => 78, 4,
 
 sub JGraft::Expr::LOCAL::returns {
    my $self=shift;
-   return ref($self)? type_mask($self->{return_value_expr}) : 127;
+   return ref($self)? type_mask($self->{return_value_expr}) : TYPE_ANY;
 }
 
 sub JGraft::Expr::Ref::_validate {
@@ -801,8 +800,8 @@ sub _codepoint {
    return 0x10ffff unless defined $v;
    return if is_expr($v);
    my $type=type_mask($v);
-   return $v if $type==4;
-   return ord($v) if $type==8 && length($v)==1;
+   return $v if $type==TYPE_NUMBER;
+   return ord($v) if $type==TYPE_STRING && length($v)==1;
    return;
 }
 
@@ -815,7 +814,7 @@ sub JGraft::Expr::JOIN::_validate {
    if (ref($split) eq 'HASH' && is_expr($split->{sep}) && $split->{sep}->is_match) {
       exists $split->{keep} || exists $split->{default}
          or JGraft::_Node::_bad('Regex joining requires a default separator');
-      JGraft::_Node::_expect($split->{default},8,'string separator') unless exists $split->{keep};
+      JGraft::_Node::_expect($split->{default},TYPE_STRING,'string separator') unless exists $split->{keep};
    }
 }
 

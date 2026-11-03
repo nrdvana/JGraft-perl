@@ -4,7 +4,7 @@ use lib 't/lib';
 use Test2AndUtils;
 use JGraft qw(:constructors jgexec);
 use JGraft::Exec;
-use JGraft::Util qw(type_mask is_finite is_integer);
+use JGraft::Util qw(:types type_mask is_finite is_integer);
 use Scalar::Util qw(refaddr blessed);
 use JSON::PP ();
 my $json=JSON::PP->new->canonical->allow_nonref;
@@ -78,8 +78,12 @@ for my $value (1,'1',undef,JSON::PP::false) {
    type_mask($value); is_finite($value); is_integer($value);
    is($json->encode($value),$before,'type predicates preserve scalar flags');
 }
-is(type_mask(1),4,'number type');
-is(type_mask('1'),8,'string type');
+is([TYPE_NONE,TYPE_NULL,TYPE_BOOLEAN,TYPE_NUMBER,TYPE_STRING,TYPE_ARRAY,TYPE_OBJECT,TYPE_DATE,TYPE_ANY],
+   [0,1,2,4,8,16,32,64,127],'exported type constants retain their bit assignments');
+is(TYPE_NULL | TYPE_BOOLEAN | TYPE_NUMBER | TYPE_STRING | TYPE_ARRAY | TYPE_OBJECT | TYPE_DATE,
+   TYPE_ANY,'TYPE_ANY includes all type bits');
+is(type_mask(1),TYPE_NUMBER,'number type');
+is(type_mask('1'),TYPE_STRING,'string type');
 ok(!is_finite('1'),'numeric string is not numeric data');
 
 $exec=JGraft::Exec->new(jgraft=>'["JGRAFT",{},["COPY",2,"x"]]');

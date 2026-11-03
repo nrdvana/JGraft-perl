@@ -7,7 +7,7 @@ no warnings 'recursion';
 use Carp 'croak';
 use Scalar::Util qw(blessed refaddr);
 use JSON::PP ();
-use JGraft::Util qw(type_mask is_finite is_integer is_expr is_action);
+use JGraft::Util qw(:types type_mask is_finite is_integer is_expr is_action);
 use overload '""' => 'as_string', 'bool' => sub { 1 }, fallback => 1;
 
 sub new {
@@ -156,22 +156,22 @@ sub _inspect {
    }
    my $type= type_mask($v);
    if (!ref $v || JSON::PP::is_bool($v)) {
-      $self->_step(length($v)*.001) if $type == 8;
-      $type != 4 || is_finite($v) or $self->_fail('UNSUPPORTED_GRAFT','Non-finite input number');
+      $self->_step(length($v)*.001) if $type == TYPE_STRING;
+      $type != TYPE_NUMBER || is_finite($v) or $self->_fail('UNSUPPORTED_GRAFT','Non-finite input number');
       return;
    }
    ref($v) eq 'ARRAY' || ref($v) eq 'HASH' or $self->_fail('UNSUPPORTED_GRAFT','Unsupported data reference '.ref($v));
    my $id=refaddr($v);
    $active->{$id} and $self->_fail($ast?'INVALID_GRAFT':'INVALID_TARGET','Cyclic data');
    local $active->{$id}=1;
-   my $n= $type==16? scalar @$v : scalar keys %$v;
+   my $n= $type==TYPE_ARRAY? scalar @$v : scalar keys %$v;
    if (!$ast && $self->{undo_state} && !$self->{undo_state}{original_ids}{$id}) {
       $self->_charge('mem',32);
       $self->{undo_state}{original_ids}{$id}=1;
    }
    $self->_step($n);
-   $self->_allocation(($type==16?80:128)+($type==16?16:64)*$n) if $alloc;
-   if ($type==16) {
+   $self->_allocation(($type==TYPE_ARRAY?80:128)+($type==TYPE_ARRAY?16:64)*$n) if $alloc;
+   if ($type==TYPE_ARRAY) {
       for my $i (0..$#$v) {
          exists $v->[$i] or $self->_fail('UNSUPPORTED_GRAFT','Sparse input arrays are not JSON data');
          $self->_inspect($v->[$i],$depth+1,$active,$ast,$alloc);
@@ -288,6 +288,7 @@ sub _path {
    $self->_depth($depth);
    $self->_step(1);
    is_expr($expr) or $self->_fail('INVALID_OPERAND','Path must be a reference expression');
+   local $self->{expression}=$expr;
    if ($expr->_name eq 'EXPR') {
       return $self->_path($self->_macro($expr,$depth+1),$mode,$depth+1);
    }
@@ -317,18 +318,20 @@ sub _path {
    for my $i (0..$#parts) {
       my $v=$parts[$i];
       my $t=type_mask($v);
-      next if $t==8 || ($t==2 && !$v);
-      if ($t==4 && is_finite($v)) {
+      next if $t==TYPE_STRING || ($t==TYPE_BOOLEAN && !$v);
+      if ($t==TYPE_NUMBER && is_finite($v)) {
          next if is_integer($v) || ($mode eq 'move_dst' && $i==$#parts && $v*2==int($v*2));
       }
       $self->_fail($literal[$i]?'INVALID_GRAFT':'INVALID_OPERAND','Invalid path selector');
    }
-   $ns eq 'temp' && !@parts and $self->_fail('INVALID_OPERAND','TEMP root is inaccessible');
+   $ns eq 'temp' && !@parts and $self->_fail(
+      (grep is_expr($_), @{$expr->path})?'INVALID_OPERAND':'INVALID_GRAFT','TEMP root is inaccessible');
    if ($ns ne 'node' && ($mode eq 'write' || $mode =~ /^move_/) && !@parts) {
       $self->_fail((grep is_expr($_), @{$expr->path})?'INVALID_OPERAND':'INVALID_GRAFT','Namespace root cannot be overwritten or moved');
    }
-   if ($ns ne 'node' && @parts && type_mask($parts[0])==4) {
-      is_integer($parts[0]) or $self->_fail('INVALID_OPERAND','Namespace property must be an integer or string');
+   if ($ns ne 'node' && @parts && type_mask($parts[0])==TYPE_NUMBER) {
+      is_integer($parts[0]) or $self->_fail($literal[0]?'INVALID_GRAFT':'INVALID_OPERAND',
+         'Namespace property must be an integer or string');
       my $key=$parts[0];
       $parts[0]="$key";
    }
@@ -340,14 +343,14 @@ sub _selector {
    my ($self,$value,$container,$half)= @_;
    my $type=type_mask($value);
    my $kind=type_mask($container);
-   if ($kind==32) {
-      $type==8 or $self->_fail('INVALID_TARGET','Object selectors must be strings');
+   if ($kind==TYPE_OBJECT) {
+      $type==TYPE_STRING or $self->_fail('INVALID_TARGET','Object selectors must be strings');
       return $value;
    }
-   $kind==16 or $self->_fail('INVALID_TARGET','Path descends through a scalar');
+   $kind==TYPE_ARRAY or $self->_fail('INVALID_TARGET','Path descends through a scalar');
    my $len=@$container;
-   return $len if $type==2 && !$value;
-   $type==4 && is_finite($value) or $self->_fail('INVALID_TARGET','Array selectors must be numbers');
+   return $len if $type==TYPE_BOOLEAN && !$value;
+   $type==TYPE_NUMBER && is_finite($value) or $self->_fail('INVALID_TARGET','Array selectors must be numbers');
    if (is_integer($value)) {
       my $index=$value<0? $len+$value : 0+$value;
       $index>=0 && $index<=$len or $self->_fail('INVALID_TARGET','Array index out of range');
@@ -385,7 +388,7 @@ sub _read {
 sub _same_key {
    my ($self,$a,$b)= @_;
    return 0 unless type_mask($a)==type_mask($b);
-   $self->_step(1+(length($a)+length($b))*.001) if type_mask($a)==8;
+   $self->_step(1+(length($a)+length($b))*.001) if type_mask($a)==TYPE_STRING;
    return $a eq $b;
 }
 sub _probe {
@@ -401,7 +404,7 @@ sub _probe {
       unless ($exists) {
          # These empty virtual containers are for validation, not output.
          my $kind=type_mask($parts->[$i]);
-         $v=$kind==8? {} : [];
+         $v=$kind==TYPE_STRING? {} : [];
       }
       my $key=$self->_selector($parts->[$i],$v,$half && $i==$#$parts);
       if (ref $v eq 'ARRAY' && !is_integer($key)) {
@@ -424,7 +427,7 @@ sub _parent {
    my ($self,$loc)= @_;
    my ($cell,$parts)=@$loc;
    if (!$cell->[1]) {
-      $cell->[0]=type_mask($parts->[0])==8? $self->_new_hash(0):$self->_new_array(0);
+      $cell->[0]=type_mask($parts->[0])==TYPE_STRING? $self->_new_hash(0):$self->_new_array(0);
       $cell->[1]=1;
    }
    my $v=$self->_cow($cell->[0]);
@@ -433,7 +436,7 @@ sub _parent {
       my $key=$parts->[$i];
       my $child;
       if ($self->_present($v,$key)) { $child=$self->_child($v,$key) }
-      else { $child=type_mask($parts->[$i+1])==8? $self->_new_hash(0):$self->_new_array(0) }
+      else { $child=type_mask($parts->[$i+1])==TYPE_STRING? $self->_new_hash(0):$self->_new_array(0) }
       $child=$self->_cow($child);
       $self->_put($v,$key,$child);
       $v=$child;
@@ -538,7 +541,7 @@ sub _macro {
    my ($self,$expr,$depth)= @_;
    my $name=$self->_eval($expr->name,$depth+1);
    my $t=type_mask($name);
-   $t==8 || ($t==4 && is_integer($name)) or $self->_fail('INVALID_OPERAND','Invalid EXPR name');
+   $t==TYPE_STRING || ($t==TYPE_NUMBER && is_integer($name)) or $self->_fail('INVALID_OPERAND','Invalid EXPR name');
    my $key="$name";
    exists $self->{expr}[0]{$key} or $self->_fail('INVALID_TARGET','Unknown common expression');
    return $self->{expr}[0]{$key};
@@ -552,20 +555,20 @@ sub _eval {
       return $self->_expression($v,$depth);
    }
    my $t=type_mask($v);
-   if ($t==16) {
+   if ($t==TYPE_ARRAY) {
       my $out=$self->_new_array(scalar @$v);
       $self->_step(scalar @$v);
       for my $i (0..$#$v) { $out->[$i]=$self->_eval($v->[$i],$depth+1) }
       return $out;
    }
-   if ($t==32) {
+   if ($t==TYPE_OBJECT) {
       my $out=$self->_new_hash(scalar keys %$v);
       $self->_step(scalar keys %$v);
       $out->{$_}=$self->_eval($v->{$_},$depth+1) for keys %$v;
       return $out;
    }
-   $self->_step(length($v)*.001) if $t==8;
-   $t==1 || $t==2 || $t==4 || $t==8 or $self->_fail('UNSUPPORTED_GRAFT','Unsupported literal value');
+   $self->_step(length($v)*.001) if $t==TYPE_STRING;
+   $t==TYPE_NULL || $t==TYPE_BOOLEAN || $t==TYPE_NUMBER || $t==TYPE_STRING or $self->_fail('UNSUPPORTED_GRAFT','Unsupported literal value');
    return $v;
 }
 sub _input_value {
@@ -582,8 +585,8 @@ sub _expression {
    if ($name eq 'LENGTH') {
       my $v=$self->_input_value($expr,'value_expr',$depth);
       my $t=type_mask($v);
-      return scalar @$v if $t==16;
-      if ($t==8) { $self->_step(length($v)*.001); return length($v) }
+      return scalar @$v if $t==TYPE_ARRAY;
+      if ($t==TYPE_STRING) { $self->_step(length($v)*.001); return length($v) }
       $self->_fail('INVALID_TARGET','LENGTH expects an array or string');
    }
    if ($name eq 'SLICE') { return $self->_slice($expr,$depth+1) }
@@ -597,7 +600,7 @@ sub _expression {
       for my $pair (@{$expr->bindings}) {
          my $key=$self->_eval($pair->[0],$depth+1);
          my $t=type_mask($key);
-         $t==1 || $t==8 || ($t==4 && is_finite($key)) or $self->_fail('INVALID_OPERAND','Invalid LOCAL property');
+         $t==TYPE_NULL || $t==TYPE_STRING || ($t==TYPE_NUMBER && is_finite($key)) or $self->_fail('INVALID_OPERAND','Invalid LOCAL property');
          my $value=$self->_eval($pair->[1],$depth+1);
          if (!defined $key) { $self->{current}=[[$value,1],[]] }
          else { $self->{temp}[0]{"$key"}=$value }
@@ -608,7 +611,7 @@ sub _expression {
       $self->_step(scalar @{$expr->value_exprs});
       for my $arg (@{$expr->value_exprs}) {
          my $v=$self->_eval($arg,$depth+1);
-         type_mask($v)==2 or $self->_fail('INVALID_TARGET','Logical operands must be booleans');
+         type_mask($v)==TYPE_BOOLEAN or $self->_fail('INVALID_TARGET','Logical operands must be booleans');
          return JSON::PP::false if $name eq 'AND' && !$v;
          return $name eq 'NOT'? JSON::PP::false : JSON::PP::true if $name ne 'AND' && $v;
       }
@@ -618,13 +621,13 @@ sub _expression {
       my $v=$self->_input_value($expr,'value_expr',$depth);
       my $t=type_mask($v);
       if ($name eq 'CASTBOOL') {
-         return $v if $t==2;
-         return $v? JSON::PP::true : JSON::PP::false if $t==4 && ($v==0 || $v==1);
-         return $v eq 'true'? JSON::PP::true : JSON::PP::false if $t==8 && ($v eq 'true' || $v eq 'false');
+         return $v if $t==TYPE_BOOLEAN;
+         return $v? JSON::PP::true : JSON::PP::false if $t==TYPE_NUMBER && ($v==0 || $v==1);
+         return $v eq 'true'? JSON::PP::true : JSON::PP::false if $t==TYPE_STRING && ($v eq 'true' || $v eq 'false');
       }
       elsif ($name eq 'CASTNUM') {
-         return $v if $t==4;
-         if ($t==8 && $v =~ /\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z/) {
+         return $v if $t==TYPE_NUMBER;
+         if ($t==TYPE_STRING && $v =~ /\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z/) {
             $self->_step(length($v)*.001);
             my $num=0+$v;
             is_finite($num) or $self->_fail('UNSUPPORTED_GRAFT','Number outside supported range');
@@ -632,9 +635,9 @@ sub _expression {
          }
       }
       else {
-         return $v if $t==8;
-         return $v? 'true':'false' if $t==2;
-         if ($t==4) {
+         return $v if $t==TYPE_STRING;
+         return $v? 'true':'false' if $t==TYPE_BOOLEAN;
+         if ($t==TYPE_NUMBER) {
             require JGraft;
             return JGraft::_json()->new->allow_nonref->encode($v);
          }
@@ -655,7 +658,7 @@ sub _expression {
       }
       else { @values=map $self->_eval($expr->{$_},$depth+1), qw(value_expr1 value_expr2) }
       $self->_step(scalar @values);
-      for my $v (@values) { type_mask($v)==4 && is_finite($v) or $self->_fail('INVALID_TARGET','Arithmetic expects finite numbers') }
+      for my $v (@values) { type_mask($v)==TYPE_NUMBER && is_finite($v) or $self->_fail('INVALID_TARGET','Arithmetic expects finite numbers') }
       my $result=$name eq 'MUL'?1:0;
       if ($name eq 'ADD') { $result+=$_ for @values }
       elsif ($name eq 'MUL') { $result*=$_ for @values }
@@ -698,12 +701,12 @@ sub _slice {
       is_integer($ofs) && (!exists $expr->{len} || is_integer($len)) or $self->_fail('INVALID_OPERAND','SLICE bounds must be integers');
    }
    my $type=type_mask($value);
-   $type==16 || $type==8 or $self->_fail('INVALID_TARGET','SLICE expects an array or string');
-   my $size=$type==16? scalar @$value : length($value);
+   $type==TYPE_ARRAY || $type==TYPE_STRING or $self->_fail('INVALID_TARGET','SLICE expects an array or string');
+   my $size=$type==TYPE_ARRAY? scalar @$value : length($value);
    $ofs+=$size if $ofs<0;
    $lim=defined $len? ($len<0?$size+$len:$ofs+$len) : $size unless defined $lim;
    $ofs>=0 && $ofs<=$lim && $lim<=$size or $self->_fail('INVALID_TARGET','SLICE is out of range');
-   if ($type==8) { $self->_step(($lim-$ofs)*.001); $self->_charge('mem',4*($lim-$ofs)); return substr($value,$ofs,$lim-$ofs) }
+   if ($type==TYPE_STRING) { $self->_step(($lim-$ofs)*.001); $self->_charge('mem',4*($lim-$ofs)); return substr($value,$ofs,$lim-$ofs) }
    my $out=$self->_new_array($lim-$ofs);
    $self->_step($lim-$ofs);
    for (my $i=$ofs;$i<$lim;++$i) {
@@ -725,6 +728,15 @@ sub _slice {
 Executes JGRAFT, AT, COPY, and MOVE with namespace references, value construction,
 common expressions, LOCAL, LENGTH, SLICE, arithmetic, logical operators, and the
 boolean/number/string casts. Other operations fail with UNSUPPORTED_GRAFT.
+
+JGRAFT initializes constants in declaration order against the inherited common
+expressions and parent stash, then installs its unevaluated common expressions
+and starts a fresh stash. Inherited constants/expressions are shadowed locally;
+EXPR references evaluate in the invoking scope. NODE follows the current node,
+TEMP resets per action, and CONST/CAP are read-only. CAP starts empty; populating
+captures requires the matching operations, which are not yet implemented.
+EXPR aliases can supply action paths, with namespace and selector restrictions
+checked against the resolved reference.
 
 Unchanged subtrees may share storage with input. New containers are owned by an
 execution generation. Copying a container freezes that generation; subsequent

@@ -9,7 +9,7 @@ use parent 'Test2::V0';
 
 our @EXPORT= (
    @Test2::V0::EXPORT,
-   qw( explain unindent pipe_with_data escape_nonprintable unescape_nonprintable cmpthese run_perl )
+   qw( explain unindent pipe_with_data escape_nonprintable unescape_nonprintable cmpthese run_perl test_conformance )
 );
 
 # Test2 runs async by default, which messes up the relation between warnings and the test
@@ -23,6 +23,87 @@ sub run_perl {
    my $output= do { local $/; <$pipe> };
    close $pipe;
    return ($?, defined $output? $output : '');
+}
+
+# Run a specification conformance file or an already decoded case/group.
+# supported => [operation names] explicitly skips unimplemented operations.
+# undo => 0 disables undo round trips (enabled by default).
+sub test_conformance {
+   my ($source,%options)=@_;
+   $_ eq 'supported' || $_ eq 'undo' or die "Unknown conformance option '$_'" for keys %options;
+   require JGraft;
+   require JGraft::Exec;
+   require JSON::PP;
+   require Scalar::Util;
+   my $suite=$source;
+   unless (ref $source) {
+      unless (-f $source) {
+         SKIP: { skip "$source: conformance fixtures unavailable",1 }
+         return;
+      }
+      open my $fh,'<:raw',$source or die "open($source): $!";
+      $suite=JSON::PP->new->utf8->decode(do {local $/; <$fh>});
+      close $fh or die "close($source): $!";
+   }
+   my $config={json=>JSON::PP->new->canonical->allow_nonref,
+      undo=>exists $options{undo}? $options{undo} : 1};
+   $config->{supported}={map {$_=>1} @{$options{supported}}} if exists $options{supported};
+   _conformance_cases($suite,'',$config);
+}
+
+sub _conformance_supported {
+   my ($value,$supported)=@_;
+   my $node=Scalar::Util::blessed($value) && $value->isa('JGraft::_Node');
+   return 0 if $node && !$supported->{$value->_name};
+   return !grep !_conformance_supported($_,$supported), @$value if ref($value) eq 'ARRAY';
+   if (ref($value) eq 'HASH' || $node) {
+      my @keys=$node? grep($_ ne '_form', keys %$value) : keys %$value;
+      return !grep !_conformance_supported($value->{$_},$supported), @keys;
+   }
+   return 1;
+}
+
+sub _conformance_cases {
+   my ($case,$prefix,$config)=@_;
+   if (exists $case->{tests}) {
+      _conformance_cases($_,$prefix.$case->{name}.' / ',$config) for @{$case->{tests}};
+      return;
+   }
+   my $name=$prefix.$case->{name};
+   my $json=$config->{json};
+   my $errors=$case->{errors} || {};
+   my $before=$json->encode([$case->{input},$case->{jgraft}]);
+   my $graft=eval { JGraft::jgparse($case->{jgraft}) };
+   my $parse_error=$@;
+   if ($parse_error) {
+      ok($errors->{INVALID_GRAFT} && !$errors->{RESOURCE_LIMIT},"$name: static rejection")
+         or diag "$parse_error";
+      is($json->encode([$case->{input},$case->{jgraft}]),$before,"$name: input and graft preserved");
+      return;
+   }
+   if ($config->{supported} && !_conformance_supported($graft,$config->{supported})) {
+      SKIP: { skip "$name: uses an unimplemented operation",1 }
+      return;
+   }
+   my $exec=JGraft::Exec->new(jgraft=>$graft,undo=>$config->{undo},
+      exists $case->{limits}? (limits=>$case->{limits}):());
+   my @out=$exec->apply($case->{input});
+   if ($errors->{RESOURCE_LIMIT}) { is($exec->error,'RESOURCE_LIMIT',"$name: required resource failure") }
+   elsif ($exec->error) { ok($errors->{$exec->error},"$name: permitted failure") or diag "$exec" }
+   else {
+      ok(exists $case->{output},"$name: success permitted");
+      is($json->encode($out[0]),$json->encode($case->{output}),"$name: output");
+   }
+   if (exists $case->{logs}) {
+      is($json->encode($exec->can('logs')? $exec->logs : []),$json->encode($case->{logs}),"$name: logs");
+   }
+   is($json->encode([$case->{input},$case->{jgraft}]),$before,"$name: input and graft preserved");
+   return unless $config->{undo};
+   my $data=$json->decode($json->encode($exec->undo->to_json_data));
+   my $restore=JGraft::Exec->new(jgraft=>$data);
+   $restore->apply($exec->output);
+   ok($restore->success,"$name: undo succeeds") or diag "$restore",explain($data);
+   is($json->encode($restore->output),$json->encode($case->{input}),"$name: undo restores input");
 }
 
 # Use Data::Printer if available, but fall back to Data::Dumper

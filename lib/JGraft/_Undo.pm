@@ -5,7 +5,7 @@ use strict;
 use warnings;
 no warnings 'recursion';
 use Scalar::Util 'refaddr';
-use JGraft::Util 'type_mask';
+use JGraft::Util qw(:types type_mask);
 
 sub _new {
    my ($class,$exec,$input)=@_;
@@ -30,7 +30,7 @@ sub _record {
          && ($delete || $key!=int($key) || $key==@$value)) {
          $node->{array}=1;
       }
-      $exec->_step(length($key)*.001) if type_mask($key)==8;
+      $exec->_step(length($key)*.001) if type_mask($key)==TYPE_STRING;
       my $token=_key($key);
       unless (exists $node->{children}{$token}) {
          $exec->_charge('mem',160+4*length($token));
@@ -57,14 +57,14 @@ sub _build {
 sub _key {
    my $value=shift;
    my $type=type_mask($value);
-   return 'r'.refaddr($value) if $type==16 || $type==32;
-   return $type.':'.(!defined $value? '' : $type==2? ($value?1:0) : $value);
+   return 'r'.refaddr($value) if $type==TYPE_ARRAY || $type==TYPE_OBJECT;
+   return $type.':'.(!defined $value? '' : $type==TYPE_BOOLEAN? ($value?1:0) : $value);
 }
 sub _origin { my ($self,$value)=@_; $self->{lineage}{refaddr($value)} || refaddr($value) }
 sub _fingerprint {
    my ($self,$value)=@_;
    my $type=type_mask($value);
-   return $type==16 || $type==32? 'r'.$self->_origin($value) : _key($value);
+   return $type==TYPE_ARRAY || $type==TYPE_OBJECT? 'r'.$self->_origin($value) : _key($value);
 }
 sub _node {
    my ($self,$class,%attrs)=@_;
@@ -111,14 +111,14 @@ sub _move {
 sub _index {
    my ($self,$value,$link)=@_;
    my $type=type_mask($value);
-   return unless $type==16 || $type==32;
+   return unless $type==TYPE_ARRAY || $type==TYPE_OBJECT;
    my $id=refaddr($value);
    return if exists $self->{exact}{$id};
    my $entry=[$value,$link];
    $self->{exact}{$id}=$entry;
    $self->{origins}{$self->_origin($value)} ||= $entry;
    return if $self->{original_ids}{$id};
-   if ($type==16) {
+   if ($type==TYPE_ARRAY) {
       for my $i (0..$#$value) { $self->_index($value->[$i],[$link,$i]) }
    }
    else {
@@ -128,7 +128,7 @@ sub _index {
 sub _restore {
    my ($self,$wanted,$parts)=@_;
    my $type=type_mask($wanted);
-   if ($type==16 || $type==32) {
+   if ($type==TYPE_ARRAY || $type==TYPE_OBJECT) {
       unless (exists $self->{exact}) {
          $self->{exact}={}; $self->{origins}={};
          $self->_index($self->{output},undef);
@@ -156,14 +156,14 @@ sub _diff {
    return if $hint && !$hint->{whole} && !keys %{$hint->{children}};
    my ($wt,$ht)=(type_mask($wanted),type_mask($have));
    if ($wt==$ht) {
-      if ($wt==16 || $wt==32) { return if refaddr($wanted)==refaddr($have) }
-      elsif ($wt==1) { return }
-      elsif ($wt==8) {
+      if ($wt==TYPE_ARRAY || $wt==TYPE_OBJECT) { return if refaddr($wanted)==refaddr($have) }
+      elsif ($wt==TYPE_NULL) { return }
+      elsif ($wt==TYPE_STRING) {
          return if $wanted eq $have;
       }
       else { return if $wanted==$have }
    }
-   unless ($wt==$ht && ($wt==16 || $wt==32) && $self->_origin($wanted)==$self->_origin($have)) {
+   unless ($wt==$ht && ($wt==TYPE_ARRAY || $wt==TYPE_OBJECT) && $self->_origin($wanted)==$self->_origin($have)) {
       $self->_restore($wanted,$parts);
       return;
    }
@@ -181,7 +181,7 @@ sub _diff {
 sub _contents {
    my ($self,$wanted,$have,$hint)=@_;
    my $wt=type_mask($wanted);
-   if ($wt==16) {
+   if ($wt==TYPE_ARRAY) {
       if ($hint && !$hint->{whole} && !$hint->{array} && @$wanted==@$have) {
          for my $entry (values %{$hint->{children}}) {
             my ($i,$child)=@$entry;

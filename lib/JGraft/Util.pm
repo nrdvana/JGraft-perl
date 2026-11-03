@@ -7,7 +7,21 @@ use Exporter 'import';
 use Scalar::Util 'blessed';
 use B ();
 use JSON::PP ();
+use constant {
+   TYPE_NONE    => 0,
+   TYPE_NULL    => 1,
+   TYPE_BOOLEAN => 2,
+   TYPE_NUMBER  => 4,
+   TYPE_STRING  => 8,
+   TYPE_ARRAY   => 16,
+   TYPE_OBJECT  => 32,
+   TYPE_DATE    => 64,
+   TYPE_ANY     => 127,
+};
 our @EXPORT_OK= qw(type_mask is_finite is_integer is_expr is_action invalid_graft);
+our %EXPORT_TAGS=(types=>[qw(TYPE_NONE TYPE_NULL TYPE_BOOLEAN TYPE_NUMBER
+   TYPE_STRING TYPE_ARRAY TYPE_OBJECT TYPE_DATE TYPE_ANY)]);
+push @EXPORT_OK,@{$EXPORT_TAGS{types}};
 our $_construction_context;
 
 sub invalid_graft {
@@ -21,18 +35,18 @@ sub invalid_graft {
 
 sub type_mask {
    my $v= shift;
-   return 1 unless defined $v;
-   return 2 if JSON::PP::is_bool($v);
+   return TYPE_NULL unless defined $v;
+   return TYPE_BOOLEAN if JSON::PP::is_bool($v);
    return $v->returns if is_expr($v);
-   return 16 if ref $v eq 'ARRAY';
-   return 32 if ref $v eq 'HASH';
-   return 0 if ref $v;
+   return TYPE_ARRAY if ref $v eq 'ARRAY';
+   return TYPE_OBJECT if ref $v eq 'HASH';
+   return TYPE_NONE if ref $v;
    my $flags= B::svref_2object(\$v)->FLAGS;
-   return ($flags & (B::SVp_IOK() | B::SVp_NOK())) && !($flags & B::SVp_POK())? 4 : 8;
+   return ($flags & (B::SVp_IOK() | B::SVp_NOK())) && !($flags & B::SVp_POK())? TYPE_NUMBER : TYPE_STRING;
 }
 sub is_finite {
    my $v= shift;
-   return 0 if ref $v || type_mask($v) != 4;
+   return 0 if ref $v || type_mask($v) != TYPE_NUMBER;
    return ($v - $v) == 0;
 }
 sub is_integer { my $v= shift; is_finite($v) && $v == int($v) }
@@ -43,6 +57,26 @@ sub is_action { blessed($_[0]) && $_[0]->isa('JGraft::Action') }
 
 Optional exports shared by the node constructors and executor. Numeric predicates
 inspect copies of scalar values, preserving numeric/string distinctions in input.
+
+=head1 TYPE CONSTANTS
+
+  use JGraft::Util qw(:types type_mask);
+  my $allowed= TYPE_NULL | TYPE_NUMBER;
+
+The C<:types> export tag supplies these Perl constants; each may also be imported
+individually. Combine type bits with C<|>. Their numeric values are unchanged:
+
+  TYPE_NONE       0    No possible result, or an unrecognized reference
+  TYPE_NULL       1
+  TYPE_BOOLEAN    2
+  TYPE_NUMBER     4
+  TYPE_STRING     8
+  TYPE_ARRAY     16
+  TYPE_OBJECT    32
+  TYPE_DATE      64
+  TYPE_ANY      127    All supported type bits
+
+=for Pod::Coverage TYPE_[A-Z]+
 
 =function invalid_graft
 
@@ -58,6 +92,7 @@ enabled by default.
 Return the JSON type bitmask: null=1, boolean=2, number=4, string=8, array=16,
 object=32. An expression object returns its possible result types (including
 date=64); other references return zero. This does not validate container contents.
+Use the named L</TYPE CONSTANTS> when checking or combining these bits.
 
 =function is_finite
 

@@ -3,6 +3,7 @@ use warnings;
 use lib 't/lib';
 use Test2AndUtils;
 use JGraft qw(:constructors jgparse);
+use JGraft::Util ':types';
 use JSON::PP ();
 use Scalar::Util 'refaddr';
 
@@ -79,16 +80,16 @@ for my $registry ('JGraft::Action', 'JGraft::Expr') {
 }
 
 my $literal= ['ADD',1,2];
-is(JGraft::Expr::ADD->returns, 4, 'numeric return declaration');
-is(JGraft::Expr::CAPTURE->returns, 2|32, 'union return declaration');
-is(JGraft::Expr::FAIL->returns, 0, 'non-returning declaration');
+is(JGraft::Expr::ADD->returns, TYPE_NUMBER, 'numeric return declaration');
+is(JGraft::Expr::CAPTURE->returns, TYPE_BOOLEAN | TYPE_OBJECT, 'union return declaration');
+is(JGraft::Expr::FAIL->returns, TYPE_NONE, 'non-returning declaration');
 is(scalar @{JGraft::Expr::SLICE->forms}, 2, 'overloaded forms exposed directly');
 is(JGraft::Expr::REP->forms->[0]{fields}[0], ['min','nonneg_int',0], 'form defaults preserved');
 my $local_number= LOCAL('x',1,42);
-is(JGraft::Expr::LOCAL->returns, 127, 'LOCAL class declaration remains general');
-is($local_number->returns, 4, 'LOCAL instance refines its literal return type');
-is(LOCAL('x',1,CASTSTR())->returns, 8, 'LOCAL instance refines expression return type');
-is(LOCAL(LOCAL(CASTSTR()))->returns, 8, 'nested LOCAL return types refine recursively');
+is(JGraft::Expr::LOCAL->returns, TYPE_ANY, 'LOCAL class declaration remains general');
+is($local_number->returns, TYPE_NUMBER, 'LOCAL instance refines its literal return type');
+is(LOCAL('x',1,CASTSTR())->returns, TYPE_STRING, 'LOCAL instance refines expression return type');
+is(LOCAL(LOCAL(CASTSTR()))->returns, TYPE_STRING, 'nested LOCAL return types refine recursively');
 like(dies { REP(LOCAL(CASTSTR())) }, qr/cannot return/, 'validation uses refined LOCAL capabilities');
 my $literal_expr= LENGTH($literal);
 is($literal_expr->value_expr, $literal, 'constructor array stays literal');

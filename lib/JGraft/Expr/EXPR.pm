@@ -8,6 +8,9 @@ This object represents the L<EXPR Expression|https://github.com/nrdvana/JGraft/S
 
 The expression references the common expression identified by L</name>. Common expressions are
 declared by the JGRAFT action and interpreted in the context of the reference.
+When used as an action path, the definition must expand to a reference expression.
+The resolved namespace must satisfy that action's read/write restrictions;
+these checks happen at execution because definitions and names can be scoped.
 
 =attribute id
 
