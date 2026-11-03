@@ -6,15 +6,15 @@ package JGraft::Action;
 
   use JGraft::Action;
   
-  my $graft= JGraft::Action->parse($json_or_data);
+  my $graft= JGraft::Action->new_from_json_data($json_data);
   say $graft->format(pretty => 1);
 
 =head1 DESCRIPTION
 
-This is the base class for L<JGraft actions|https://github.com/nrdvana/JGraft#actions>.  The
-method L</parse> can be used to automatically build the correct action from serialized JSON or
-decoded JSON data.  To construct new actions from pre-parsed parameters, use the individual
-constructors of
+This is the abstract base class for L<JGraft actions|https://github.com/nrdvana/JGraft#actions>.
+The L</new_from_json_data> constructor assembles a tree of JGraft::Action and JGraft::Expr
+objects from the JSON-encoded form of JGraft.  Trees can also be assembled directly from the
+individual constructors of the per-action classes:
 
 =over
 
@@ -28,7 +28,31 @@ Log status, or abort graft.
 
 =item L<JGraft::Action::AT>
 
-...
+Navigate to sub-node and execute sub-actions
+
+=item L<JGraft::Action::ATSPLIT>
+
+Navigate into SPLIT, apply actions, re-JOIN
+
+=item L<JGraft::Action::MATCH>
+
+Assert current node matches pattern
+
+=item L<JGraft::Action::IF>
+
+Choose action based on which pattern matches
+
+=item L<JGraft::Action::COPY>
+
+Assign-by-value to properties
+
+=item L<JGraft::Action::MOVE>
+
+Move existing values between properties
+
+=item L<JGraft::Action::SPLICE>
+
+Perform standard splice() on an array
 
 =back
 
@@ -42,6 +66,8 @@ use experimental 'signatures';
 #use warnings;
 #__end__
 use Carp;
+require JGraft::_Node;
+our @ISA= ('JGraft::_Node');
 
 =function get_class
 
@@ -51,51 +77,46 @@ Given an action name or ID, return the class that represents it.
 
 =cut
 
-our %by_name= (
-   # Reference Expressions
-   JGRAFT => -1,
-   RAISE  =>  0,
-   ...
-);
-our %by_id= reverse %by_name;
-our %to_class= map +(
-   $_           => "JGraft::Action::$_",
-   $by_name{$_} => "JGraft::Action::$_",
-), keys %by_name;
-
+our (%by_name, %by_id, %to_class); # populated below
 sub get_class {
+   # can be called as class method or function
    shift if @_ == 2 && ($_[0] eq __PACKAGE__ || $_[0]->isa(__PACKAGE__));
    @_ == 1 or croak "Expected one argument";
-   $to_class{$_[0]} or croak "Unknown JGraft expression: '$_[0]'";
+   my $name= $_[0];
+   defined $name && !ref $name or croak "Expected an action name or ID";
+   $to_class{$name} or croak "Unknown JGraft action: '$name'";
 }
 
-=constructor parse
+=attribute forms
 
-  my $action= JGraft::Action->parse($json_or_data);
+An arrayref describing the possible patterns of arguments which are accepted by the constructor.
 
-Decode JSON if provided a string, and then decode the data into a tree of JGraft action and
-expression objects.
+=constructor new_from_json_data
+
+  $action= JGraft::Action->new_from_json_data(\@array_notation);
+
+Construct the specified action and any subtrees of actions or expressions from the JSON
+representation of JGraft.  The argument must be an arrayref (since all actions are encoded
+as arrays) and the first element must be a known action ID or name.  Each argument will be
+interpreted according to the action's context for that argument.
 
 =cut
 
 #__p5.28__
-sub parse($class, $in) {
+sub new_from_json_data($class, $in) {
 #__p5.8__
-#sub parse {
+#sub new_from_json_data {
 #   my ($class, $in)= @_;
 #   croak "Expected one argument" unless @_ == 2;
 #__end__
-   unless (ref $in eq 'ARRAY' && @$in) {
-      $in= JGraft::coerce_json_to_data($in);
-      ref $in eq 'ARRAY' && @$in
-         or croak "Actions in JSON must be arrays with at least one element";
-   }
-   my $need_class= $to_class{$in->[0]}
-      or croak "Unknown action '$in->[0]'";
-   # ->parse can be called on a subclass, but should restrict to that subclass
+   ref $in eq 'ARRAY' && @$in
+      or croak "Expected an array of at least one element";
+   my ($op, @args)= @$in;
+   my $need_class= __PACKAGE__->get_class($op);
+   # ->new_from_json_data can be called on a subclass, but should restrict to that subclass
    $class eq __PACKAGE__ || $need_class->isa($class)
       or croak "Action $need_class does not inherit from $class";
-   $need_class->_parse($in);
+   $need_class->_construct(\@args, 1);
 }
 
 =method to_json_data
@@ -103,13 +124,11 @@ sub parse($class, $in) {
   my $data= $action->to_json_data;
 
 Return the JSON-pure data structure that represents this action, which could be passed back to
-L</parse> to re-create it.
+L</new_from_json_data> to re-create it.
 
 =cut
 
-sub to_json_data {
-   die "Unimplemented";
-}
+# to_json_data and TO_JSON are inherited from _Node
 
 =method format
 
@@ -131,11 +150,87 @@ sub format {
    die "unimplemented";
 }
 
+sub _define_action {
+   my ($name, $id, @forms)= @_;
+   my $class= __PACKAGE__.'::'.$name;
+   $by_name{$name}= $id;
+   $by_id{$id}= $name;
+   $to_class{$name}= $to_class{$id}= $class;
+   my %attrs;
+   for my $form (@forms) {
+      $attrs{$_->[0]}++ for grep defined, @{$form->{fields}||[]}, @{$form}{qw( repeat tail )};
+   }
+   no strict 'refs';
+   @{$class.'::ISA'}= (__PACKAGE__);
+   *{$class.'::id'}= sub { $id };
+   *{$class.'::forms'}= sub { \@forms };
+   *{$class.'::new'}= \&JGraft::_Node::_new;
+   for (keys %attrs) {
+      my $attr= $_;
+      *{$class.'::'.$attr}= sub { $_[0]{$attr} };
+   }
+}
+
+
+# Name, protocol ID, operand forms.
+_define_action(JGRAFT => -1,
+   {  fields => [[ metadata => 'metadata' ]],
+      repeat =>  [ actions => 'action'],
+      min => 1
+   }
+);
+_define_action(RAISE => 0,
+   {  fields => [[ level => 'level'],
+                 [ message => 'message'],
+                 [ data => 'value']],
+      min => 2
+   }
+);
+_define_action(AT => 1,
+   {  fields => [[ path => 'node_path' ]],
+      repeat =>  [ actions => 'action' ],
+      min => 1
+   }
+);
+_define_action(ATSPLIT => 2,
+   {  fields => [[ path => 'node_path' ],
+                 [ split_spec => 'split' ]],
+      repeat =>  [ actions => 'action' ],
+      min => 2
+   }
+);
+_define_action(MATCH => 3,
+   {  fields => [[ match_spec => 'match']],
+      repeat =>  [ actions => 'action'],
+      min => 1
+   }
+);
+_define_action(IF => 4,
+   {  repeat => [ branches => 'match','action'],
+      tail   => [ else_action => 'action'],
+      optional_tail => 1,
+      min => 0,
+   }
+);
+_define_action(COPY => 5,
+   {  repeat => [ assignments => 'value','write_path'],
+      min => 2
+   }
+);
+_define_action(MOVE => 6,
+   {  repeat => [ moves => 'move_src','move_dst'],
+      min => 2
+   }
+);
+_define_action(SPLICE => 7,
+   {  fields => [[ array_elem_path => 'write_path'],
+                 [ count_expr => 'nullable_int']],
+      repeat =>  [ replacements => 'value'],
+      min => 2
+   }
+);
+
 require JGraft;
-require JGraft::Action::JGRAFT;
-require JGraft::Action::RAISE;
-require JGraft::Action::AT;
-...
 require JGraft::Expr;
 
 1;

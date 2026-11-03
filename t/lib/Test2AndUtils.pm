@@ -9,12 +9,21 @@ use parent 'Test2::V0';
 
 our @EXPORT= (
    @Test2::V0::EXPORT,
-   qw( explain unindent pipe_with_data escape_nonprintable unescape_nonprintable cmpthese )
+   qw( explain unindent pipe_with_data escape_nonprintable unescape_nonprintable cmpthese run_perl )
 );
 
 # Test2 runs async by default, which messes up the relation between warnings and the test
 # that generated them.  Streamed generates output sequentially.
 *subtest= \&subtest_streamed;
+
+# Run a fresh copy of the current interpreter against the built modules.
+sub run_perl {
+   open my $pipe, '-|', $^X, '-Iblib/lib', '-Iblib/arch', @_
+      or die "Cannot launch $^X: $!";
+   my $output= do { local $/; <$pipe> };
+   close $pipe;
+   return ($?, defined $output? $output : '');
+}
 
 # Use Data::Printer if available, but fall back to Data::Dumper
 eval q{

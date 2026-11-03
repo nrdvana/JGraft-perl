@@ -1,4 +1,4 @@
-package JGraft::Expr::Match;
+package JGraft::Expr::Fn;
 # VERSION
 # ABSTRACT: Parent class for Function Expressions
 
@@ -8,17 +8,6 @@ This is the base class for function expressions.
 
 =cut
 
-use strict;
-use warnings;
-
-sub is_fn { !!1 }
-
-require JGraft::Expr::CAPTURE;
-require JGraft::Expr::LOCAL;
-require JGraft::Expr::NOT;
-require JGraft::Expr::AND;
-require JGraft::Expr::OR;
-require JGraft::Expr::LENGTH;
-...
+require JGraft::Expr;
 
 1;

@@ -7,8 +7,8 @@ package JGraft;
   use JGraft qw( :constructors );
   my $graft= JGRAFT(
     MATCH(
-      { title => ['STR'],
-        content => ['STR'],
+      { title => STR,
+        content => STR,
       },
       COPY(
         JOIN(' ', MAP(
@@ -17,12 +17,12 @@ package JGraft;
         )),
         'title'
       ),
-      ATSPLIT('content', CHARS("\n\t "),
+      ATSPLIT('content', { sep => CHARS("\n\t "), default => ' ' },
         MATCH(
           ARRAY(0, SEQMIN(0,REP),
             "I", "always", "remember", "to", "run", "spellcheck"
           ),
-          SPLICE(ADD(1,CAP(0,'ofs')), 0, "almost"),
+          SPLICE(NODE(ADD(1,CAP(0,'ofs'))), 0, "almost"),
         )
       ),
     )
@@ -37,8 +37,6 @@ package JGraft;
   #     content => "After editing I almost always remember to run spellcheck"
   #   }
   
-  jgparse(
-
 =cut
 
 use strict;
@@ -48,7 +46,7 @@ use Scalar::Util qw( blessed openhandle );
 use overload ();
 
 use Exporter 'import';
-@JGraft::EXPORT_OK= qw( jgdiff jgpatch jgparse );
+@JGraft::EXPORT_OK= qw( jgdiff jgpatch jgparse json_data );
 
 =head1 DESCRIPTION
 
@@ -56,7 +54,7 @@ This is the Perl 5 implementation of L<JGraft|https://github.com/nrdvana/JGraft>
 portable lisp-like language for describing structural edits to trees of data, and is itself a
 tree of data which can be encoded in JSON.  Its primary purpose is to serve as a "diff / patch"
 equivalent for structured data.  For more information about the JGraft format itself, see the
-L<specification/https://github.com/nrdvana/JGraft/SpecV1.md>.
+L<specification|https://github.com/nrdvana/JGraft/SpecV1.md>.
 
 =function jgdiff
 
@@ -95,7 +93,7 @@ disconnected from the original.
 
 =cut
 
-sub jgpatch {
+sub jgexec {
    my ($graft, $data_in, %options)= @_;
    require JGraft::Patch;
    my $patch= JGraft::Patch->new(%options, jgraft => $graft);
@@ -105,29 +103,45 @@ sub jgpatch {
 
 =function jgparse
 
-  my $jgraft= jgparse($json);
-  # Shortcut for:
-  #   my $p= JGraft::Action->parse($json);
+  $jgraft= jgparse($json_string);
+  $jgraft= jgparse(path("./foo.jg"));
+  $jgraft= jgparse(\*HANDLE);
+  $jgraft= jgparse(\@data);
+  $jgraft= jgparse(\$json_utf8);
 
-Takes either a string of JSON, or already-decoded JSON data (which must be an arrayref specifying
-an action) and returns a JGraft action or expression object.  Grafts that are invalid per a
-shallow static analysis (i.e. an action or expression constructor detects incorrect arguments)
-die immediately.  This does not perform a deep static analysis of the expressions to determine
-whether the graft is valid.  The input may also be a JGraft::Action object, in which case it
-passes through unchanged.
+This function extracts JSON data from the argument according to its type, then passes it to
+L<JGraft::Action/new_from_json_data>.  The argument can be anything supported by the
+L</json_data> function, and additionally can be a string of JSON text.  If the graft is clearly
+invalid (as detected by the constructors of the actions and expressions) this will die with
+an C<INVALID_GRAFT> error.
+
+Note that the C<$json_string> form suffers from the usual problem of requiring you to have
+pre-decoded your input into "characters" (not bytes) and it is easy to pass UTF-8 bytes by
+accident.  This function warns if it encounters a string that also happens to be a valid
+UTF-8 sequence of bytes.  If you know that your input is UTF-8 bytes, pass it as a scalar-ref.
+You can disable the warning with C<< $JGraft::warn_utf8_scalar=0 >>.
 
 =cut
 
+our $warn_utf8_scalar= 1;
 sub jgparse {
    my $something= shift;
    return !defined $something? croak "Undefined input"
+        : !ref($something)? do {
+            if ($warn_utf8_scalar && $something =~ /[^0-\x7F]/ && utf8::decode(my $tmp= $something)) {
+               carp "Scalar will be parsed as characters, but looks like UTF-8 bytes.  "
+                  . "Pass UTF-8 buffers as a scalar-ref.";
+               $warn_utf8_scalar= 0;
+            }
+            JGraft::Action->new_from_json_data(_json()->new->allow_nonref(0)->decode($something));
+          }
         : blessed($something) && $something->isa('JGraft::Action')? $something
-        : JGraft::Action->parse($something);
+        : JGraft::Action->new_from_json_data(json_data($something));
 }
 
 require JGraft::Action;
 
-=function coerce_json_to_data
+=function json_data
 
 This utility function takes a variety of inputs, returning json-like data as-is or extracting
 JSON data from the thing in some manner.  Its behavior depends on the type of the argument:
@@ -183,13 +197,13 @@ sub _json {
 
 # Path objects are recognized on a best-effort basis
 our %path_classes= map { $_ => 1 } qw( Path::Class::File Path::Tiny Mojo::File IO::All );
-sub coerce_json_to_data {
+sub json_data {
    my $in= shift;
    # Output that could result from decode_json is returned as-is.  Booleans are handled below.
    return $in if !ref $in || ref $in eq 'HASH' || ref $in eq 'ARRAY';
    # A scalar-ref is interpreted as UTF-8 bytes to decode.
    return _json->new->allow_nonref(1)->utf8->decode($$in)
-     if ref $in eq 'SCALAR';
+      if ref $in eq 'SCALAR';
    # An already-open file handle means to read it from the current position.
    # If it has layers on it that are known to generate characters rather than bytes,
    # use the characters, else assume we need to decode UTF-8.
@@ -221,11 +235,69 @@ sub coerce_json_to_data {
       croak "Can't convert ".ref($in)." to JSON data";
    }
    my $buf= '';
+   my $n;
    do {
-     my $n= read($in_handle, $buf, 65536, length($buf));
-     defined $n or croak "Error reading JSON input: $!";
+      $n= read($in_handle, $buf, 65536, length($buf));
+      defined $n or croak "Error reading JSON input: $!";
    } while ($n);
    return $coder->decode($buf);
+}
+
+=function C<:constructors>
+
+The C<:constructors> export tag provides uppercase constructor functions matching the name of
+every action and expression.  The arguments for each are identical to their JSON-encoded form,
+though some constructor functions have additional special cases for their arguments, as noted
+below.  All arguments are interpreted as perl data, not JGraft JSON-encoded expressions.
+In other words, an array is an array, not an expression.  To construct an action or expression
+from JSON-encoded data, use the L<JGraft::Action/new_from_json_data> or
+L<JGraft::Expr/new_from_json_data> constructors.
+
+=head4 Actions
+
+  JGRAFT(\%metadata, @actions)
+  JGRAFT(@actions)                  # implied { v => 1 } for %meta
+  RAISE($level, $message)
+  RAISE($level, $message, $data=undef)
+  AT($path, @actions)
+  ATSPLIT($path, $split_spec, @actions)
+  MATCH($match_spec, @actions)
+  IF(@branch_pairs, $else_action)
+  COPY(@val_dst_pairs)
+  MOVE(@src_dst_pairs)
+  SPLICE($elem_path, $del_count, @replacements)
+
+=head4 Ref Expressions
+
+=head4 Match Expressions
+
+=head4 Function Expressions
+
+=for Pod::Coverage [A-Z]+
+
+=cut
+
+# Export each Action and Expression as a function which takes the same arguments
+# as the JSON notation.  This is done by simply passing the argument list as an
+# arrayref to the constructor.
+our %EXPORT_TAGS;
+{
+   no strict 'refs';
+   my @constructors;
+   for my $registry ('JGraft::Action', 'JGraft::Expr') {
+      my $names= \%{$registry.'::by_name'};
+      for my $name (sort keys %$names) {
+         my $class= $registry->get_class($name);
+         *{__PACKAGE__.'::'.$name}= $name eq 'JGRAFT'? sub {
+            my @args= @_;
+            unshift @args, {v=>1} unless @args && ref $args[0] eq 'HASH';
+            $class->new(\@args);
+         } : sub { $class->new([@_]) };
+         push @constructors, $name;
+      }
+   }
+   push @JGraft::EXPORT_OK, @constructors;
+   $EXPORT_TAGS{constructors}= \@constructors;
 }
 
 1;
