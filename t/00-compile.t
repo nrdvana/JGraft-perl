@@ -2,6 +2,8 @@ use strict;
 use warnings;
 use lib 't/lib';
 use Test2AndUtils;
+use IPC::Open3;
+use Symbol 'gensym';
 use File::Find ();
 
 -d 'blib/lib' or bail_out('Build first: perl Makefile.PL && make; then prove -b');
@@ -11,7 +13,10 @@ File::Find::find({ no_chdir => 1, wanted => sub {
 } }, 'blib/lib');
 ok(scalar @modules, 'found built modules');
 for my $file (sort @modules) {
-   my $status= system($^X, '-Iblib/lib', '-Iblib/arch', '-c', $file);
-   is($status, 0, "$file compiles");
+   my $err = gensym;
+   my $pid = open3(undef, my $out, $err, $^X, '-Iblib/lib', '-Iblib/arch', '-c', $file);
+   note do { local $/; <$err> };
+   waitpid($pid, 0);
+   is($?, 0, "$file compiles");
 }
 done_testing;
