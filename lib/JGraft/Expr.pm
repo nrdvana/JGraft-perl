@@ -260,6 +260,7 @@ use experimental 'signatures';
 #use warnings;
 #__end__
 use Carp;
+use JGraft::Util qw(is_expr type_mask invalid_graft);
 require JGraft::_Node;
 our @ISA= ('JGraft::_Node');
 
@@ -279,10 +280,10 @@ our (%by_name, %by_id, %to_class); # populated below
 sub get_class {
    # optionally called as a class method
    shift if @_ == 2 && ($_[0] eq __PACKAGE__ || $_[0]->isa(__PACKAGE__));
-   @_ == 1 or croak "Expected one argument";
+   @_ == 1 or invalid_graft("Expected one argument");
    my $name= $_[0];
-   defined $name && !ref $name or croak "Expected an expression name or ID";
-   $to_class{$name} or croak "Unknown JGraft expression: '$name'";
+   defined $name && !ref $name or invalid_graft("Expected an expression name or ID");
+   $to_class{$name} or invalid_graft("Unknown JGraft expression: '$name'");
 }
 
 =attribute id
@@ -293,8 +294,9 @@ The ID number of this expression
 
 The declared result-type bitmask for a concrete class: null=1, boolean=2,
 number=4, string=8, array=16, object=32, and date=64. Zero means no successful
-result; 127 permits any type. This declaration is shared across argument forms.
-Internal analysis may narrow it using a particular instance's operands.
+result; 127 permits any type. Class calls return the declared capabilities;
+instance calls may refine these using their operands. LOCAL instances return
+the type of their return-value operand, while LOCAL class calls return 127.
 
 =attribute forms
 
@@ -359,13 +361,15 @@ sub new_from_json_data($class, $in) {
 #   my ($class, $in)= @_;
 #   croak "Expected one argument" unless @_ == 2;
 #__end__
+   local $JGraft::Util::_construction_context={class=>$class,method=>'new_from_json_data',
+      parent=>$JGraft::Util::_construction_context};
    ref $in eq 'ARRAY' && @$in
-      or croak "Expected an array of at least one element";
+      or invalid_graft("Expected an array of at least one element");
    my ($op, @args)= @$in;
    my $need_class= __PACKAGE__->get_class($op);
    # ->new_from_json_data can be called on a subclass, but should restrict to that subclass
    $class eq __PACKAGE__ || $need_class->isa($class)
-      or croak "Expression $need_class does not inherit from $class";
+      or invalid_graft("Expression $need_class does not inherit from $class");
    $need_class->_construct(\@args, 1);
 }
 
@@ -418,7 +422,7 @@ sub _define_expr {
    # TODO: use Class::XSAccessor if available
    *{$class.'::new'}= \&JGraft::_Node::_new;
    *{$class.'::id'}= sub { $id };
-   *{$class.'::returns'}= sub { $returns };
+   *{$class.'::returns'}= sub { $returns } unless defined &{$class.'::returns'};
    *{$class.'::forms'}= sub { \@forms };
    for (keys %attrs) {
       my $attr= $_;
@@ -748,6 +752,72 @@ _define_expr(MOD => 78, 4,
       min => 2
    }
 );
+
+sub JGraft::Expr::LOCAL::returns {
+   my $self=shift;
+   return ref($self)? type_mask($self->{return_value_expr}) : 127;
+}
+
+sub JGraft::Expr::Ref::_validate {
+   my $self=shift;
+   JGraft::_Node::_path_elements($self->{path},1) if exists $self->{path};
+}
+
+sub JGraft::Expr::TEMP::_validate {
+   my $self=shift;
+   JGraft::Expr::Ref::_validate($self);
+   @{$self->{path}} or JGraft::_Node::_bad('TEMP requires a path');
+}
+
+sub JGraft::Expr::NUM::_validate {
+   my $self=shift;
+   return unless defined $self->{min} && defined $self->{max}
+      && !is_expr($self->{min}) && !is_expr($self->{max});
+   $self->{min} <= $self->{max} or JGraft::_Node::_bad('NUM bounds are reversed');
+}
+
+sub JGraft::Expr::REP::_validate {
+   my $self=shift;
+   return unless exists $self->{min} && exists $self->{max}
+      && !is_expr($self->{min}) && !is_expr($self->{max});
+   $self->{max} <= 0 || $self->{max} >= $self->{min}
+      or JGraft::_Node::_bad('REP bounds are reversed');
+}
+
+sub JGraft::Expr::CHARS::_validate {
+   my $self=shift;
+   my $values=$self->{entries};
+   for (my $i=0; $i+1<@$values; ++$i) {
+      my ($a,$b)=map _codepoint($_), @$values[$i,$i+1];
+      if (defined $a && defined $b) {
+         $a <= $b or JGraft::_Node::_bad('CHARS range is reversed');
+         ++$i;
+      }
+   }
+}
+
+sub _codepoint {
+   my $v=shift;
+   return 0x10ffff unless defined $v;
+   return if is_expr($v);
+   my $type=type_mask($v);
+   return $v if $type==4;
+   return ord($v) if $type==8 && length($v)==1;
+   return;
+}
+
+sub JGraft::Expr::JOIN::_validate {
+   my $self=shift;
+   my $split=$self->{split_spec};
+   if (is_expr($split) && $split->is_match) {
+      JGraft::_Node::_bad('Regex joining requires a default separator');
+   }
+   if (ref($split) eq 'HASH' && is_expr($split->{sep}) && $split->{sep}->is_match) {
+      exists $split->{keep} || exists $split->{default}
+         or JGraft::_Node::_bad('Regex joining requires a default separator');
+      JGraft::_Node::_expect($split->{default},8,'string separator') unless exists $split->{keep};
+   }
+}
 
 require JGraft;
 

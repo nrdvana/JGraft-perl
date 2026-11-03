@@ -66,6 +66,7 @@ use experimental 'signatures';
 #use warnings;
 #__end__
 use Carp;
+use JGraft::Util 'invalid_graft';
 require JGraft::_Node;
 our @ISA= ('JGraft::_Node');
 
@@ -94,10 +95,10 @@ our (%by_name, %by_id, %to_class); # populated below
 sub get_class {
    # can be called as class method or function
    shift if @_ == 2 && ($_[0] eq __PACKAGE__ || $_[0]->isa(__PACKAGE__));
-   @_ == 1 or croak "Expected one argument";
+   @_ == 1 or invalid_graft("Expected one argument");
    my $name= $_[0];
-   defined $name && !ref $name or croak "Expected an action name or ID";
-   $to_class{$name} or croak "Unknown JGraft action: '$name'";
+   defined $name && !ref $name or invalid_graft("Expected an action name or ID");
+   $to_class{$name} or invalid_graft("Unknown JGraft action: '$name'");
 }
 
 =attribute forms
@@ -122,13 +123,15 @@ sub new_from_json_data($class, $in) {
 #   my ($class, $in)= @_;
 #   croak "Expected one argument" unless @_ == 2;
 #__end__
+   local $JGraft::Util::_construction_context={class=>$class,method=>'new_from_json_data',
+      parent=>$JGraft::Util::_construction_context};
    ref $in eq 'ARRAY' && @$in
-      or croak "Expected an array of at least one element";
+      or invalid_graft("Expected an array of at least one element");
    my ($op, @args)= @$in;
    my $need_class= __PACKAGE__->get_class($op);
    # ->new_from_json_data can be called on a subclass, but should restrict to that subclass
    $class eq __PACKAGE__ || $need_class->isa($class)
-      or croak "Action $need_class does not inherit from $class";
+      or invalid_graft("Action $need_class does not inherit from $class");
    $need_class->_construct(\@args, 1);
 }
 
@@ -242,6 +245,8 @@ _define_action(SPLICE => 7,
       min => 2
    }
 );
+
+sub JGraft::Action::ATSPLIT::_validate { &JGraft::Expr::JOIN::_validate }
 
 require JGraft;
 require JGraft::Expr;

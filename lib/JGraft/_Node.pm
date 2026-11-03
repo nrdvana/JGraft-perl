@@ -3,7 +3,6 @@ package JGraft::_Node;
 # ABSTRACT: Shared constructor and notation handling for JGraft nodes
 use strict;
 use warnings;
-use Carp 'croak';
 use Scalar::Util qw(blessed refaddr);
 use JGraft::Util ();
 use JSON::PP ();
@@ -16,11 +15,13 @@ use JSON::PP ();
 *_is_action= \&JGraft::Util::is_action;
 
 sub _name { (my $name= ref($_[0]) || $_[0]) =~ s/.*:://; $name }
-sub _bad { croak 'INVALID_GRAFT: '.join('', @_) }
+*_bad= \&JGraft::Util::invalid_graft;
 
 sub _new {
    my $class= shift;
    $class= ref($class) || $class;
+   local $JGraft::Util::_construction_context={class=>$class,method=>'new',
+      parent=>$JGraft::Util::_construction_context};
    if (@_ == 1 && ref $_[0] eq 'ARRAY') {
       return $class->_construct($_[0], 0, {});
    }
@@ -44,6 +45,8 @@ sub _new {
 # _parse deliberately receives the operation token as well as its operands.
 sub _parse {
    my ($class, $in, $seen)= @_;
+   local $JGraft::Util::_construction_context={class=>$class,method=>'new_from_json_data',
+      parent=>$JGraft::Util::_construction_context};
    ref $in eq 'ARRAY' && @$in or _bad('Expected a complete operation array');
    my ($token, @args)= @$in;
    $class->get_class($token) eq $class or _bad("Operation does not name $class");
@@ -105,6 +108,9 @@ sub _assemble {
 
 sub _construct {
    my ($class, $args, $parse, $seen, $form)= @_;
+   my $context=$JGraft::Util::_construction_context;
+   local $JGraft::Util::_construction_context=$context && $context->{class} eq $class? $context
+      : {class=>$class,method=>$parse?'new_from_json_data':'new',parent=>$context};
    unless ($form) {
       ($form)= grep _fits($_, scalar @$args), @{$class->forms};
    }
@@ -113,6 +119,8 @@ sub _construct {
    my $i= 0;
    for my $field (@{$form->{fields} || []}) {
       last if $i == @$args;
+      local $JGraft::Util::_construction_context={%{$JGraft::Util::_construction_context},
+         operand=>$field->[0],index=>$i};
       $attrs{$field->[0]}= _argument($args->[$i++], $field->[1], $parse, $seen);
    }
    if (my $repeat= $form->{repeat}) {
@@ -121,12 +129,16 @@ sub _construct {
       if ($form->{tail} && (!$form->{optional_tail} || ($end - $i) % $width)) {
          --$end;
          my $tail= $form->{tail};
+         local $JGraft::Util::_construction_context={%{$JGraft::Util::_construction_context},
+            operand=>$tail->[0],index=>$end};
          $attrs{$tail->[0]}= _argument($args->[$end], $tail->[1], $parse, $seen);
       }
       my @list;
       while ($i < $end) {
          my @group;
          for my $j (1..$#$repeat) {
+            local $JGraft::Util::_construction_context={%{$JGraft::Util::_construction_context},
+               operand=>$repeat->[0],index=>$i};
             push @group, _argument($args->[$i++], $repeat->[$j], $parse, $seen);
          }
          push @list, $width == 1? $group[0] : \@group;
@@ -364,59 +376,7 @@ sub _split_spec {
    return \%copy;
 }
 
-sub _validate {
-   my $self= shift;
-   my $name= $self->_name;
-   if ($self->isa('JGraft::Expr::Ref')) {
-      _path_elements($self->{path}, 1) if exists $self->{path};
-      $name eq 'TEMP' && !@{$self->{path}} and _bad('TEMP requires a path');
-   }
-   if ($name eq 'NUM' && defined $self->{min} && defined $self->{max}
-      && !_is_expr($self->{min}) && !_is_expr($self->{max})) {
-      $self->{min} <= $self->{max} or _bad('NUM bounds are reversed');
-   }
-   if ($name eq 'REP' && exists $self->{min} && exists $self->{max}
-      && !_is_expr($self->{min}) && !_is_expr($self->{max})) {
-      $self->{max} <= 0 || $self->{max} >= $self->{min} or _bad('REP bounds are reversed');
-   }
-   if ($name eq 'CHARS') {
-      my $values= $self->{entries};
-      for (my $i= 0; $i + 1 < @$values; ++$i) {
-         my ($a, $b)= map _codepoint($_), @$values[$i, $i+1];
-         if (defined $a && defined $b) {
-            $a <= $b or _bad('CHARS range is reversed');
-            ++$i;
-         }
-      }
-   }
-   if ($name eq 'JOIN' || $name eq 'ATSPLIT') {
-      my $split= $self->{split_spec};
-      if (_is_expr($split) && $split->is_match) { _bad('Regex joining requires a default separator') }
-      if (ref $split eq 'HASH' && _is_expr($split->{sep}) && $split->{sep}->is_match) {
-         exists $split->{keep} || exists $split->{default} or _bad('Regex joining requires a default separator');
-         _expect($split->{default}, 8, 'string separator') unless exists $split->{keep};
-      }
-   }
-}
-
-sub _codepoint {
-   my $v= shift;
-   return 0x10ffff unless defined $v;
-   return if _is_expr($v);
-   my $type= _type($v);
-   return $v if $type == 4;
-   return ord($v) if $type == 8 && length($v) == 1;
-   return;
-}
-
-sub _result_types {
-   my $self= shift;
-   my $name= $self->_name;
-   return $self->{return_value_expr}->_result_types
-      if $name eq 'LOCAL' && _is_expr($self->{return_value_expr});
-   return _type($self->{return_value_expr}) if $name eq 'LOCAL';
-   return $self->returns;
-}
+sub _validate { }
 
 sub _encode_tree {
    my $v= shift;

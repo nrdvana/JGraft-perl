@@ -79,7 +79,7 @@ sub apply {
          require JGraft;
          my $parsed= eval { JGraft::jgparse($graft) };
          my $err= $@;
-         $err and $self->_fail('INVALID_GRAFT',"$err");
+         $err and $self->_fail('INVALID_GRAFT',"$err",$err);
          $graft= $parsed;
       }
       $self->_run($graft,1);
@@ -101,11 +101,12 @@ sub apply {
 }
 
 sub _fail {
-   my ($self,$code,$message)= @_;
+   my ($self,$code,$message,$cause)= @_;
    $self->{error}= $code;
    $self->{message}= $message;
    $self->{diagnostic}= { action=>$self->{action}, expression=>$self->{expression},
       path=>[ @{$self->{current}[1]} ] };
+   $self->{diagnostic}{cause}=$cause if defined $cause;
    die $self;
 }
 sub _charge {
@@ -767,6 +768,8 @@ The diagnostic text for an expected failure.
 =attribute diagnostic
 
 The action, expression, and current path recorded at failure.
+For graft parsing failures, C<cause> preserves the original exception, including
+L<JGraft::Error> construction context and its text stack trace.
 
 =attribute success
 
