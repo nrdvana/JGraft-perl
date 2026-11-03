@@ -69,6 +69,19 @@ use Carp;
 require JGraft::_Node;
 our @ISA= ('JGraft::_Node');
 
+=method exec
+
+  my $output= $action->exec($input, %options);
+
+Apply this action through L<JGraft/jgexec>. Throws a L<JGraft::Exec> object on failure.
+
+=cut
+
+sub exec {
+   require JGraft;
+   JGraft::jgexec(@_);
+}
+
 =function get_class
 
   $act_class= JGraft::Action->get_class($name_or_id);

@@ -46,7 +46,7 @@ use Scalar::Util qw( blessed openhandle );
 use overload ();
 
 use Exporter 'import';
-@JGraft::EXPORT_OK= qw( jgdiff jgpatch jgparse json_data );
+@JGraft::EXPORT_OK= qw( jgdiff jgexec jgparse json_data );
 
 =head1 DESCRIPTION
 
@@ -95,10 +95,10 @@ disconnected from the original.
 
 sub jgexec {
    my ($graft, $data_in, %options)= @_;
-   require JGraft::Patch;
-   my $patch= JGraft::Patch->new(%options, jgraft => $graft);
-   my @ret= $patch->patch($data_in);
-   return @ret? $ret[0] : die $patch;
+   require JGraft::Exec;
+   my $exec= JGraft::Exec->new(%options, jgraft => $graft);
+   my @ret= $exec->apply($data_in);
+   return @ret? $ret[0] : die $exec;
 }
 
 =function jgparse
@@ -126,17 +126,17 @@ You can disable the warning with C<< $JGraft::warn_utf8_scalar=0 >>.
 our $warn_utf8_scalar= 1;
 sub jgparse {
    my $something= shift;
-   return !defined $something? croak "Undefined input"
-        : !ref($something)? do {
-            if ($warn_utf8_scalar && $something =~ /[^0-\x7F]/ && utf8::decode(my $tmp= $something)) {
-               carp "Scalar will be parsed as characters, but looks like UTF-8 bytes.  "
-                  . "Pass UTF-8 buffers as a scalar-ref.";
-               $warn_utf8_scalar= 0;
-            }
-            JGraft::Action->new_from_json_data(_json()->new->allow_nonref(0)->decode($something));
-          }
-        : blessed($something) && $something->isa('JGraft::Action')? $something
-        : JGraft::Action->new_from_json_data(json_data($something));
+   defined $something or croak "Undefined input";
+   unless (ref $something) {
+      if ($warn_utf8_scalar && $something =~ /[^\x00-\x7F]/ && utf8::decode(my $tmp= $something)) {
+         carp "Scalar will be parsed as characters, but looks like UTF-8 bytes.  "
+            . "Pass UTF-8 buffers as a scalar-ref.";
+         $warn_utf8_scalar= 0;
+      }
+      return JGraft::Action->new_from_json_data(_json()->new->allow_nonref(0)->decode($something));
+   }
+   return $something if blessed($something) && $something->isa('JGraft::Action');
+   return JGraft::Action->new_from_json_data(json_data($something));
 }
 
 require JGraft::Action;

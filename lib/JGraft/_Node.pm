@@ -5,28 +5,18 @@ use strict;
 use warnings;
 use Carp 'croak';
 use Scalar::Util qw(blessed refaddr);
-use B ();
+use JGraft::Util ();
 use JSON::PP ();
 
-# Type masks: null, boolean, number, string, array, object, date.
-sub _type {
-   my $v= shift;
-   return 1 unless defined $v;
-   return 2 if JSON::PP::is_bool($v);
-   return $v->_result_types if blessed($v) && $v->isa('JGraft::Expr');
-   return 16 if ref $v eq 'ARRAY';
-   return 32 if ref $v eq 'HASH';
-   return 0 if ref $v;
-   my $flags= B::svref_2object(\$v)->FLAGS;
-   return ($flags & (B::SVp_IOK() | B::SVp_NOK())) && !($flags & B::SVp_POK())? 4 : 8;
-}
+# Keep the constructor's private names while sharing predicates with execution.
+*_type= \&JGraft::Util::type_mask;
+*_finite= \&JGraft::Util::is_finite;
+*_integer= \&JGraft::Util::is_integer;
+*_is_expr= \&JGraft::Util::is_expr;
+*_is_action= \&JGraft::Util::is_action;
 
 sub _name { (my $name= ref($_[0]) || $_[0]) =~ s/.*:://; $name }
-sub _finite { my $v= shift; ($v - $v) == 0 }
-sub _integer { my $v= shift; _type($v) == 4 && _finite($v) && $v == int($v) }
 sub _bad { croak 'INVALID_GRAFT: '.join('', @_) }
-sub _is_expr { blessed($_[0]) && $_[0]->isa('JGraft::Expr') }
-sub _is_action { blessed($_[0]) && $_[0]->isa('JGraft::Action') }
 
 sub _new {
    my $class= shift;
