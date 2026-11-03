@@ -246,6 +246,7 @@ _define_action(SPLICE => 7,
    }
 );
 
+# ATSPLIT needs the same split_spec validation as the JOIN expression.
 sub JGraft::Action::ATSPLIT::_validate { &JGraft::Expr::JOIN::_validate }
 
 require JGraft;

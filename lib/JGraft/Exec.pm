@@ -14,8 +14,13 @@ sub new {
    my $class= shift;
    @_ % 2 == 0 or croak 'Expected name/value options';
    my %opt= @_;
-   my %allowed= map {$_=>1} qw(jgraft input clone undo limits);
+   my %allowed= map {$_=>1} qw(jgraft input clone undo limits codepoint_policy);
    $allowed{$_} or croak "Unknown execution option '$_'" for keys %opt;
+   if (exists $opt{codepoint_policy}) {
+      my $policy=$opt{codepoint_policy};
+      defined($policy) && (ref($policy) eq 'CODE' || (!ref($policy) && $policy =~ /\A(?:preserve|reject|substitute)\z/))
+         or croak 'codepoint_policy must be preserve, reject, substitute, or a coderef';
+   }
    my %limits= (ops=>1000000, mem=>67108864, new_obj=>100000, depth=>256);
    if (exists $opt{limits}) {
       ref $opt{limits} eq 'HASH' or croak 'limits must be a hashref';
@@ -58,6 +63,8 @@ sub apply {
    $self->{lineage}= {};
    delete $self->{undo_state};
    $self->{pending}= {};
+   $self->{regex_literals}= {};
+   $self->{char_classes}= {};
    $self->{epoch}= 1;
    $self->{root}= [$input,1];
    $self->{current}= [$self->{root},[]];
@@ -157,6 +164,7 @@ sub _inspect {
    my $type= type_mask($v);
    if (!ref $v || JSON::PP::is_bool($v)) {
       $self->_step(length($v)*.001) if $type == TYPE_STRING;
+      $self->_check_string($v,$ast?'graft':'input') if $type == TYPE_STRING;
       $type != TYPE_NUMBER || is_finite($v) or $self->_fail('UNSUPPORTED_GRAFT','Non-finite input number');
       return;
    }
@@ -180,9 +188,16 @@ sub _inspect {
    else {
       for my $key (keys %$v) {
          $self->_step(length($key)*.001);
+         $self->_check_string($key,$ast?'graft key':'input key');
          $self->_inspect($v->{$key},$depth+1,$active,$ast,$alloc);
       }
    }
+}
+
+sub _check_string {
+   my ($self,$value,$kind)=@_;
+   require JGraft::_String;
+   JGraft::_String->_check($self,$value,$kind);
 }
 
 sub _cow {
@@ -234,53 +249,85 @@ sub _run {
    is_action($action) or $self->_fail('INVALID_GRAFT','Expected an action object');
    local $self->{action}=$action;
    local $self->{temp}=[$self->_new_hash(0),1];
-   my $name=$action->_name;
-   if ($name eq 'JGRAFT') {
-      my $meta=$action->metadata;
-      if (exists $meta->{v} && $meta->{v}>1) { $self->_fail('UNSUPPORTED_GRAFT','Unsupported JGraft version') }
-      local $self->{const}= $self->{const};
-      local $self->{expr}= $self->{expr};
-      for my $ns ('const','expr') {
-         next unless exists $meta->{$ns};
-         my $copy=$self->_new_hash(scalar keys %{$self->{$ns}[0]});
-         $self->_step(scalar keys %{$self->{$ns}[0]});
-         %$copy=%{$self->{$ns}[0]};
-         $self->{$ns}=[$copy,1];
-         my $defs=$meta->{$ns};
-         $self->_step(scalar @$defs);
-         for (my $i=0;$i<@$defs;$i+=2) {
-            my $key=$defs->[$i];
-            $key="$key";
-            my $v=$ns eq 'const'? $self->_eval($defs->[$i+1],$depth+1) : $defs->[$i+1];
-            $self->_snapshot($v) if $ns eq 'const';
-            $self->_write([$self->{$ns},[$key]],$v);
-         }
-      }
-      local $self->{stash}=[$self->_new_hash(0),1];
-      $self->_step(scalar @{$action->actions});
-      $self->_run($_,$depth+1) for @{$action->actions};
-   }
-   elsif ($name eq 'AT') {
-      my $loc=$self->_path($action->path,'at',$depth+1);
-      my ($v,$canonical)=$self->_read($loc);
-      local $self->{current}=$canonical;
-      $self->_step(scalar @{$action->actions});
-      $self->_run($_,$depth+1) for @{$action->actions};
-   }
-   elsif ($name eq 'COPY') {
-      my $pairs=$action->assignments;
-      $self->_step(scalar @$pairs);
-      for my $pair (@$pairs) {
-         my $v=$self->_eval($pair->[0],$depth+1);
-         # Keep the value stable even if destination expressions read from it.
-         $self->_snapshot($v);
-         my $loc=$self->_path($pair->[1],'write',$depth+1);
-         my $dest=$self->_probe($loc,undef,0);
-         $self->_write($dest,$v);
+   return $action->_execute($self,$depth);
+}
+
+# Keep action execution methods alongside expression execution methods in this
+# module, with per-action context and TEMP lifetime managed by _run above.
+sub JGraft::Action::_execute {
+   my ($action,$self)= @_;
+   $self->_fail('UNSUPPORTED_GRAFT','Action '.$action->_name.' is not implemented');
+}
+sub JGraft::Action::JGRAFT::_execute {
+   my ($action,$self,$depth)= @_;
+   my $meta=$action->metadata;
+   if (exists $meta->{v} && $meta->{v}>1) { $self->_fail('UNSUPPORTED_GRAFT','Unsupported JGraft version') }
+   local $self->{const}= $self->{const};
+   local $self->{expr}= $self->{expr};
+   for my $ns ('const','expr') {
+      next unless exists $meta->{$ns};
+      my $copy=$self->_new_hash(scalar keys %{$self->{$ns}[0]});
+      $self->_step(scalar keys %{$self->{$ns}[0]});
+      %$copy=%{$self->{$ns}[0]};
+      $self->{$ns}=[$copy,1];
+      my $defs=$meta->{$ns};
+      $self->_step(scalar @$defs);
+      for (my $i=0;$i<@$defs;$i+=2) {
+         my $key=$defs->[$i];
+         $key="$key";
+         my $v=$ns eq 'const'? $self->_eval($defs->[$i+1],$depth+1) : $defs->[$i+1];
+         $self->_snapshot($v) if $ns eq 'const';
+         $self->_write([$self->{$ns},[$key]],$v);
       }
    }
-   elsif ($name eq 'MOVE') { $self->_move($action->moves,$depth+1) }
-   else { $self->_fail('UNSUPPORTED_GRAFT',"Action $name is not implemented") }
+   local $self->{stash}=[$self->_new_hash(0),1];
+   $self->_step(scalar @{$action->actions});
+   $self->_run($_,$depth+1) for @{$action->actions};
+}
+sub JGraft::Action::MATCH::_execute {
+   my ($action,$self,$depth)= @_;
+   my $match=$self->_match($action->match_spec,$depth+1,1);
+   $match or $self->_fail('NO_MATCH','Current node does not match');
+   local $self->{cap}=[$match->{captures},1];
+   $self->_step(scalar @{$action->actions});
+   $self->_run($_,$depth+1) for @{$action->actions};
+}
+sub JGraft::Action::IF::_execute {
+   my ($action,$self,$depth)= @_;
+   $self->_step(scalar @{$action->branches});
+   for my $branch (@{$action->branches}) {
+      my $match=$self->_match($branch->[0],$depth+1,1);
+      next unless $match;
+      local $self->{cap}=[$match->{captures},1];
+      $self->_run($branch->[1],$depth+1);
+      return;
+   }
+   $self->_run($action->else_action,$depth+1) if exists $action->{else_action};
+}
+sub JGraft::Action::AT::_execute {
+   my ($action,$self,$depth)= @_;
+   my $loc=$self->_path($action->path,'at',$depth+1);
+   my ($v,$canonical)=$self->_read($loc);
+   local $self->{current}=$canonical;
+   $self->_step(scalar @{$action->actions});
+   $self->_run($_,$depth+1) for @{$action->actions};
+}
+sub JGraft::Action::COPY::_execute {
+   my ($action,$self,$depth)= @_;
+   my $pairs=$action->assignments;
+   $self->_step(scalar @$pairs);
+   for my $pair (@$pairs) {
+      my $v=$self->_eval($pair->[0],$depth+1);
+      # Keep the value stable even if destination expressions read from it.
+      $self->_snapshot($v);
+      my $loc=$self->_path($pair->[1],'write',$depth+1);
+      my $dest=$self->_probe($loc,undef,0);
+      $self->_write($dest,$v);
+   }
+}
+sub JGraft::Action::MOVE::_execute {
+   my ($action,$self,$depth)= @_;
+   return $self->_move($action->moves,$depth+1);
 }
 
 sub _path {
@@ -537,6 +584,29 @@ sub _move {
    die $err unless $ok;
 }
 
+sub _match {
+   my ($self,$spec,$depth,$observable)=@_;
+   require JGraft::_Match;
+   my $state=JGraft::_Match->_new($self,$observable);
+   my ($cell,$parts)=@{$self->{current}};
+   my ($value,$exists)=@$cell;
+   my $parent;
+   $self->_step(scalar @$parts);
+   for my $key (@$parts) {
+      unless ($exists && (ref($value) eq 'ARRAY' || ref($value) eq 'HASH') && $self->_present($value,$key)) {
+         $exists=0; $value=undef; last;
+      }
+      $parent=$value;
+      $value=$self->_child($value,$key);
+   }
+   my $prop=@$parts? $parts->[-1] : $self->{match_cursor}? $self->{match_cursor}{prop} : undef;
+   my $cursor=$state->_cursor($value,$exists,$prop,undef);
+   $cursor->{array}=$parent if ref($parent) eq 'ARRAY';
+   $cursor->{array}=$self->{match_cursor}{array} if !@$parts && $self->{match_cursor} && $self->{match_cursor}{array};
+   $cursor->{string}=$self->{match_cursor}{string} if !@$parts && $self->{match_cursor} && $self->{match_cursor}{string};
+   return $state->_test($spec,$cursor,$depth,0)? $state : undef;
+}
+
 sub _macro {
    my ($self,$expr,$depth)= @_;
    my $name=$self->_eval($expr->name,$depth+1);
@@ -552,7 +622,9 @@ sub _eval {
    $self->_step(1);
    if (is_expr($v)) {
       local $self->{expression}=$v;
-      return $self->_expression($v,$depth);
+      my $result=$self->_expression($v,$depth);
+      $self->_check_string($result,'expression') if type_mask($result)==TYPE_STRING;
+      return $result;
    }
    my $t=type_mask($v);
    if ($t==TYPE_ARRAY) {
@@ -564,10 +636,14 @@ sub _eval {
    if ($t==TYPE_OBJECT) {
       my $out=$self->_new_hash(scalar keys %$v);
       $self->_step(scalar keys %$v);
-      $out->{$_}=$self->_eval($v->{$_},$depth+1) for keys %$v;
+      for my $key (keys %$v) {
+         $self->_check_string($key,'expression key');
+         $out->{$key}=$self->_eval($v->{$key},$depth+1);
+      }
       return $out;
    }
    $self->_step(length($v)*.001) if $t==TYPE_STRING;
+   $self->_check_string($v,'literal') if $t==TYPE_STRING;
    $t==TYPE_NULL || $t==TYPE_BOOLEAN || $t==TYPE_NUMBER || $t==TYPE_STRING or $self->_fail('UNSUPPORTED_GRAFT','Unsupported literal value');
    return $v;
 }
@@ -578,100 +654,190 @@ sub _input_value {
 }
 sub _expression {
    my ($self,$expr,$depth)= @_;
-   my $name=$expr->_name;
-   return $self->_eval($self->_macro($expr,$depth+1),$depth+1) if $name eq 'EXPR';
-   return ($self->_read($self->_path($expr,'read',$depth+1)))[0] if $expr->is_ref;
-   if ($name eq 'FAIL') { $self->_fail('INVALID_TARGET','FAIL expression') }
-   if ($name eq 'LENGTH') {
-      my $v=$self->_input_value($expr,'value_expr',$depth);
-      my $t=type_mask($v);
-      return scalar @$v if $t==TYPE_ARRAY;
-      if ($t==TYPE_STRING) { $self->_step(length($v)*.001); return length($v) }
-      $self->_fail('INVALID_TARGET','LENGTH expects an array or string');
+   return $expr->_execute($self,$depth);
+}
+
+# Install execution methods here so parsing-only users need not load them.
+# References and match expressions inherit their category's common handler.
+sub JGraft::Expr::_execute {
+   my ($expr,$self)= @_;
+   $self->_fail('UNSUPPORTED_GRAFT','Expression '.$expr->_name.' is not implemented');
+}
+sub JGraft::Expr::Ref::_execute {
+   my ($expr,$self,$depth)= @_;
+   return ($self->_read($self->_path($expr,'read',$depth+1)))[0];
+}
+sub JGraft::Expr::EXPR::_execute {
+   my ($expr,$self,$depth)= @_;
+   return $self->_eval($self->_macro($expr,$depth+1),$depth+1);
+}
+sub JGraft::Expr::Match::_execute {
+   my ($expr,$self,$depth)= @_;
+   return $self->_match($expr,$depth+1)? JSON::PP::true : JSON::PP::false;
+}
+sub JGraft::Expr::CAPTURE::_execute {
+   my ($expr,$self,$depth)= @_;
+   my $match=$self->_match($expr->match_expr,$depth+1,1);
+   return $match? $match->{captures} : JSON::PP::false;
+}
+sub JGraft::Expr::CURPROP::_execute {
+   my ($expr,$self)= @_;
+   return $self->{match_cursor}{prop} if $self->{match_cursor};
+   return @{$self->{current}[1]}? $self->{current}[1][-1] : undef;
+}
+sub JGraft::Expr::FAIL::_execute {
+   my ($expr,$self)= @_;
+   $self->_fail('INVALID_TARGET','FAIL expression');
+}
+sub JGraft::Expr::LENGTH::_execute {
+   my ($expr,$self,$depth)= @_;
+   my $v=$self->_input_value($expr,'value_expr',$depth);
+   my $t=type_mask($v);
+   return scalar @$v if $t==TYPE_ARRAY;
+   if ($t==TYPE_STRING) { $self->_step(length($v)*.001); return length($v) }
+   $self->_fail('INVALID_TARGET','LENGTH expects an array or string');
+}
+sub JGraft::Expr::SLICE::_execute {
+   my ($expr,$self,$depth)= @_;
+   return $self->_slice($expr,$depth+1);
+}
+sub JGraft::Expr::LOCAL::_execute {
+   my ($expr,$self,$depth)= @_;
+   my $copy=$self->_new_hash(scalar keys %{$self->{temp}[0]});
+   $self->_step(scalar keys %{$self->{temp}[0]});
+   %$copy=%{$self->{temp}[0]};
+   local $self->{temp}=[$copy,1];
+   local $self->{current}=$self->{current};
+   local $self->{match_cursor}=$self->{match_cursor};
+   $self->_step(scalar @{$expr->bindings});
+   for my $pair (@{$expr->bindings}) {
+      my $key=$self->_eval($pair->[0],$depth+1);
+      my $t=type_mask($key);
+      $t==TYPE_NULL || $t==TYPE_STRING || ($t==TYPE_NUMBER && is_finite($key)) or $self->_fail('INVALID_OPERAND','Invalid LOCAL property');
+      my $value=$self->_eval($pair->[1],$depth+1);
+      if (!defined $key) { $self->{current}=[[$value,1],[]]; $self->{match_cursor}=undef }
+      else { $self->{temp}[0]{"$key"}=$value }
    }
-   if ($name eq 'SLICE') { return $self->_slice($expr,$depth+1) }
-   if ($name eq 'LOCAL') {
-      my $copy=$self->_new_hash(scalar keys %{$self->{temp}[0]});
-      $self->_step(scalar keys %{$self->{temp}[0]});
-      %$copy=%{$self->{temp}[0]};
-      local $self->{temp}=[$copy,1];
-      local $self->{current}=$self->{current};
-      $self->_step(scalar @{$expr->bindings});
-      for my $pair (@{$expr->bindings}) {
-         my $key=$self->_eval($pair->[0],$depth+1);
-         my $t=type_mask($key);
-         $t==TYPE_NULL || $t==TYPE_STRING || ($t==TYPE_NUMBER && is_finite($key)) or $self->_fail('INVALID_OPERAND','Invalid LOCAL property');
-         my $value=$self->_eval($pair->[1],$depth+1);
-         if (!defined $key) { $self->{current}=[[$value,1],[]] }
-         else { $self->{temp}[0]{"$key"}=$value }
-      }
-      return $self->_eval($expr->return_value_expr,$depth+1);
+   return $self->_eval($expr->return_value_expr,$depth+1);
+}
+
+sub _boolean_value {
+   my ($self,$arg,$depth)= @_;
+   my $value=$self->_eval($arg,$depth);
+   type_mask($value)==TYPE_BOOLEAN or $self->_fail('INVALID_TARGET','Logical operands must be booleans');
+   return $value;
+}
+sub JGraft::Expr::AND::_execute {
+   my ($expr,$self,$depth)= @_;
+   $self->_step(scalar @{$expr->value_exprs});
+   for my $arg (@{$expr->value_exprs}) {
+      return JSON::PP::false unless $self->_boolean_value($arg,$depth+1);
    }
-   if ($name eq 'AND' || $name eq 'OR' || $name eq 'NOT') {
+   return JSON::PP::true;
+}
+sub JGraft::Expr::OR::_execute {
+   my ($expr,$self,$depth)= @_;
+   $self->_step(scalar @{$expr->value_exprs});
+   for my $arg (@{$expr->value_exprs}) {
+      return JSON::PP::true if $self->_boolean_value($arg,$depth+1);
+   }
+   return JSON::PP::false;
+}
+sub JGraft::Expr::NOT::_execute {
+   my ($expr,$self,$depth)= @_;
+   $self->_step(scalar @{$expr->value_exprs});
+   for my $arg (@{$expr->value_exprs}) {
+      return JSON::PP::false if $self->_boolean_value($arg,$depth+1);
+   }
+   return JSON::PP::true;
+}
+sub JGraft::Expr::CASTBOOL::_execute {
+   my ($expr,$self,$depth)= @_;
+   my $v=$self->_input_value($expr,'value_expr',$depth);
+   my $t=type_mask($v);
+   return $v if $t==TYPE_BOOLEAN;
+   return $v? JSON::PP::true : JSON::PP::false if $t==TYPE_NUMBER && ($v==0 || $v==1);
+   return $v eq 'true'? JSON::PP::true : JSON::PP::false if $t==TYPE_STRING && ($v eq 'true' || $v eq 'false');
+   $self->_fail('INVALID_TARGET','Invalid CASTBOOL input');
+}
+sub JGraft::Expr::CASTNUM::_execute {
+   my ($expr,$self,$depth)= @_;
+   my $v=$self->_input_value($expr,'value_expr',$depth);
+   my $t=type_mask($v);
+   return $v if $t==TYPE_NUMBER;
+   if ($t==TYPE_STRING && $v =~ /\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z/) {
+      $self->_step(length($v)*.001);
+      my $num=0+$v;
+      is_finite($num) or $self->_fail('UNSUPPORTED_GRAFT','Number outside supported range');
+      return $num;
+   }
+   $self->_fail('INVALID_TARGET','Invalid CASTNUM input');
+}
+sub JGraft::Expr::CASTSTR::_execute {
+   my ($expr,$self,$depth)= @_;
+   my $v=$self->_input_value($expr,'value_expr',$depth);
+   my $t=type_mask($v);
+   return $v if $t==TYPE_STRING;
+   return $v? 'true':'false' if $t==TYPE_BOOLEAN;
+   if ($t==TYPE_NUMBER) {
+      require JGraft;
+      return JGraft::_json()->new->allow_nonref->encode($v);
+   }
+   $self->_fail('INVALID_TARGET','Invalid CASTSTR input');
+}
+
+sub _numeric_values {
+   my ($self,$expr,$depth)= @_;
+   my @values;
+   if (exists $expr->{value_exprs}) {
       $self->_step(scalar @{$expr->value_exprs});
-      for my $arg (@{$expr->value_exprs}) {
-         my $v=$self->_eval($arg,$depth+1);
-         type_mask($v)==TYPE_BOOLEAN or $self->_fail('INVALID_TARGET','Logical operands must be booleans');
-         return JSON::PP::false if $name eq 'AND' && !$v;
-         return $name eq 'NOT'? JSON::PP::false : JSON::PP::true if $name ne 'AND' && $v;
+      @values=map $self->_eval($_,$depth+1), @{$expr->value_exprs};
+      if (@values==1 && ref $values[0] eq 'ARRAY') {
+         my $array=$values[0];
+         $self->_step(scalar @$array);
+         for my $i (0..$#$array) { $self->_present($array,$i) or $self->_fail('INVALID_TARGET','Deleted array element') }
+         @values=@$array;
       }
-      return $name eq 'OR'? JSON::PP::false : JSON::PP::true;
    }
-   if ($name eq 'CASTBOOL' || $name eq 'CASTNUM' || $name eq 'CASTSTR') {
-      my $v=$self->_input_value($expr,'value_expr',$depth);
-      my $t=type_mask($v);
-      if ($name eq 'CASTBOOL') {
-         return $v if $t==TYPE_BOOLEAN;
-         return $v? JSON::PP::true : JSON::PP::false if $t==TYPE_NUMBER && ($v==0 || $v==1);
-         return $v eq 'true'? JSON::PP::true : JSON::PP::false if $t==TYPE_STRING && ($v eq 'true' || $v eq 'false');
-      }
-      elsif ($name eq 'CASTNUM') {
-         return $v if $t==TYPE_NUMBER;
-         if ($t==TYPE_STRING && $v =~ /\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z/) {
-            $self->_step(length($v)*.001);
-            my $num=0+$v;
-            is_finite($num) or $self->_fail('UNSUPPORTED_GRAFT','Number outside supported range');
-            return $num;
-         }
-      }
-      else {
-         return $v if $t==TYPE_STRING;
-         return $v? 'true':'false' if $t==TYPE_BOOLEAN;
-         if ($t==TYPE_NUMBER) {
-            require JGraft;
-            return JGraft::_json()->new->allow_nonref->encode($v);
-         }
-      }
-      $self->_fail('INVALID_TARGET',"Invalid $name input");
-   }
-   if ($name eq 'ADD' || $name eq 'MUL' || $name eq 'SUB' || $name eq 'DIV' || $name eq 'MOD') {
-      my @values;
-      if (exists $expr->{value_exprs}) {
-         $self->_step(scalar @{$expr->value_exprs});
-         @values=map $self->_eval($_,$depth+1), @{$expr->value_exprs};
-         if (@values==1 && ref $values[0] eq 'ARRAY') {
-            my $array=$values[0];
-            $self->_step(scalar @$array);
-            for my $i (0..$#$array) { $self->_present($array,$i) or $self->_fail('INVALID_TARGET','Deleted array element') }
-            @values=@$array;
-         }
-      }
-      else { @values=map $self->_eval($expr->{$_},$depth+1), qw(value_expr1 value_expr2) }
-      $self->_step(scalar @values);
-      for my $v (@values) { type_mask($v)==TYPE_NUMBER && is_finite($v) or $self->_fail('INVALID_TARGET','Arithmetic expects finite numbers') }
-      my $result=$name eq 'MUL'?1:0;
-      if ($name eq 'ADD') { $result+=$_ for @values }
-      elsif ($name eq 'MUL') { $result*=$_ for @values }
-      elsif ($name eq 'SUB') { $result=$values[0]-$values[1] }
-      else {
-         $values[1]!=0 or $self->_fail('INVALID_TARGET','Division by zero');
-         if ($name eq 'DIV') { $result=$values[0]/$values[1] }
-         else { require POSIX; $result=$values[0]-POSIX::floor($values[0]/$values[1])*$values[1] }
-      }
-      is_finite($result) or $self->_fail('INVALID_TARGET','Non-finite arithmetic result');
-      return $result;
-   }
-   $self->_fail('UNSUPPORTED_GRAFT',"Expression $name is not implemented");
+   else { @values=map $self->_eval($expr->{$_},$depth+1), qw(value_expr1 value_expr2) }
+   $self->_step(scalar @values);
+   for my $v (@values) { type_mask($v)==TYPE_NUMBER && is_finite($v) or $self->_fail('INVALID_TARGET','Arithmetic expects finite numbers') }
+   return @values;
+}
+sub _finite_result {
+   my ($self,$result)= @_;
+   is_finite($result) or $self->_fail('INVALID_TARGET','Non-finite arithmetic result');
+   return $result;
+}
+sub JGraft::Expr::ADD::_execute {
+   my ($expr,$self,$depth)= @_;
+   my $result=0;
+   $result+=$_ for $self->_numeric_values($expr,$depth);
+   return $self->_finite_result($result);
+}
+sub JGraft::Expr::MUL::_execute {
+   my ($expr,$self,$depth)= @_;
+   my $result=1;
+   $result*=$_ for $self->_numeric_values($expr,$depth);
+   return $self->_finite_result($result);
+}
+sub JGraft::Expr::SUB::_execute {
+   my ($expr,$self,$depth)= @_;
+   my ($a,$b)=$self->_numeric_values($expr,$depth);
+   return $self->_finite_result($a-$b);
+}
+sub JGraft::Expr::DIV::_execute {
+   my ($expr,$self,$depth)= @_;
+   my ($a,$b)=$self->_numeric_values($expr,$depth);
+   $b!=0 or $self->_fail('INVALID_TARGET','Division by zero');
+   return $self->_finite_result($a/$b);
+}
+sub JGraft::Expr::MOD::_execute {
+   my ($expr,$self,$depth)= @_;
+   my ($a,$b)=$self->_numeric_values($expr,$depth);
+   $b!=0 or $self->_fail('INVALID_TARGET','Division by zero');
+   require POSIX;
+   return $self->_finite_result($a-POSIX::floor($a/$b)*$b);
 }
 
 sub _slice {
@@ -725,16 +891,31 @@ sub _slice {
 
 =head1 DESCRIPTION
 
-Executes JGRAFT, AT, COPY, and MOVE with namespace references, value construction,
-common expressions, LOCAL, LENGTH, SLICE, arithmetic, logical operators, and the
-boolean/number/string casts. Other operations fail with UNSUPPORTED_GRAFT.
+Executes JGRAFT, AT, MATCH, IF, COPY, and MOVE with namespace references, value
+construction, common expressions, structural matching, LOCAL, LENGTH, SLICE,
+CURPROP, CAPTURE, arithmetic, logical operators, and boolean/number/string casts.
+Structural matching supports HAS, IS, ANY, ALL, NONE, EXISTS, ARRAY, NUM, BOOL,
+STR, CHARS, and WITH. Array and string sequences support SEQ, SEQMIN, SEQMAX, REP, START, END,
+successor unions/coverage assertions, and preferred named captures.
+STR searches for the leftmost regex match over Unicode codepoints. Regex branching
+uses the sequence engine; quoted literal runs use cached anchored Perl patterns.
+Date and fuzzy matching remain unimplemented.
+Other operations fail with UNSUPPORTED_GRAFT.
+
+HAS/IS modes propagate through match structures. Match expressions evaluated by
+functions start fresh matching state. INVALID_TARGET/INVALID_OPERAND encountered
+while matching become mismatches; ANY/NONE trap those errors per alternative.
+Fatal errors and resource limits propagate. Missing nodes remain distinct from
+null and may be tested by EXISTS or negated predicates.
 
 JGRAFT initializes constants in declaration order against the inherited common
 expressions and parent stash, then installs its unevaluated common expressions
 and starts a fresh stash. Inherited constants/expressions are shadowed locally;
 EXPR references evaluate in the invoking scope. NODE follows the current node,
-TEMP resets per action, and CONST/CAP are read-only. CAP starts empty; populating
-captures requires the matching operations, which are not yet implemented.
+TEMP resets per action, and CONST/CAP are read-only. MATCH and successful IF
+conditions replace CAP locally with their captures. IF's else action inherits CAP;
+CAPTURE returns captures or false without changing CAP. Array captures contain
+C<path>, C<ofs>, C<len>, and C<lim> and may be passed to SLICE.
 EXPR aliases can supply action paths, with namespace and selector restrictions
 checked against the resolved reference.
 
@@ -746,13 +927,56 @@ keeps deferred deletions/insertions attached to array identity until its end.
 
 =constructor new
 
-Options: C<jgraft>, optional C<input>, C<clone>, C<undo>, and C<limits>. Limits
+Options: C<jgraft>, optional C<input>, C<clone>, C<undo>, C<limits>, and
+C<codepoint_policy>. Limits
 are estimated cumulative C<ops>, C<mem>, C<new_obj>, and maximum C<depth>. Defaults
 are 1,000,000 operations, 64 MiB, 100,000 data containers, and depth 256. An explicit
 undef disables an individual limit. Memory accounting is a conservative cumulative
 allocation estimate including path and deferred-array scratch space; it does not
 subtract reclaimed storage. Input and pre-existing graft containers are excluded
 from new allocations. JSON-data graft compilation is conservatively precharged.
+
+Strings contain Perl characters, not encoded UTF-8 octets. Unflagged bytes denote
+U+0000 through U+00FF; callers must decode external encodings themselves. Regex
+positions, LENGTH, SLICE, and capture bounds count codepoints, not graphemes.
+String regex views use byte access for unflagged strings and a packed big-endian
+four-byte codepoint buffer for flagged strings. Conversion and caches contribute
+to resource counters. Input scalars and their regex positions are preserved.
+
+C<codepoint_policy> controls surrogates (U+D800 through U+DFFF) and noncharacters
+(U+FDD0 through U+FDEF and the final two codepoints of every Unicode plane):
+
+=over
+
+=item C<preserve> (default)
+
+Repair Encode's substitutions to preserve each original codepoint in string views.
+
+=item C<reject>
+
+Abort with UNSUPPORTED_GRAFT when one of these codepoints is encountered, including
+in input values, object keys, or graft literals, independently of regex execution.
+
+=item C<substitute>
+
+Keep Encode's default UTF-32BE substitutions in string regex views. The exact
+substitutions depend on the installed Encode; Perl 5.8 can substitute NUL where
+modern Encode substitutes U+FFFD. Stored input/output values are not rewritten;
+SLICE still extracts original text at the corresponding character bounds.
+
+=item A coderef
+
+Called as C<< $callback->($codepoint, {index => $character_index, kind => $kind}) >>.
+Return C<preserve>, C<reject>, or C<substitute> for that occurrence. C<kind> describes
+the inspected source, such as C<input>, C<input key>, C<graft>, C<graft key>,
+C<literal>, C<expression>, C<expression key>, C<subject>, C<pattern>, or
+C<character class>. Validation and conversion can inspect the same text more than
+once; decisions should be consistent. Callback exceptions propagate unchanged.
+
+=back
+
+Values above U+10FFFF always fail with UNSUPPORTED_GRAFT, regardless of policy.
+Neither preserving nor substituting combines adjacent surrogate codepoints.
 
 =method apply
 

@@ -26,7 +26,8 @@ sub run_perl {
 }
 
 # Run a specification conformance file or an already decoded case/group.
-# supported => [operation names] explicitly skips unimplemented operations.
+# supported => [operation names] or {name => bool/coderef} filters operations
+# and partially implemented forms; predicates receive the parsed node.
 # undo => 0 disables undo round trips (enabled by default).
 sub test_conformance {
    my ($source,%options)=@_;
@@ -42,19 +43,133 @@ sub test_conformance {
          return;
       }
       open my $fh,'<:raw',$source or die "open($source): $!";
-      $suite=JSON::PP->new->utf8->decode(do {local $/; <$fh>});
+      $suite=_conformance_json(do {local $/; <$fh>});
       close $fh or die "close($source): $!";
    }
    my $config={json=>JSON::PP->new->canonical->allow_nonref,
       undo=>exists $options{undo}? $options{undo} : 1};
-   $config->{supported}={map {$_=>1} @{$options{supported}}} if exists $options{supported};
+   if (exists $options{supported}) {
+      $config->{supported}=ref($options{supported}) eq 'HASH'? $options{supported}
+         : {map {$_=>1} @{$options{supported}}};
+   }
    _conformance_cases($suite,'',$config);
+}
+
+# JSON::PP rejects lone-surrogate strings in both data and patterns. Split only
+# the conformance outline into raw JSON
+# spans so supported leaves still use the normal decoder without altered data.
+sub _conformance_json {
+   my ($text)=@_;
+   my $json=JSON::PP->new->utf8->allow_nonref;
+   my $decoded=eval { $json->decode($text) };
+   my $error=$@;
+   return $decoded unless $error;
+   die $error unless $error =~ /surrogate/i;
+   my $offset=0;
+   my $end=_conformance_json_span(\$text,\$offset);
+   substr($text,$end) =~ /\A[ \t\r\n]*\z/ or die 'Trailing data in conformance JSON';
+   return _conformance_json_group(\$text,0,$end,$json);
+}
+sub _conformance_json_space {
+   my ($text,$offset)=@_;
+   pos($$text)=$$offset;
+   $$text =~ /\G[ \t\r\n]*/gc;
+   $$offset=pos($$text);
+}
+sub _conformance_json_span {
+   my ($text,$offset)=@_;
+   _conformance_json_space($text,$offset);
+   my $first=substr($$text,$$offset,1);
+   if ($first eq '{' || $first eq '[') {
+      ++$$offset;
+      _conformance_json_space($text,$offset);
+      my $close=$first eq '{'? '}' : ']';
+      unless (substr($$text,$$offset,1) eq $close) {
+         while (1) {
+            if ($first eq '{') {
+               substr($$text,$$offset,1) eq '"' or die 'Invalid conformance JSON object key';
+               _conformance_json_span($text,$offset);
+               _conformance_json_space($text,$offset);
+               substr($$text,$$offset,1) eq ':' or die 'Missing conformance JSON colon';
+               ++$$offset;
+            }
+            _conformance_json_span($text,$offset);
+            _conformance_json_space($text,$offset);
+            last unless substr($$text,$$offset,1) eq ',';
+            ++$$offset;
+            _conformance_json_space($text,$offset);
+         }
+      }
+      substr($$text,$$offset,1) eq $close or die 'Missing conformance JSON closing delimiter';
+      return ++$$offset;
+   }
+   pos($$text)=$$offset;
+   $$text =~ /\G(?:"(?:[^"\\\x00-\x1f]|\\(?:["\\\/bfnrt]|u[0-9a-fA-F]{4}))*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null)/gc
+      or die 'Invalid conformance JSON value';
+   return $$offset=pos($$text);
+}
+sub _conformance_json_group {
+   my ($text,$start,$end,$json)=@_;
+   my $offset=$start;
+   _conformance_json_space($text,\$offset);
+   substr($$text,$offset++,1) eq '{' or die 'Conformance group must be an object';
+   my %members;
+   _conformance_json_space($text,\$offset);
+   while (substr($$text,$offset,1) ne '}') {
+      my $key_start=$offset;
+      _conformance_json_span($text,\$offset);
+      my $key=$json->decode(substr($$text,$key_start,$offset-$key_start));
+      _conformance_json_space($text,\$offset);
+      ++$offset; # colon already checked by the span scanner
+      _conformance_json_space($text,\$offset);
+      my $value_start=$offset;
+      _conformance_json_span($text,\$offset);
+      $members{$key}=[$value_start,$offset];
+      _conformance_json_space($text,\$offset);
+      last unless substr($$text,$offset,1) eq ',';
+      ++$offset;
+      _conformance_json_space($text,\$offset);
+   }
+   unless (exists $members{tests}) {
+      my $case=eval { $json->decode(substr($$text,$start,$end-$start)) };
+      my $error=$@;
+      return $case unless $error;
+      die $error unless $error =~ /surrogate/i;
+      my $name=$members{name};
+      return bless {name=>$json->decode(substr($$text,$name->[0],$name->[1]-$name->[0])),
+         reason=>'JSON::PP cannot decode lone-surrogate strings'},'Test2AndUtils::_UnsupportedJSON';
+   }
+   my %group;
+   for my $key (keys %members) {
+      next if $key eq 'tests';
+      my ($from,$to)=@{$members{$key}};
+      $group{$key}=$json->decode(substr($$text,$from,$to-$from));
+   }
+   $offset=$members{tests}[0];
+   substr($$text,$offset++,1) eq '[' or die 'Conformance tests must be an array';
+   _conformance_json_space($text,\$offset);
+   my @tests;
+   while (substr($$text,$offset,1) ne ']') {
+      my $from=$offset;
+      _conformance_json_span($text,\$offset);
+      push @tests,_conformance_json_group($text,$from,$offset,$json);
+      _conformance_json_space($text,\$offset);
+      last unless substr($$text,$offset,1) eq ',';
+      ++$offset;
+      _conformance_json_space($text,\$offset);
+   }
+   $group{tests}=\@tests;
+   return \%group;
 }
 
 sub _conformance_supported {
    my ($value,$supported)=@_;
    my $node=Scalar::Util::blessed($value) && $value->isa('JGraft::_Node');
-   return 0 if $node && !$supported->{$value->_name};
+   if ($node) {
+      my $support=$supported->{$value->_name};
+      return 0 unless $support;
+      return 0 if ref($support) eq 'CODE' && !$support->($value);
+   }
    return !grep !_conformance_supported($_,$supported), @$value if ref($value) eq 'ARRAY';
    if (ref($value) eq 'HASH' || $node) {
       my @keys=$node? grep($_ ne '_form', keys %$value) : keys %$value;
@@ -65,6 +180,10 @@ sub _conformance_supported {
 
 sub _conformance_cases {
    my ($case,$prefix,$config)=@_;
+   if (ref($case) eq 'Test2AndUtils::_UnsupportedJSON') {
+      SKIP: { skip $prefix.$case->{name}.": ".$case->{reason},1 }
+      return;
+   }
    if (exists $case->{tests}) {
       _conformance_cases($_,$prefix.$case->{name}.' / ',$config) for @{$case->{tests}};
       return;

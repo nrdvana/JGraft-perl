@@ -23,6 +23,7 @@ my %WriteMakefileArgs = (
   "PREREQ_PM" => {
     "B" => 0,
     "Carp" => 0,
+    "Encode" => 0,
     "Exporter" => 0,
     "JSON::PP" => 0,
     "POSIX" => 0,
@@ -30,6 +31,7 @@ my %WriteMakefileArgs = (
     "constant" => 0,
     "overload" => 0,
     "strict" => 0,
+    "utf8" => 0,
     "warnings" => 0
   },
   "TEST_REQUIRES" => {
@@ -62,6 +64,7 @@ my %FallbackPrereqs = (
   "B" => 0,
   "Benchmark" => 0,
   "Carp" => 0,
+  "Encode" => 0,
   "Exporter" => 0,
   "File::Find" => 0,
   "File::Temp" => 0,
@@ -81,6 +84,7 @@ my %FallbackPrereqs = (
   "overload" => 0,
   "parent" => 0,
   "strict" => 0,
+  "utf8" => 0,
   "warnings" => 0
 );
 
