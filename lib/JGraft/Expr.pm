@@ -783,28 +783,6 @@ sub JGraft::Expr::REP::_validate {
       or JGraft::_Node::_bad('REP bounds are reversed');
 }
 
-sub JGraft::Expr::CHARS::_validate {
-   my $self=shift;
-   my $values=$self->{entries};
-   for (my $i=0; $i+1<@$values; ++$i) {
-      my ($a,$b)=map _codepoint($_), @$values[$i,$i+1];
-      if (defined $a && defined $b) {
-         $a <= $b or JGraft::_Node::_bad('CHARS range is reversed');
-         ++$i;
-      }
-   }
-}
-
-sub _codepoint {
-   my $v=shift;
-   return 0x10ffff unless defined $v;
-   return if is_expr($v);
-   my $type=type_mask($v);
-   return $v if $type==TYPE_NUMBER;
-   return ord($v) if $type==TYPE_STRING && length($v)==1;
-   return;
-}
-
 sub JGraft::Expr::JOIN::_validate {
    my $self=shift;
    my $split=$self->{split_spec};
@@ -818,6 +796,7 @@ sub JGraft::Expr::JOIN::_validate {
    }
 }
 
+require JGraft::Expr::CHARS;
 require JGraft;
 
 1;

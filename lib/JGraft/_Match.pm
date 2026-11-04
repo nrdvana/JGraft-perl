@@ -187,8 +187,7 @@ sub _expression {
    return $cursor->{exists} if $name eq 'EXISTS';
    if ($name eq 'DATE') { return $cursor->{exists} && !!$exec->_date($cursor->{value}) }
    if ($name eq 'CHARS') {
-      require JGraft::_Chars;
-      return JGraft::_Chars->_test($exec,$expr,$cursor,$depth+1);
+      return $expr->_test($exec,$cursor,$depth+1);
    }
    if ($name eq 'START' || $name eq 'END') {
       return 0 unless ($cursor->{array} || $cursor->{string}) && defined $cursor->{prop};

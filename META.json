@@ -38,9 +38,12 @@
             "POSIX" : "0",
             "Scalar::Util" : "0",
             "Time::Piece" : "0",
+            "Unicode::UCD" : "0",
+            "charnames" : "0",
             "constant" : "0",
             "overload" : "0",
             "perl" : "5.008009",
+            "re" : "0",
             "strict" : "0",
             "utf8" : "0",
             "warnings" : "0"
