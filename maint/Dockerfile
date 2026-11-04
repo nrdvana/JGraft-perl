@@ -1,6 +1,6 @@
 # This docker image contains everything needed for development and testing
-# of the library.  It includes the system perl and a perl 5.8 for back-compat
-# tests.
+# of the library. It includes system Perl, Perl 5.8 for back-compat tests,
+# and Perl 5.28 for testing the modern/legacy source boundary.
 
 FROM debian:13
 
@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y \
 # that would not be visible to the separate Perl 5.8 installation.
 # Test2's tests need parent. Bootstrap with a release whose tests work with
 # Perl 5.8's bundled Test::More, before Test2 installs the newer Test::More.
+# Perl 5.28's bundled MakeMaker needs upgrading for the project's Makefile.PL.
 # Test::Pod::Coverage::Configurable is the author plugin not packaged by Debian.
 RUN cd /tmp \
  && curl -fL https://cpan.metacpan.org/authors/id/M/MI/MIYAGAWA/App-cpanminus-1.7048.tar.gz \
@@ -49,8 +50,28 @@ RUN cd /tmp \
  && ln -s /opt/perl-5.8.9/bin/perl /usr/local/bin/perl5.8 \
  && ln -s /opt/perl-5.8.9/bin/prove /usr/local/bin/prove5.8 \
  && perl5.8 -MTest2::V0 -e 'is(sprintf("%vd", $^V), "5.8.9", "legacy interpreter"); done_testing;' \
+ && cd /tmp \
+ && curl -fL https://www.cpan.org/src/5.0/perl-5.28.3.tar.gz -o perl-5.28.3.tar.gz \
+ && echo 'afc9c1d661597ae14d9e883c5071092bed73f60c3109b294823ea01aca705114  perl-5.28.3.tar.gz' \
+      | sha256sum -c - \
+ && tar xzf perl-5.28.3.tar.gz \
+ && cd perl-5.28.3 \
+ && patchperl \
+ && sh Configure -des -Dprefix=/opt/perl-5.28.3 -Dcc=gcc-12 \
+ && make -j2 \
+ && make install \
+ && cd /tmp \
+ && /opt/perl-5.28.3/bin/perl App-cpanminus-1.7048/bin/cpanm \
+      --mirror https://cpan.metacpan.org --mirror-only \
+      App::cpanminus ExtUtils::MakeMaker Test2::V0 \
+ && ln -s /opt/perl-5.28.3/bin/perl /usr/local/bin/perl5.28 \
+ && ln -s /opt/perl-5.28.3/bin/prove /usr/local/bin/prove5.28 \
+ && perl5.28 -MExtUtils::MakeMaker=7.70 -MTest2::V0 \
+      -e 'is(sprintf("%vd", $^V), "5.28.3", "modern branch boundary interpreter"); done_testing;' \
  && rm -rf /tmp/perl-5.8.9 /tmp/perl-5.8.9.tar.gz \
+      /tmp/perl-5.28.3 /tmp/perl-5.28.3.tar.gz \
       /tmp/App-cpanminus-1.7048 /tmp/cpanminus.tar.gz /root/.cpanm
 
-# Run legacy tests with: perl5.8 Makefile.PL && make test
-# Or invoke perl5.8 / prove5.8 directly. The system Perl remains the default.
+# Run tests with: perl5.8 Makefile.PL && make test
+#             or perl5.28 Makefile.PL && make test
+# Or invoke the versioned perl/prove aliases directly. System Perl remains default.
