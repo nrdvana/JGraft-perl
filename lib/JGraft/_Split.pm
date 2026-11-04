@@ -201,6 +201,27 @@ sub _select_meta {
    $exec->_step(scalar @$indices); $exec->_charge('mem',160+16*@$indices);
    $exec->{split_meta}{refaddr($target)}={%$meta,array=>$target,rows=>[@{$meta->{rows}}[@$indices]]};
 }
+# Prepare parallel rows before editing. As when building a fresh array, the
+# first surviving or directly referenced row chooses the metadata origin.
+sub _splice_meta {
+   my ($class,$exec,$array,$offset,$count,$sources)=@_;
+   my $old=$exec->{split_meta}{refaddr($array)};
+   my $tail=@$array-$offset-$count;
+   my $chosen=$offset? $old : undef;
+   for my $source (@$sources) { $chosen=$source if !$chosen && $source }
+   $chosen=$old if !$chosen && $tail;
+   return unless $chosen;
+   my $size=$offset+@$sources+$tail;
+   return unless $size;
+   $exec->_step(3*$size); $exec->_charge('mem',160+112*$size);
+   my @rows;
+   my $same=$old && $old->{origin}==$chosen->{origin};
+   push @rows,$same?$old->{rows}[$_]:undef for 0..$offset-1;
+   push @rows,$_ && $_->{origin}==$chosen->{origin}?$_->{row}:undef for @$sources;
+   push @rows,$same?$old->{rows}[$_]:undef for $offset+$count..$#$array;
+   return {array=>$array,origin=>$chosen->{origin},separators=>$chosen->{separators},
+      trims=>$chosen->{trims},rows=>\@rows};
+}
 sub _insert_meta {
    my ($class,$exec,$array,$source)=@_;
    my $meta=$exec->{split_meta}{refaddr($array)};

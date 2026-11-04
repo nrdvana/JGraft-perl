@@ -1,0 +1,129 @@
+#! /usr/bin/env perl
+# PODNAME: jg-format
+# VERSION
+# ABSTRACT: Format JGraft JSON for reading
+
+use strict;
+use warnings;
+use FindBin;
+BEGIN {
+   if (-f "$FindBin::RealBin/../dist.ini") {
+      push @INC, "$FindBin::RealBin/../blib/lib" if -d "$FindBin::RealBin/../blib/lib";
+      push @INC, "$FindBin::RealBin/../lib";
+   }
+}
+use JGraft 'jgformat';
+use JGraft::_JSON ();
+use Getopt::Long;
+use Pod::Usage;
+
+=head1 USAGE
+
+  jg-format [OPTIONS] [FILE|-]
+
+Read UTF-8 JSON from FILE or standard input and write readable JSON. Valid embedded
+JGRAFT arrays use directive formatting; invalid grafts remain ordinary JSON. Numeric
+tokens and lone surrogates are preserved.
+
+  jg-format patch.json
+  jg-format --wrap 100 --close inline patch.json > readable.json
+  jg-format --ids < patch.json
+  jg-format conformance.json --output readable.json
+  jg-format --indent 0 --wrap 0 conformance.json > compact.json
+
+=head1 OPTIONS
+
+=over
+
+=item --indent=N
+
+Spaces per indentation level. Defaults to 2. With zero indentation, output has no
+optional spaces or structural breaks and wraps only between complete JSON tokens.
+
+=item --wrap=N
+
+Initial line width. Defaults to 79. Set to zero to disable width wrapping. With both
+indentation and wrapping disabled, output is fully minified without a final newline.
+Deep indentation expands the local width when a directive needs to wrap.
+
+=item --close=STYLE
+
+Closing-bracket style for wrapped containers: C<newline> (the default) or C<inline>.
+Ignored with zero indentation.
+
+=item --ids, --names
+
+Use numeric directive IDs or names. Defaults to names. Logical argument pairs stay
+together when they fit.
+
+=item --prefix=STRING
+
+Whitespace prefix for every line. Ignored with zero indentation.
+
+=item --output=FILE, -o FILE
+
+Write to FILE instead of standard output. Output is opened only after parsing and
+formatting succeed, so input and output may name the same file.
+
+=item --help, -h
+
+Show this usage and option documentation.
+
+=back
+
+Formatting options correspond to L<JGraft::Action/format>.
+
+=cut
+
+my %options= (indent => 2, wrap => 79, prefix => '', ids => 0, close => 'newline');
+GetOptions(
+   'indent=i'   => \$options{indent},
+   'wrap=i'     => \$options{wrap},
+   'prefix=s'   => \$options{prefix},
+   'close=s'    => \$options{close},
+   'ids!'       => \$options{ids},
+   'names'      => sub { $options{ids}= 0 },
+   'output|o=s' => \my $output,
+   'help|h'     => sub { pod2usage(-exitval => 0, -verbose => 99, -sections => 'USAGE|OPTIONS') },
+) && @ARGV <= 1 or pod2usage(-exitval => 2, -verbose => 99, -sections => 'USAGE');
+
+my $input= @ARGV? $ARGV[0] : '-';
+my $ok= eval {
+   my $fh;
+   if ($input eq '-') {
+      binmode STDIN, ':raw' or die "stdin: $!\n";
+      $fh= \*STDIN;
+   } else {
+      open $fh, '<:raw', $input or die "$input: $!\n";
+   }
+   my $buffer= '';
+   while (1) {
+      my $n= read($fh, $buffer, 65536, length($buffer));
+      defined($n) or die "$input: $!\n";
+      last unless $n;
+   }
+   my $data= JGraft::_JSON::decode($buffer, preserve_numbers => 1);
+   close $fh or die "$input: $!\n" unless $input eq '-';
+   my $text= jgformat($data, %options);
+   $text .= "\n" if $options{indent} || $options{wrap};
+
+   # Open output only after parsing/rendering, so input and output may coincide.
+   my $out;
+   if (!defined($output) || $output eq '-') {
+      binmode STDOUT, ':encoding(UTF-8)' or die "stdout: $!\n";
+      $out= \*STDOUT;
+   } else {
+      open $out, '>:encoding(UTF-8)', $output or die "$output: $!\n";
+   }
+   print {$out} $text or die "write: $!\n";
+   close $out or die "close: $!\n";
+   1;
+};
+unless ($ok) {
+   my $error= $@;
+   $error= $error->message if ref($error) && eval { $error->can('message') };
+   $error =~ s/\s+\z//;
+   print STDERR "jg-format: $error\n";
+   exit 1;
+}
+exit 0;

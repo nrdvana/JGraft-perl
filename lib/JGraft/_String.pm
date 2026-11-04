@@ -45,11 +45,13 @@ sub _new {
    my $buffer;
    if ($wide) {
       # CHECK=0 leaves the private source copy intact. Old Encode emits a
-      # warning while replacing surrogates/U+FFFF; the scan restores their bits.
+      # warning while replacing surrogates/noncharacters; the scan restores
+      # their bits. Both the 5.8 and 5.28 warning forms stay local to Encode.
       {
          my $previous=$SIG{__WARN__};
          local $SIG{__WARN__}=sub {
             return if $_[0] =~ /^Malformed UTF-8 character \((?:UTF-16 surrogate|character 0xffff\))/;
+            return if $_[0] =~ /^(?:UTF-16 surrogate U\+[0-9A-F]+|Unicode non-character U\+[0-9A-F]+ is not recommended for open interchange) in subroutine entry\b/;
             if (ref($previous) eq 'CODE') { $previous->(@_) }
             elsif (!defined($previous) || $previous ne 'IGNORE') { warn @_ }
          };

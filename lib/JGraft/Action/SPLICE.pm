@@ -10,6 +10,14 @@ The action replaces a span beginning at L</array_elem_path>. L</count_expr> dete
 number of elements removed, and L</replacements> supplies the new values. An undef count
 removes the remaining elements of the array.
 
+The path must address an existing array's element or append position; missing
+parents are not created. Negative counts end before the corresponding element
+counted from the end. Bounds must describe a valid span. All replacements are
+evaluated before editing, and array-valued replacements remain single elements.
+SPLIT metadata follows surviving elements and directly referenced replacements;
+other replacements receive adjacent formatting. Copy-on-write isolates existing
+aliases, and the executor's lazy undo restores deleted values and shifted spans.
+
 =attribute id
 
 The numeric operation ID, C<7>.

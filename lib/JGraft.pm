@@ -46,7 +46,7 @@ use Scalar::Util qw( blessed openhandle );
 use overload ();
 
 use Exporter 'import';
-@JGraft::EXPORT_OK= qw( jgdiff jgexec jgparse json_data );
+@JGraft::EXPORT_OK= qw( jgdiff jgexec jgparse jgformat json_data );
 
 =head1 DESCRIPTION
 
@@ -140,6 +140,26 @@ sub jgparse {
 }
 
 require JGraft::Action;
+
+=function jgformat
+
+  my $text= jgformat($json_data, indent => 2, wrap => 79);
+
+Format decoded JSON data, or an action/expression object. Embedded C<["JGRAFT", ...]>
+arrays are parsed and use directive formatting when valid; invalid grafts remain
+ordinary JSON. Other containers stay inline unless a child has multiple members
+or requires multiple lines, in which case each member gets its own line. Long
+flat containers wrap at member boundaries. Options match L<JGraft::Action/format>.
+
+Strings are literal JSON string values, not JSON text to decode. For UTF-8 files,
+L<jg-format> also preserves original numeric tokens and lone surrogate escapes.
+
+=cut
+
+sub jgformat {
+   require JGraft::_Format;
+   return JGraft::_Format->format_json(@_);
+}
 
 =function json_data
 

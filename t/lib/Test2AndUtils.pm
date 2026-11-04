@@ -55,111 +55,12 @@ sub test_conformance {
    _conformance_cases($suite,'',$config);
 }
 
-# JSON::PP rejects lone-surrogate strings in both data and patterns. Split only
-# the conformance outline into raw JSON
-# spans so supported leaves still use the normal decoder without altered data.
+# Use the same strict transport decoder for fixtures and serialized undo.
 sub _conformance_json {
-   my ($text)=@_;
-   my $json=JSON::PP->new->utf8->allow_nonref;
-   my $decoded=eval { $json->decode($text) };
-   my $error=$@;
-   return $decoded unless $error;
-   die $error unless $error =~ /surrogate/i;
-   my $offset=0;
-   my $end=_conformance_json_span(\$text,\$offset);
-   substr($text,$end) =~ /\A[ \t\r\n]*\z/ or die 'Trailing data in conformance JSON';
-   return _conformance_json_group(\$text,0,$end,$json);
-}
-sub _conformance_json_space {
-   my ($text,$offset)=@_;
-   pos($$text)=$$offset;
-   $$text =~ /\G[ \t\r\n]*/gc;
-   $$offset=pos($$text);
-}
-sub _conformance_json_span {
-   my ($text,$offset)=@_;
-   _conformance_json_space($text,$offset);
-   my $first=substr($$text,$$offset,1);
-   if ($first eq '{' || $first eq '[') {
-      ++$$offset;
-      _conformance_json_space($text,$offset);
-      my $close=$first eq '{'? '}' : ']';
-      unless (substr($$text,$$offset,1) eq $close) {
-         while (1) {
-            if ($first eq '{') {
-               substr($$text,$$offset,1) eq '"' or die 'Invalid conformance JSON object key';
-               _conformance_json_span($text,$offset);
-               _conformance_json_space($text,$offset);
-               substr($$text,$$offset,1) eq ':' or die 'Missing conformance JSON colon';
-               ++$$offset;
-            }
-            _conformance_json_span($text,$offset);
-            _conformance_json_space($text,$offset);
-            last unless substr($$text,$$offset,1) eq ',';
-            ++$$offset;
-            _conformance_json_space($text,$offset);
-         }
-      }
-      substr($$text,$$offset,1) eq $close or die 'Missing conformance JSON closing delimiter';
-      return ++$$offset;
-   }
-   pos($$text)=$$offset;
-   $$text =~ /\G(?:"(?:[^"\\\x00-\x1f]|\\(?:["\\\/bfnrt]|u[0-9a-fA-F]{4}))*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null)/gc
-      or die 'Invalid conformance JSON value';
-   return $$offset=pos($$text);
-}
-sub _conformance_json_group {
-   my ($text,$start,$end,$json)=@_;
-   my $offset=$start;
-   _conformance_json_space($text,\$offset);
-   substr($$text,$offset++,1) eq '{' or die 'Conformance group must be an object';
-   my %members;
-   _conformance_json_space($text,\$offset);
-   while (substr($$text,$offset,1) ne '}') {
-      my $key_start=$offset;
-      _conformance_json_span($text,\$offset);
-      my $key=$json->decode(substr($$text,$key_start,$offset-$key_start));
-      _conformance_json_space($text,\$offset);
-      ++$offset; # colon already checked by the span scanner
-      _conformance_json_space($text,\$offset);
-      my $value_start=$offset;
-      _conformance_json_span($text,\$offset);
-      $members{$key}=[$value_start,$offset];
-      _conformance_json_space($text,\$offset);
-      last unless substr($$text,$offset,1) eq ',';
-      ++$offset;
-      _conformance_json_space($text,\$offset);
-   }
-   unless (exists $members{tests}) {
-      my $case=eval { $json->decode(substr($$text,$start,$end-$start)) };
-      my $error=$@;
-      return $case unless $error;
-      die $error unless $error =~ /surrogate/i;
-      my $name=$members{name};
-      return bless {name=>$json->decode(substr($$text,$name->[0],$name->[1]-$name->[0])),
-         reason=>'JSON::PP cannot decode lone-surrogate strings'},'Test2AndUtils::_UnsupportedJSON';
-   }
-   my %group;
-   for my $key (keys %members) {
-      next if $key eq 'tests';
-      my ($from,$to)=@{$members{$key}};
-      $group{$key}=$json->decode(substr($$text,$from,$to-$from));
-   }
-   $offset=$members{tests}[0];
-   substr($$text,$offset++,1) eq '[' or die 'Conformance tests must be an array';
-   _conformance_json_space($text,\$offset);
-   my @tests;
-   while (substr($$text,$offset,1) ne ']') {
-      my $from=$offset;
-      _conformance_json_span($text,\$offset);
-      push @tests,_conformance_json_group($text,$from,$offset,$json);
-      _conformance_json_space($text,\$offset);
-      last unless substr($$text,$offset,1) eq ',';
-      ++$offset;
-      _conformance_json_space($text,\$offset);
-   }
-   $group{tests}=\@tests;
-   return \%group;
+   require JGraft::_JSON;
+   my $value=eval { JGraft::_JSON::decode(@_) };
+   die "conformance JSON: $@" if $@;
+   return $value;
 }
 
 sub _conformance_supported {
@@ -178,12 +79,40 @@ sub _conformance_supported {
    return 1;
 }
 
+# Compare JSON values by type and value, rather than an encoder's choice of
+# integer/exponent spelling. Perl 5.8 may represent equal numbers as IV or NV.
+sub _conformance_same {
+   my ($a,$b)=@_;
+   my $type=JGraft::Util::type_mask($a);
+   return 0 unless $type==JGraft::Util::type_mask($b);
+   return 1 unless defined $a;
+   if (ref($a) eq 'ARRAY') {
+      return 0 unless @$a==@$b;
+      for my $i (0..$#$a) { return 0 unless _conformance_same($a->[$i],$b->[$i]) }
+      return 1;
+   }
+   if (ref($a) eq 'HASH') {
+      return 0 unless keys(%$a)==keys(%$b);
+      for my $key (keys %$a) { return 0 unless exists($b->{$key}) && _conformance_same($a->{$key},$b->{$key}) }
+      return 1;
+   }
+   return $a==$b if $type==JGraft::Util::TYPE_NUMBER() || $type==JGraft::Util::TYPE_BOOLEAN();
+   return $a eq $b;
+}
+sub _conformance_compare {
+   my ($a,$b,$name,$json)=@_;
+   return if ok(_conformance_same($a,$b),$name);
+   # Old Test2 table rendering cannot handle raw surrogate scalars on 5.8.
+   no warnings 'utf8';
+   for my $item (['got',$a],['expected',$b]) {
+      my $text=$json->encode($item->[1]);
+      $text =~ s/([^\x20-\x7e])/sprintf('\\u{%X}',ord($1))/eg;
+      diag "$item->[0]: $text";
+   }
+}
+
 sub _conformance_cases {
    my ($case,$prefix,$config)=@_;
-   if (ref($case) eq 'Test2AndUtils::_UnsupportedJSON') {
-      SKIP: { skip $prefix.$case->{name}.": ".$case->{reason},1 }
-      return;
-   }
    if (exists $case->{tests}) {
       _conformance_cases($_,$prefix.$case->{name}.' / ',$config) for @{$case->{tests}};
       return;
@@ -211,18 +140,18 @@ sub _conformance_cases {
    elsif ($exec->error) { ok($errors->{$exec->error},"$name: permitted failure") or diag "$exec" }
    else {
       ok(exists $case->{output},"$name: success permitted");
-      is($json->encode($out[0]),$json->encode($case->{output}),"$name: output");
+      _conformance_compare($out[0],$case->{output},"$name: output",$json);
    }
    if (exists $case->{logs}) {
-      is($json->encode($exec->can('logs')? $exec->logs : []),$json->encode($case->{logs}),"$name: logs");
+      _conformance_compare($exec->can('logs')? $exec->logs : [],$case->{logs},"$name: logs",$json);
    }
    is($json->encode([$case->{input},$case->{jgraft}]),$before,"$name: input and graft preserved");
    return unless $config->{undo};
-   my $data=$json->decode($json->encode($exec->undo->to_json_data));
+   my $data=_conformance_json($json->encode($exec->undo->to_json_data));
    my $restore=JGraft::Exec->new(jgraft=>$data);
    $restore->apply($exec->output);
    ok($restore->success,"$name: undo succeeds") or diag "$restore",explain($data);
-   is($json->encode($restore->output),$json->encode($case->{input}),"$name: undo restores input");
+   _conformance_compare($restore->output,$case->{input},"$name: undo restores input",$json);
 }
 
 # Use Data::Printer if available, but fall back to Data::Dumper

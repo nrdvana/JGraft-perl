@@ -148,22 +148,45 @@ L</new_from_json_data> to re-create it.
 
 =method format
 
-  my $json_text= JGraft::Action->format(%options);
+  my $json_text= $action->format(%options);
   # Options:
+  #   prefix  => $str,  # the current indent, as a string
   #   indent  => $n,    # number of spaces of indent per level
   #   wrap    => $cols, # attempt to keep content no wider than $cols
+  #   ids     => 1,     # numeric IDs instead of names (default: 0)
+  #   close   => 'inline', # or 'newline' (default)
 
-With no arguments, it defaults to C<< indent => 2, wrap => 79 >> which ideally keeps it readable
-on a terminal.  This method is implemented differently by each action; each has rules that judge
-how best to represent its arguments in the remaining columns.  For a more generic formatting,
-you can always call C<to_json_data> and serialize it to JSON with whatever formatting you like;
-however, note that a file containing JGraft should begin with the string C<< ["JGRAFT", >> 
-(no whitespace) for easy detection.
+Returns JSON text without a trailing newline. Defaults are C<< indent => 2 >>,
+C<< wrap => 79 >>, an empty whitespace prefix, directive names, and closing
+brackets on their own lines for wrapped containers. C<< close => 'inline' >>
+attaches those brackets to the final argument instead.
+
+Nested directives with more than one argument start on new lines. Logical pairs
+such as COPY assignments and IF branches share a line when they fit. Arguments
+reserve one column for their following comma or closing bracket. If wrapping
+would leave fewer than 40 columns after indentation, the local width doubles
+until there is room; arguments are rendered again under that wider constraint.
+C<< wrap => 0 >> disables width-driven wrapping, while structural breaks remain.
+Long scalar strings are never split. Object keys are sorted for stable output.
+
+C<< indent => 0 >> selects compact JSON: no optional spaces, indentation, or
+structural breaks. Width wrapping inserts newlines only between complete JSON
+tokens; width doubling and the closing-bracket style are ignored in this mode.
+With C<< indent => 0, wrap => 0 >>, the result is entirely minified. String contents
+remain unchanged. The whitespace prefix is ignored in compact mode.
+
+The prefix is included on every line. With the default empty prefix and names,
+the output begins C<["JGRAFT",> for a JGRAFT node. Numeric IDs change actual
+directives only; literal strings and array escaping are preserved. The
+L<jg-format> command provides the same formatting options for UTF-8 graft files.
+It also accepts arbitrary JSON, formatting valid embedded grafts as directives
+and invalid ones as ordinary JSON; see L<JGraft/jgformat>.
 
 =cut
 
 sub format {
-   die "unimplemented";
+   require JGraft::_Format;
+   return JGraft::_Format->format(@_);
 }
 
 sub _define_action {

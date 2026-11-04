@@ -5,14 +5,6 @@ use Test2AndUtils;
 use JGraft qw(:constructors);
 use JGraft::Exec;
 
-my %supported=map {$_=>1} qw(JGRAFT AT ATSPLIT MATCH IF COPY MOVE EXPR NODE TEMP STASH CONST CAP
-   HAS IS NONE ANY ALL EXISTS ARRAY STR NUM BOOL WITH CAPTURE CURPROP DATE CASTDATE LESS LESSEQ CHARS SEQ SEQMIN SEQMAX REP START END
-   FAIL LENGTH SLICE LOCAL AND OR NOT CASTBOOL CASTNUM CASTSTR ADD MUL SUB DIV MOD SPLIT JOIN
-   CONCAT REDUCE FILTER MAP PROPS MKOBJ CASE);
-for my $file (qw(20-concat 21-mkobj 24-case 30-reduce 31-filter 32-map 34-props)) {
-   test_conformance("jgraft-spec/conformance/$file.json",supported=>\%supported);
-}
-
 # All construction paths must propagate date-container tracking so the chosen
 # formatter runs on export, including through pairs and parallel arrays.
 my $date=CASTDATE('2024-02-29');

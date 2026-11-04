@@ -311,7 +311,7 @@ sub _entries {
 }
 sub to_json_data {
    my $self=shift;
-   return $self->JGraft::_Node::to_json_data unless exists $self->{_invlist};
+   return $self->JGraft::_Node::to_json_data(@_) unless exists $self->{_invlist};
    return ['CHARS',@{_entries($self->invlist)}];
 }
 

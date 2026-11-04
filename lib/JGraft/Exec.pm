@@ -44,6 +44,7 @@ sub error { $_[0]{error} }
 sub message { $_[0]{message} }
 sub diagnostic { $_[0]{diagnostic} }
 sub success { $_[0]{success} }
+sub logs { $_[0]{logs} || [] }
 sub undo {
    my $self=shift;
    @_ == 0 or croak 'undo takes no arguments';
@@ -64,6 +65,7 @@ sub apply {
    my $input= @_? $_[0] : $self->{options}{input};
    delete @{$self}{qw(error message diagnostic success undo output)};
    $self->{count}= {ops=>0,mem=>0,new_obj=>0,depth=>0};
+   $self->{logs}= [];
    $self->{owned}= {};
    $self->{lineage}= {};
    delete $self->{undo_state};
@@ -348,6 +350,83 @@ sub JGraft::Action::COPY::_execute {
 sub JGraft::Action::MOVE::_execute {
    my ($action,$self,$depth)= @_;
    return $self->_move($action->moves,$depth+1);
+}
+sub JGraft::Action::RAISE::_execute {
+   no warnings 'utf8';
+   my ($action,$self,$depth)=@_;
+   my $message=$self->_eval($action->message,$depth+1);
+   type_mask($message)==TYPE_STRING or $self->_fail('INVALID_TARGET','RAISE message must be a string');
+   $self->_step(length($message));
+   while ($message =~ /(.)/gs) {
+      my $cp=ord($1);
+      ($cp<32 || ($cp>=127 && $cp<=159) || ($cp>=0xd800 && $cp<=0xdfff)
+         || ($cp>=0xfdd0 && $cp<=0xfdef) || ($cp & 0xffff)>=0xfffe)
+         and $self->_fail('INVALID_TARGET','RAISE message contains a forbidden character');
+   }
+   my $level=$action->level;
+   $level={info=>0,warn=>1,fail=>2}->{$level} if type_mask($level)==TYPE_STRING;
+   my $entry=$self->_new_hash(exists($action->{data})?3:2);
+   @$entry{qw(level message)}=($level,$message);
+   if (exists $action->{data}) {
+      my $data=$self->_export_dates($self->_eval($action->data,$depth+1),$depth+1,{});
+      $entry->{data}=$self->_snapshot($data);
+   }
+   $self->_charge('mem',16+4*length($message));
+   push @{$self->{logs}},$entry;
+   $self->_fail('NO_MATCH',$message) if $level==2;
+}
+sub JGraft::Action::SPLICE::_execute {
+   my ($action,$self,$depth)=@_;
+   my $loc=$self->_path($action->array_elem_path,'write',$depth+1);
+   @{$loc->[1]} or $self->_fail('INVALID_TARGET','SPLICE requires an array element path');
+   my @parts=@{$loc->[1]};
+   my $last=pop @parts;
+   my ($array,$parent_loc)=$self->_read([$loc->[0],\@parts,$loc->[2]]);
+   type_mask($array)==TYPE_ARRAY or $self->_fail('INVALID_TARGET','SPLICE requires an array element path');
+   my $offset=$self->_selector($last,$array,0);
+   my $count=$self->_eval($action->count_expr,$depth+1);
+   !defined($count) || is_integer($count) or $self->_fail('INVALID_OPERAND','SPLICE count must be an integer or null');
+   my $size=@$array;
+   $count=$size-$offset unless defined $count;
+   $count+=$size-$offset if $count<0;
+   $count>=0 && $count<=$size-$offset or $self->_fail('INVALID_TARGET','SPLICE count is out of range');
+   my (@values,@sources);
+   $self->_step(scalar @{$action->replacements});
+   $self->_charge('mem',32*@{$action->replacements});
+   for my $arg (@{$action->replacements}) {
+      my ($value,$source)=$self->_value_source($arg,$depth+1);
+      $value=$self->_export_dates($value,$depth+1,{})
+         if ($loc->[2] || '') eq 'node' || refaddr($loc->[0])==refaddr($self->{root});
+      push @values,$self->_snapshot($value);
+      push @sources,$source;
+   }
+   return unless $count || @values;
+   # Reserve array shifting and metadata repair before touching the tree.
+   $self->_step($size+@values);
+   $self->_charge('mem',16*($size+@values));
+   $self->{undo_state}->_record($self,$parent_loc) if $self->{undo_state};
+   my $dest=[$parent_loc->[0],[@{$parent_loc->[1]},$offset],$loc->[2]];
+   ($array)=$self->_parent($dest);
+   require JGraft::_Split;
+   my $meta=JGraft::_Split->_splice_meta($self,$array,$offset,$count,\@sources);
+   splice @$array,$offset,$count,@values;
+   if ($meta) {
+      $self->{split_meta}{refaddr($array)}=$meta;
+      JGraft::_Split->_fill_meta($self,$array,1);
+   }
+   else { delete $self->{split_meta}{refaddr($array)} }
+   for my $value (@values) {
+      next unless $self->_contains_date($value);
+      # Mark ancestors too: the array may be inside a TEMP/STASH container.
+      my $container=$parent_loc->[0][0];
+      $self->_step(1+@{$parent_loc->[1]});
+      $self->_mark_date_container($container);
+      for my $part (@{$parent_loc->[1]}) {
+         $container=$self->_child($container,$part);
+         $self->_mark_date_container($container);
+      }
+      last;
+   }
 }
 sub JGraft::Action::ATSPLIT::_execute {
    my ($action,$self,$depth)=@_;
@@ -1145,6 +1224,10 @@ sub JGraft::Expr::CASTNUM::_execute {
       $self->_step(length($v)*.001);
       my $num=0+$v;
       is_finite($num) or $self->_fail('UNSUPPORTED_GRAFT','Number outside supported range');
+      if ($num==0) {
+         my ($mantissa)=split /[eE]/,$v,2;
+         $mantissa !~ /[1-9]/ or $self->_fail('UNSUPPORTED_GRAFT','Number underflows supported range');
+      }
       return $num;
    }
    $self->_fail('INVALID_TARGET','Invalid CASTNUM input');
@@ -1163,7 +1246,15 @@ sub JGraft::Expr::CASTSTR::_execute {
    }
    if ($t==TYPE_NUMBER) {
       require JGraft;
-      return JGraft::_json()->new->allow_nonref->encode($v);
+      my $out=JGraft::_json()->new->allow_nonref->encode($v);
+      if (is_integer($v) && $out =~ /\A(-?)([0-9]+)(?:\.([0-9]+))?[eE]([+-]?[0-9]+)\z/) {
+         my ($sign,$whole,$fraction,$exponent)=($1,$2,defined($3)?$3:'',0+$4);
+         my $digits=$whole.$fraction;
+         my $zeros=$exponent-length($fraction);
+         $out=$sign.($zeros>=0? $digits.('0'x$zeros) : substr($digits,0,length($digits)+$zeros));
+      }
+      $self->_step(length($out)*.001); $self->_charge('mem',length($out));
+      return $out;
    }
    $self->_fail('INVALID_TARGET','Invalid CASTSTR input');
 }
@@ -1332,7 +1423,7 @@ sub _slice {
 
 =head1 DESCRIPTION
 
-Executes JGRAFT, AT, ATSPLIT, MATCH, IF, COPY, and MOVE with namespace references, value
+Executes JGRAFT, RAISE, AT, ATSPLIT, MATCH, IF, COPY, MOVE, and SPLICE with namespace references, value
 construction, common expressions, structural matching, LOCAL, LENGTH, SLICE, SPLIT, JOIN,
 CONCAT, REDUCE, FILTER, MAP, PROPS, MKOBJ, CASE, CURPROP, CAPTURE, arithmetic,
 logical operators, comparisons, and boolean/number/string/date casts.
@@ -1342,7 +1433,21 @@ successor unions/coverage assertions, and preferred named captures.
 STR searches for the leftmost regex match over Unicode codepoints. Regex branching
 uses the sequence engine; quoted literal runs use cached anchored Perl patterns.
 Fuzzy matching remains unimplemented.
-Other operations fail with UNSUPPORTED_GRAFT.
+Unsupported protocol versions fail with UNSUPPORTED_GRAFT.
+
+SPLICE resolves an existing array and normalizes its offset/count, then evaluates
+all replacement values before editing. Replacements are individual values rather
+than flattened arrays. Array shifting, metadata repair, copy-on-write, and undo
+tracking are included in resource accounting. SPLIT metadata is spliced in parallel;
+direct element references retain matching-origin rows and new values receive
+adjacent formatting after the final order is known.
+
+RAISE collects ordered diagnostics in C<logs>. Info/warn levels continue execution;
+fail records its diagnostic and ends the attempt with NO_MATCH. Message expressions
+must return printable strings without controls, surrogates, or noncharacters.
+Optional data is evaluated before recording and held as a copy-on-write snapshot;
+dates use the configured output formatter. A failed message/data evaluation emits
+no record for that action. Earlier records remain available after failure.
 
 SPLIT supports literal and longest-match regex separators, whole-field element
 constraints, retained separators, and ordered left/right trimming. JOIN restores
@@ -1492,6 +1597,14 @@ L<JGraft::Error> construction context and its text stack trace.
 =attribute success
 
 True after successful execution, including when the result is null.
+
+=attribute logs
+
+An arrayref of ordered RAISE diagnostics. Each entry has numeric C<level>
+(0 info, 1 warn, 2 fail), C<message>, and C<data> only when supplied, including
+explicit null. Fatal entries are included. Each C<apply> starts a fresh array;
+records from earlier applications remain valid. Treat records and their shared
+data as read-only, like shared input/output. Logging does not print or warn.
 
 =attribute counters
 

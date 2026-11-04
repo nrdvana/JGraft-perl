@@ -76,15 +76,15 @@ $exec=JGraft::Exec->new(jgraft=>JGRAFT({expr=>['cycle',EXPR('cycle')]},MATCH([SE
 $exec->apply([]);
 is($exec->error,'RESOURCE_LIMIT','recursive macros inside sequences remain bounded');
 
-# Outline splitting preserves normal JSON decoding and never substitutes values
-# into an unsupported case. Non-Unicode syntax failures still propagate.
+# Fixture decoding preserves arbitrary object keys and escaped structure, while
+# retaining lone surrogates as actual Perl codepoints. Invalid JSON stays fatal.
 my $normal_input={'__proto__'=>q({}[]\"),tests=>[1]};
 my $normal=JSON::PP->new->encode({name=>'normal',input=>$normal_input,jgraft=>['JGRAFT',{}],output=>$normal_input});
 my $outline='{"name":"outline","tests":['.$normal.
    q(,{"name":"unsupported","input":"\ud800","jgraft":["JGRAFT",{}],"output":"\ud800"}]});
 my $decoded=Test2AndUtils::_conformance_json($outline);
 is($decoded->{tests}[0]{input},$normal_input,'outline preserves arbitrary keys and escaped structural characters');
-is(ref($decoded->{tests}[1]),'Test2AndUtils::_UnsupportedJSON','unsupported Unicode becomes an explicit skip record');
+is(ord($decoded->{tests}[1]{input}),0xd800,'fixture decoding retains lone surrogates');
 like(dies { Test2AndUtils::_conformance_json(substr($outline,0,-1)) },qr/conformance JSON/,'truncated outline is rejected');
 like(dies { Test2AndUtils::_conformance_json('{"name":false,}') },qr/(?:unexpected|expected|malformed)/i,'ordinary invalid JSON is rejected by decoder');
 done_testing;

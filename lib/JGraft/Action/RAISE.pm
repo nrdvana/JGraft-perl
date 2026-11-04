@@ -10,6 +10,13 @@ The action emits L</message> at L</level>, optionally attaching L</data>. The fa
 rejects the current graft attempt; message and data expressions are evaluated in value
 context.
 
+L<JGraft::Exec/logs> collects ordered records with numeric C<level>, C<message>,
+and optional C<data>. Info and warn continue execution; fail records its message
+then rejects the attempt with C<NO_MATCH>. Data remains stable across later edits
+using copy-on-write, and dates use the executor's output formatter. Message/data
+evaluation failures emit no record for that action. Messages must be strings
+without controls, surrogates, or Unicode noncharacters.
+
 =attribute id
 
 The numeric operation ID, C<0>.

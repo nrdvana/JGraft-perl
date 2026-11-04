@@ -385,23 +385,30 @@ back to L</new_from_json_data> to re-create it.
 
 =method format
 
-  my $json_text= JGraft::Expr->format(%options);
+  my $json_text= $expr->format(%options);
   # Options:
   #   prefix  => $str,  # the current indent, as a string
   #   indent  => $n,    # number of spaces of indent per level
   #   wrap    => $cols, # attempt to keep content no wider than $cols
+  #   ids     => 1,     # numeric IDs instead of names (default: 0)
+  #   close   => 'inline', # or 'newline' (default)
 
-With no arguments, it defaults to C<< indent => 2, wrap => 79 >> which ideally keeps it readable
-on a terminal.  This method is implemented differently by each expression; each has rules that
-judge how best to represent its arguments in the remaining columns.
-For a more generic formatting, you can always call C<to_json_data> and serialize it to JSON with
-whatever formatting you like; however, note that a file containing JGraft should begin with the
-string C<< ["JGRAFT", >> (no whitespace) for easy format detection.
+Returns JSON text without a trailing newline, using the same options and width
+rules as L<JGraft::Action/format>. Defaults are two-space indentation, width 79,
+names, and closing brackets on separate lines for wrapped containers.
+
+Logical pairs (LOCAL bindings and CASE branches, for example) stay together when
+they fit; a wrapped LOCAL's final expression gets its own line. Nested directives
+with multiple arguments start new lines. Deep indentation doubles the local width
+when wrapping would otherwise leave fewer than 40 columns for arguments.
+C<< indent => 0 >> emits compact JSON with only width-driven token-boundary
+newlines; adding C<< wrap => 0 >> disables those too.
 
 =cut
 
 sub format {
-   die "unimplemented";
+   require JGraft::_Format;
+   return JGraft::_Format->format(@_);
 }
 
 sub _define_expr {
@@ -773,6 +780,13 @@ sub JGraft::Expr::NUM::_validate {
    return unless defined $self->{min} && defined $self->{max}
       && !is_expr($self->{min}) && !is_expr($self->{max});
    $self->{min} <= $self->{max} or JGraft::_Node::_bad('NUM bounds are reversed');
+}
+
+sub JGraft::Expr::SLICE::_validate {
+   my $self=shift;
+   return unless exists $self->{config_obj};
+   my $types=type_mask($self->{config_obj});
+   !$types || ($types & TYPE_OBJECT) or JGraft::_Node::_bad('SLICE configuration must be an object');
 }
 
 sub JGraft::Expr::REP::_validate {

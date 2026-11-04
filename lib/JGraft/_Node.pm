@@ -388,57 +388,60 @@ sub _split_spec {
 sub _validate { }
 
 sub _encode_tree {
-   my $v= shift;
+   my ($v,$encode_node)= @_;
    return $v unless ref $v;
    return $v if JSON::PP::is_bool($v);
    if (!_is_expr($v) && _type($v)==TYPE_DATE) {
       require JGraft::Date;
-      return ['CASTDATE',JGraft::Date->new($v)->to_iso8601];
+      my $text=JGraft::Date->new($v)->to_iso8601;
+      return $encode_node? $encode_node->('JGraft::Expr::CASTDATE',[$text]) : ['CASTDATE',$text];
    }
-   return $v->to_json_data if _is_expr($v) || _is_action($v);
-   return [[map _encode_tree($_), @$v]] if ref $v eq 'ARRAY';
-   return { map +($_ => _encode_tree($v->{$_})), keys %$v } if ref $v eq 'HASH';
+   return $encode_node? $encode_node->($v) : $v->to_json_data if _is_expr($v) || _is_action($v);
+   return [[map _encode_tree($_,$encode_node), @$v]] if ref $v eq 'ARRAY';
+   return { map +($_ => _encode_tree($v->{$_},$encode_node)), keys %$v } if ref $v eq 'HASH';
    _bad('Cannot serialize ', ref($v));
 }
 
 sub _encode_argument {
-   my ($v, $context)= @_;
+   my ($v, $context, $encode_node)= @_;
    if ($context eq 'metadata') {
       my %copy= %$v;
       for my $key ('const', 'expr') {
          next unless exists $v->{$key};
          my @defs;
          for (my $i= 0; $i < @{$v->{$key}}; $i += 2) {
-            push @defs, $v->{$key}[$i], _encode_tree($v->{$key}[$i+1]);
+            push @defs, $v->{$key}[$i], _encode_tree($v->{$key}[$i+1],$encode_node);
          }
          $copy{$key}= \@defs;
       }
       return \%copy;
    }
    if ($context eq 'split' && ref $v eq 'HASH') {
-      return { map +($_ => _encode_tree($v->{$_})), keys %$v };
+      return { map +($_ => _encode_tree($v->{$_},$encode_node)), keys %$v };
    }
-   return _encode_tree($v);
+   return _encode_tree($v,$encode_node);
 }
 
 sub to_json_data {
-   my $self= shift;
+   # The optional private callback lets the formatter identify actual directives
+   # without guessing whether a literal array's first item is an operation name.
+   my ($self,$encode_node)= @_;
    my $form= $self->{_form};
    my @args;
    for my $field (@{$form->{fields} || []}) {
       last unless exists $self->{$field->[0]};
-      push @args, _encode_argument($self->{$field->[0]}, $field->[1]);
+      push @args, _encode_argument($self->{$field->[0]}, $field->[1],$encode_node);
    }
    if (my $repeat= $form->{repeat}) {
       for my $item (@{$self->{$repeat->[0]}}) {
-         if (@$repeat == 2) { push @args, _encode_argument($item, $repeat->[1]) }
+         if (@$repeat == 2) { push @args, _encode_argument($item, $repeat->[1],$encode_node) }
          else {
-            push @args, map _encode_argument($item->[$_-1], $repeat->[$_]), 1..$#$repeat;
+            push @args, map _encode_argument($item->[$_-1], $repeat->[$_],$encode_node), 1..$#$repeat;
          }
       }
    }
    if (my $tail= $form->{tail}) {
-      push @args, _encode_argument($self->{$tail->[0]}, $tail->[1]) if exists $self->{$tail->[0]};
+      push @args, _encode_argument($self->{$tail->[0]}, $tail->[1],$encode_node) if exists $self->{$tail->[0]};
    }
    return [$self->_name, @args];
 }
