@@ -179,6 +179,28 @@ sub _source {
    $exec->_charge('mem',128);
    return {origin=>$meta->{origin},separators=>$meta->{separators},trims=>$meta->{trims},row=>$meta->{rows}[$index]};
 }
+# CONCAT chooses the first nonempty metadata origin, retaining only rows from
+# that origin. Fill adjacent rows once, after all operands have been appended.
+sub _append_meta {
+   my ($class,$exec,$source,$target,$offset)=@_;
+   return unless @$source;
+   my $src=$exec->{split_meta}{refaddr($source)} or return;
+   my $meta=$exec->{split_meta}{refaddr($target)};
+   unless ($meta) {
+      $exec->_charge('mem',160+16*@$target); $exec->_step(scalar @$target);
+      $meta=$exec->{split_meta}{refaddr($target)}={%$src,array=>$target,rows=>[(undef)x scalar @$target]};
+   }
+   return unless $meta->{origin}==$src->{origin};
+   $exec->_step(scalar @$source); $exec->_charge('mem',16*@$source);
+   @{$meta->{rows}}[$offset..$offset+$#$source]=@{$src->{rows}};
+}
+sub _select_meta {
+   my ($class,$exec,$source,$target,$indices)=@_;
+   return unless @$indices;
+   my $meta=$exec->{split_meta}{refaddr($source)} or return;
+   $exec->_step(scalar @$indices); $exec->_charge('mem',160+16*@$indices);
+   $exec->{split_meta}{refaddr($target)}={%$meta,array=>$target,rows=>[@{$meta->{rows}}[@$indices]]};
+}
 sub _insert_meta {
    my ($class,$exec,$array,$source)=@_;
    my $meta=$exec->{split_meta}{refaddr($array)};

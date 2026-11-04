@@ -930,6 +930,173 @@ sub JGraft::Expr::LOCAL::_execute {
    return $self->_eval($expr->return_value_expr,$depth+1);
 }
 
+sub JGraft::Expr::CONCAT::_execute {
+   my ($expr,$self,$depth)=@_;
+   my ($type,$size,@values);
+   $size=0;
+   $self->_step(scalar @{$expr->value_exprs});
+   $self->_charge('mem',16*@{$expr->value_exprs});
+   for my $arg (@{$expr->value_exprs}) {
+      my $value=$self->_eval($arg,$depth+1);
+      my $t=type_mask($value);
+      ($t==TYPE_STRING || $t==TYPE_ARRAY) && (!defined($type) || $type==$t)
+         or $self->_fail('INVALID_TARGET','CONCAT expects homogeneous arrays or strings');
+      $type=$t;
+      $size+=$t==TYPE_ARRAY? scalar @$value : length($value);
+      push @values,$value;
+   }
+   if ($type==TYPE_STRING) {
+      $self->_step($size*.001); $self->_charge('mem',4*$size);
+      return join('',@values);
+   }
+   my $out=$self->_new_array($size);
+   $self->_step($size);
+   for my $array (@values) {
+      my $offset=@$out;
+      for my $i (0..$#$array) {
+         $self->_present($array,$i) or $self->_fail('INVALID_TARGET','CONCAT encounters a deleted element');
+         push @$out,$array->[$i];
+      }
+      JGraft::_Split->_append_meta($self,$array,$out,$offset) if $self->{split_meta}{refaddr($array)};
+      $self->_mark_date_container($out) if $self->{date_containers}{refaddr($array)};
+   }
+   if ($self->{split_meta}{refaddr($out)}) {
+      $self->_charge('mem',96*$size);
+      JGraft::_Split->_fill_meta($self,$out);
+   }
+   return $out;
+}
+
+# Each callback sees the original element and its original index. Localizing
+# both fields also isolates callbacks from an enclosing match cursor.
+sub _iterate_array {
+   my ($self,$expr,$depth,$mode)=@_;
+   my $acc=$self->_eval($expr->initial_value,$depth+1) if $mode eq 'reduce';
+   my $array=$self->_input_value($expr,'array_expr',$depth);
+   type_mask($array)==TYPE_ARRAY or $self->_fail('INVALID_TARGET','Array iteration expects an array');
+   $self->_step(scalar @$array);
+   $self->_charge('mem',80*@$array);
+   my $out=$self->_new_array(scalar @$array) unless $mode eq 'reduce';
+   my $meta=$self->{split_meta}{refaddr($array)};
+   my @selected;
+   $self->_charge('mem',16*@$array) if $meta && $mode eq 'filter';
+   if ($mode eq 'map') {
+      @$out=(undef)x scalar @$array;
+      JGraft::_Split->_copy_meta($self,$array,$out,0,scalar @$array) if $meta;
+   }
+   local $self->{temp}=$self->{temp};
+   if ($mode eq 'reduce') {
+      my $temp=$self->_new_hash(scalar keys %{$self->{temp}[0]});
+      $self->_step(scalar keys %{$self->{temp}[0]});
+      %$temp=%{$self->{temp}[0]};
+      $self->{temp}=[$temp,1];
+   }
+   local $self->{current}=$self->{current};
+   local $self->{match_cursor};
+   for my $i (0..$#$array) {
+      $self->_present($array,$i) or $self->_fail('INVALID_TARGET','Array iteration encounters a deleted element');
+      $self->{current}=[[$array,1],[$i]];
+      if ($mode eq 'reduce') {
+         $self->_put($self->{temp}[0],$expr->temp_prop,$acc);
+         $acc=$self->_eval($expr->reduce_expr,$depth+1);
+      }
+      elsif ($mode eq 'filter') {
+         if ($self->_match($expr->match_expr,$depth+1)) {
+            push @$out,$array->[$i];
+            push @selected,$i if $meta;
+         }
+      }
+      else { $self->_put($out,$i,$self->_eval($expr->transform_expr,$depth+1)) }
+   }
+   return $acc if $mode eq 'reduce';
+   JGraft::_Split->_select_meta($self,$array,$out,\@selected) if $mode eq 'filter' && $meta;
+   $self->_mark_date_container($out) if $mode eq 'filter' && @$out && $self->{date_containers}{refaddr($array)};
+   return $out;
+}
+sub JGraft::Expr::REDUCE::_execute { $_[1]->_iterate_array($_[0],$_[2],'reduce') }
+sub JGraft::Expr::FILTER::_execute { $_[1]->_iterate_array($_[0],$_[2],'filter') }
+sub JGraft::Expr::MAP::_execute { $_[1]->_iterate_array($_[0],$_[2],'map') }
+
+sub JGraft::Expr::PROPS::_execute {
+   my ($expr,$self,$depth)=@_;
+   my $object=$self->_input_value($expr,'object_expr',$depth);
+   type_mask($object)==TYPE_OBJECT or $self->_fail('INVALID_TARGET','PROPS expects an object');
+   my $n=keys %$object;
+   my $levels=1; $levels++ while 2**$levels<$n;
+   $self->_step($n*$levels);
+   $self->_charge('mem',16*$n);
+   my @keys=sort { $self->_compare_values($a,$b,$depth+1) } keys %$object;
+   my $options=$expr->{options} || 0;
+   my $out=$self->_new_array($options==2?2:$n);
+   my ($names,$values);
+   if ($options==2) { $names=$self->_new_array($n); $values=$self->_new_array($n); @$out=($names,$values) }
+   for my $key (@keys) {
+      $self->_check_string($key,'expression key');
+      if (!$options) { push @$out,$key }
+      elsif ($options==1) {
+         my $pair=$self->_new_array(2);
+         $self->_put($pair,0,$key); $self->_put($pair,1,$object->{$key});
+         $self->_put($out,scalar @$out,$pair);
+      }
+      else { push @$names,$key; $self->_put($values,scalar @$values,$object->{$key}) }
+   }
+   $self->_mark_date_container($out) if $options==2 && $self->_contains_date($values);
+   return $out;
+}
+sub JGraft::Expr::MKOBJ::_execute {
+   my ($expr,$self,$depth)=@_;
+   my @pairs;
+   if (exists $expr->{prop_array_expr}) {
+      my $pairs=$self->_eval($expr->prop_array_expr,$depth+1);
+      type_mask($pairs)==TYPE_ARRAY or $self->_fail('INVALID_TARGET','MKOBJ expects property pairs');
+      $self->_step(scalar @$pairs); $self->_charge('mem',16*@$pairs);
+      for my $i (0..$#$pairs) {
+         $self->_present($pairs,$i) or $self->_fail('INVALID_TARGET','Deleted MKOBJ pair');
+         my $pair=$pairs->[$i];
+         type_mask($pair)==TYPE_ARRAY && @$pair==2 && $self->_present($pair,0) && $self->_present($pair,1)
+            or $self->_fail('INVALID_TARGET','MKOBJ expects two-element pairs');
+         push @pairs,$pair;
+      }
+   }
+   else {
+      my @args;
+      $self->_step(scalar @{$expr->value_exprs});
+      $self->_charge('mem',32*@{$expr->value_exprs});
+      push @args,$self->_eval($_,$depth+1) for @{$expr->value_exprs};
+      @args && @args%2==0 or $self->_fail('INVALID_TARGET','MKOBJ expects property pairs');
+      if (@args==2 && type_mask($args[0])==TYPE_ARRAY && type_mask($args[1])==TYPE_ARRAY) {
+         my ($names,$values)=@args;
+         @$names==@$values or $self->_fail('INVALID_TARGET','MKOBJ array lengths differ');
+         $self->_step(scalar @$names); $self->_charge('mem',48*@$names);
+         for my $i (0..$#$names) {
+            $self->_present($names,$i) && $self->_present($values,$i) or $self->_fail('INVALID_TARGET','Deleted MKOBJ element');
+            push @pairs,[$names->[$i],$values->[$i]];
+         }
+      }
+      else { for (my $i=0;$i<@args;$i+=2) { push @pairs,[@args[$i,$i+1]] } }
+   }
+   my $out=$self->_new_hash(scalar @pairs);
+   $self->_step(scalar @pairs);
+   for my $pair (@pairs) {
+      my ($key,$value)=@$pair;
+      type_mask($key)==TYPE_STRING or $self->_fail('INVALID_TARGET','MKOBJ names must be strings');
+      $self->_check_string($key,'expression key');
+      $self->_step(length($key)*.001);
+      exists $out->{$key} and $self->_fail('INVALID_TARGET','Duplicate MKOBJ property');
+      $self->_put($out,$key,$value);
+   }
+   return $out;
+}
+sub JGraft::Expr::CASE::_execute {
+   my ($expr,$self,$depth)=@_;
+   $self->_step(scalar @{$expr->branches});
+   for my $pair (@{$expr->branches}) {
+      return $self->_eval($pair->[1],$depth+1) if $self->_match($pair->[0],$depth+1);
+   }
+   return $self->_eval($expr->else_value_expr,$depth+1) if exists $expr->{else_value_expr};
+   $self->_fail('INVALID_TARGET','CASE has no matching branch');
+}
+
 sub _boolean_value {
    my ($self,$arg,$depth)= @_;
    my $value=$self->_eval($arg,$depth);
@@ -1167,7 +1334,8 @@ sub _slice {
 
 Executes JGRAFT, AT, ATSPLIT, MATCH, IF, COPY, and MOVE with namespace references, value
 construction, common expressions, structural matching, LOCAL, LENGTH, SLICE, SPLIT, JOIN,
-CURPROP, CAPTURE, arithmetic, logical operators, comparisons, and boolean/number/string/date casts.
+CONCAT, REDUCE, FILTER, MAP, PROPS, MKOBJ, CASE, CURPROP, CAPTURE, arithmetic,
+logical operators, comparisons, and boolean/number/string/date casts.
 Structural matching supports HAS, IS, ANY, ALL, NONE, EXISTS, ARRAY, NUM, BOOL,
 STR, CHARS, DATE, and WITH. Array and string sequences support SEQ, SEQMIN, SEQMAX, REP, START, END,
 successor unions/coverage assertions, and preferred named captures.
