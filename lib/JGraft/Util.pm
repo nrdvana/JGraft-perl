@@ -38,6 +38,7 @@ sub type_mask {
    return TYPE_NULL unless defined $v;
    return TYPE_BOOLEAN if JSON::PP::is_bool($v);
    return $v->returns if is_expr($v);
+   return TYPE_DATE if blessed($v) && ($v->isa('JGraft::Date') || $v->isa('Time::Piece') || $v->isa('DateTime'));
    return TYPE_ARRAY if ref $v eq 'ARRAY';
    return TYPE_OBJECT if ref $v eq 'HASH';
    return TYPE_NONE if ref $v;

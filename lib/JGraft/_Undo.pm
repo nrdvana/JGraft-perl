@@ -57,6 +57,11 @@ sub _build {
 sub _key {
    my $value=shift;
    my $type=type_mask($value);
+   if ($type==TYPE_DATE) {
+      require JGraft::Date;
+      my $date=JGraft::Date->new($value);
+      return TYPE_DATE.':'.$date->type.':'.$date->to_iso8601;
+   }
    return 'r'.refaddr($value) if $type==TYPE_ARRAY || $type==TYPE_OBJECT;
    return $type.':'.(!defined $value? '' : $type==TYPE_BOOLEAN? ($value?1:0) : $value);
 }
@@ -161,6 +166,7 @@ sub _diff {
       elsif ($wt==TYPE_STRING) {
          return if $wanted eq $have;
       }
+      elsif ($wt==TYPE_DATE) { return if _key($wanted) eq _key($have) }
       else { return if $wanted==$have }
    }
    unless ($wt==$ht && ($wt==TYPE_ARRAY || $wt==TYPE_OBJECT) && $self->_origin($wanted)==$self->_origin($have)) {

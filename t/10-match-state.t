@@ -93,9 +93,9 @@ is($exec->error,'RESOURCE_LIMIT','match guards do not swallow recursive expansio
 $exec=JGraft::Exec->new(jgraft=>JGRAFT({v=>2}));
 $exec->apply({});
 is($exec->error,'UNSUPPORTED_GRAFT','unsupported errors remain fatal');
-$exec=JGraft::Exec->new(jgraft=>COPY(ANY(FAIL(),DATE()),NODE()));
+$exec=JGraft::Exec->new(jgraft=>COPY(ANY(FAIL(),MAP(NODE())),NODE()));
 $exec->apply(1);
-is($exec->error,'UNSUPPORTED_GRAFT','ANY does not swallow unsupported matching operations');
+is($exec->error,'UNSUPPORTED_GRAFT','ANY does not swallow unsupported expressions');
 {
    package Test::UnexpectedMatchError;
    our @ISA=('JGraft::Exec');

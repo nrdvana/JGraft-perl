@@ -243,6 +243,12 @@ sub _expect {
 sub _tree {
    my ($value, $parse, $seen, $plain)= @_;
    return $value if !ref $value || JSON::PP::is_bool($value);
+   if (!_is_expr($value) && _type($value)==TYPE_DATE) {
+      require JGraft::Date;
+      my $date=eval { JGraft::Date->new($value) };
+      $date or _bad("Invalid native date: $@");
+      return $date;
+   }
    if (_is_expr($value)) {
       $plain and _bad('Expressions are not allowed in literal data');
       return $value;
@@ -385,6 +391,10 @@ sub _encode_tree {
    my $v= shift;
    return $v unless ref $v;
    return $v if JSON::PP::is_bool($v);
+   if (!_is_expr($v) && _type($v)==TYPE_DATE) {
+      require JGraft::Date;
+      return ['CASTDATE',JGraft::Date->new($v)->to_iso8601];
+   }
    return $v->to_json_data if _is_expr($v) || _is_action($v);
    return [[map _encode_tree($_), @$v]] if ref $v eq 'ARRAY';
    return { map +($_ => _encode_tree($v->{$_})), keys %$v } if ref $v eq 'HASH';

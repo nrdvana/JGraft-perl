@@ -100,6 +100,11 @@ sub _dispatch {
       return $self->_elements($spec,$value,0,$self->{exact},$cursor,$depth,$literal);
    }
    return 1 if $type==TYPE_NULL;
+   if ($type==TYPE_DATE) {
+      my ($a,$b)=($exec->_date($spec),$exec->_date($value));
+      $exec->_step(16+length($a->fraction)+length($b->fraction));
+      return $a->type eq $b->type && !$a->_compare($b);
+   }
    if ($type==TYPE_STRING) {
       $exec->_step((length($spec)+length($value))*.001);
       return $spec eq $value;
@@ -180,6 +185,7 @@ sub _expression {
       return $name ne 'ANY';
    }
    return $cursor->{exists} if $name eq 'EXISTS';
+   if ($name eq 'DATE') { return $cursor->{exists} && !!$exec->_date($cursor->{value}) }
    if ($name eq 'CHARS') {
       require JGraft::_Chars;
       return JGraft::_Chars->_test($exec,$expr,$cursor,$depth+1);

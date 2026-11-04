@@ -5,7 +5,7 @@ use strict;
 use warnings;
 no warnings 'recursion';
 use Carp 'croak';
-use Scalar::Util qw(blessed refaddr);
+use Scalar::Util qw(blessed refaddr weaken);
 use JSON::PP ();
 use JGraft::Util qw(:types type_mask is_finite is_integer is_expr is_action);
 use overload '""' => 'as_string', 'bool' => sub { 1 }, fallback => 1;
@@ -14,8 +14,13 @@ sub new {
    my $class= shift;
    @_ % 2 == 0 or croak 'Expected name/value options';
    my %opt= @_;
-   my %allowed= map {$_=>1} qw(jgraft input clone undo limits codepoint_policy);
+   my %allowed= map {$_=>1} qw(jgraft input clone undo limits codepoint_policy date_format);
    $allowed{$_} or croak "Unknown execution option '$_'" for keys %opt;
+   if (exists $opt{date_format}) {
+      my $format=$opt{date_format};
+      defined($format) && (ref($format) eq 'CODE' || (!ref($format) && $format =~ /\A(?:iso8601|Time::Piece|DateTime)\z/))
+         or croak 'date_format must be iso8601, Time::Piece, DateTime, or a coderef';
+   }
    if (exists $opt{codepoint_policy}) {
       my $policy=$opt{codepoint_policy};
       defined($policy) && (ref($policy) eq 'CODE' || (!ref($policy) && $policy =~ /\A(?:preserve|reject|substitute)\z/))
@@ -65,6 +70,11 @@ sub apply {
    $self->{pending}= {};
    $self->{regex_literals}= {};
    $self->{char_classes}= {};
+   $self->{split_meta}= {};
+   $self->{split_origin}= 0;
+   $self->{dates}= {};
+   $self->{date_containers}= {};
+   $self->{date_output}= {};
    $self->{epoch}= 1;
    $self->{root}= [$input,1];
    $self->{current}= [$self->{root},[]];
@@ -162,6 +172,7 @@ sub _inspect {
       return;
    }
    my $type= type_mask($v);
+   if ($type==TYPE_DATE) { $self->_date($v); return }
    if (!ref $v || JSON::PP::is_bool($v)) {
       $self->_step(length($v)*.001) if $type == TYPE_STRING;
       $self->_check_string($v,$ast?'graft':'input') if $type == TYPE_STRING;
@@ -183,6 +194,7 @@ sub _inspect {
       for my $i (0..$#$v) {
          exists $v->[$i] or $self->_fail('UNSUPPORTED_GRAFT','Sparse input arrays are not JSON data');
          $self->_inspect($v->[$i],$depth+1,$active,$ast,$alloc);
+         $self->_mark_date_container($v) if $self->_contains_date($v->[$i]);
       }
    }
    else {
@@ -190,6 +202,7 @@ sub _inspect {
          $self->_step(length($key)*.001);
          $self->_check_string($key,$ast?'graft key':'input key');
          $self->_inspect($v->{$key},$depth+1,$active,$ast,$alloc);
+         $self->_mark_date_container($v) if $self->_contains_date($v->{$key});
       }
    }
 }
@@ -207,12 +220,15 @@ sub _cow {
       my $copy=$self->_new_array(scalar @$v);
       $self->_step(scalar @$v);
       @$copy=@$v;
+      $self->_mark_date_container($copy) if $self->{date_containers}{refaddr($v)};
+      JGraft::_Split->_copy_meta($self,$v,$copy,0,scalar @$v) if $self->{split_meta}{refaddr($v)};
       $self->{lineage}{refaddr($copy)}=$self->{lineage}{refaddr($v)} || refaddr($v) if $self->{undo_state};
       return $copy;
    }
    my $copy=$self->_new_hash(scalar keys %$v);
    $self->_step(scalar keys %$v);
    %$copy=%$v;
+   $self->_mark_date_container($copy) if $self->{date_containers}{refaddr($v)};
    $self->{lineage}{refaddr($copy)}=$self->{lineage}{refaddr($v)} || refaddr($v) if $self->{undo_state};
    return $copy;
 }
@@ -227,18 +243,22 @@ sub _clone_tree {
    my ($self,$v,$depth)= @_;
    $self->_depth($depth);
    $self->_step(1);
+   if (blessed($v) && $v->isa('DateTime')) { $self->_allocation(256); return $v->clone }
    return $v unless ref $v eq 'ARRAY' || ref $v eq 'HASH';
    if (ref $v eq 'ARRAY') {
       my $out=$self->_new_array(scalar @$v);
       $self->{lineage}{refaddr($out)}=$self->{lineage}{refaddr($v)} || refaddr($v) if $self->{undo_state};
       $self->_step(scalar @$v);
       for my $i (0..$#$v) { $out->[$i]=$self->_clone_tree($v->[$i],$depth+1) }
+      $self->_mark_date_container($out) if $self->{date_containers}{refaddr($v)};
+      JGraft::_Split->_copy_meta($self,$v,$out,0,scalar @$v) if $self->{split_meta}{refaddr($v)};
       return $out;
    }
    my $out=$self->_new_hash(scalar keys %$v);
    $self->{lineage}{refaddr($out)}=$self->{lineage}{refaddr($v)} || refaddr($v) if $self->{undo_state};
    $self->_step(scalar keys %$v);
    $out->{$_}=$self->_clone_tree($v->{$_},$depth+1) for keys %$v;
+   $self->_mark_date_container($out) if $self->{date_containers}{refaddr($v)};
    return $out;
 }
 
@@ -317,17 +337,34 @@ sub JGraft::Action::COPY::_execute {
    my $pairs=$action->assignments;
    $self->_step(scalar @$pairs);
    for my $pair (@$pairs) {
-      my $v=$self->_eval($pair->[0],$depth+1);
+      my ($v,$metadata)=$self->_value_source($pair->[0],$depth+1);
       # Keep the value stable even if destination expressions read from it.
       $self->_snapshot($v);
       my $loc=$self->_path($pair->[1],'write',$depth+1);
       my $dest=$self->_probe($loc,undef,0);
-      $self->_write($dest,$v);
+      $self->_write($dest,$v,$metadata);
    }
 }
 sub JGraft::Action::MOVE::_execute {
    my ($action,$self,$depth)= @_;
    return $self->_move($action->moves,$depth+1);
+}
+sub JGraft::Action::ATSPLIT::_execute {
+   my ($action,$self,$depth)=@_;
+   require JGraft::_Split;
+   my ($text,$target)=$self->_read($self->_path($action->path,'at',$depth+1));
+   my ($config,$result);
+   {
+      local $self->{current}=$target;
+      $config=JGraft::_Split->_config($self,$action->split_spec,$depth+1,'both');
+      my $array=JGraft::_Split->_split($self,$config,$text,$depth+1);
+      local $self->{current}=[[$array,1],[]];
+      local $self->{match_cursor};
+      $self->_step(scalar @{$action->actions});
+      $self->_run($_,$depth+1) for @{$action->actions};
+      $result=JGraft::_Split->_join($self,$config,($self->_read($self->{current}))[0],$depth+1);
+   }
+   $self->_write($target,$result);
 }
 
 sub _path {
@@ -383,13 +420,17 @@ sub _path {
       $parts[0]="$key";
    }
    $self->_charge('mem',32+16*(@parts+@{$base->[1]}));
-   return [$base->[0],[@{$base->[1]},@parts]];
+   return [$base->[0],[@{$base->[1]},@parts],$ns];
 }
 
 sub _selector {
    my ($self,$value,$container,$half)= @_;
    my $type=type_mask($value);
    my $kind=type_mask($container);
+   if ($kind==TYPE_DATE) {
+      $type==TYPE_STRING or $self->_fail('INVALID_TARGET','Date selectors must be field names');
+      return $value;
+   }
    if ($kind==TYPE_OBJECT) {
       $type==TYPE_STRING or $self->_fail('INVALID_TARGET','Object selectors must be strings');
       return $value;
@@ -410,12 +451,29 @@ sub _selector {
 }
 sub _present {
    my ($self,$v,$key)= @_;
+   return $self->_date($v)->_has($key) if type_mask($v)==TYPE_DATE;
    return exists $v->{$key} if ref $v eq 'HASH';
    return 0 unless is_integer($key) && $key>=0 && $key<@$v && exists $v->[$key];
    my $record=$self->{pending}{refaddr($v)};
    return !$record || !$record->{deleted}{0+$key};
 }
-sub _child { ref $_[1] eq 'ARRAY'? $_[1][$_[2]] : $_[1]{$_[2]} }
+sub _child {
+   if (type_mask($_[1])==TYPE_DATE) {
+      my $date=$_[0]->_date($_[1]);
+      if ($_[2] eq 'second') {
+         my $n=length($date->fraction);
+         $_[0]->_step($n*.01+1); $_[0]->_charge('mem',2*$n);
+      }
+      my $value=eval { $date->_get($_[2]) };
+      my $error=$@;
+      if ($error) {
+         die $error if ref($error) || $error !~ /\AUNSUPPORTED_GRAFT:/;
+         $_[0]->_fail('UNSUPPORTED_GRAFT',"$error");
+      }
+      return $value;
+   }
+   return ref($_[1]) eq 'ARRAY'? $_[1][$_[2]] : $_[1]{$_[2]};
+}
 sub _read {
    my ($self,$loc)= @_;
    my ($cell,$parts)=@$loc;
@@ -430,7 +488,7 @@ sub _read {
       push @canonical,$key;
       $v=$self->_child($v,$key);
    }
-   return ($v,[$cell,\@canonical]);
+   return ($v,[$cell,\@canonical,$loc->[2]]);
 }
 sub _same_key {
    my ($self,$a,$b)= @_;
@@ -453,6 +511,7 @@ sub _probe {
          my $kind=type_mask($parts->[$i]);
          $v=$kind==TYPE_STRING? {} : [];
       }
+      type_mask($v)!=TYPE_DATE or $self->_fail('INVALID_TARGET','Date fields are immutable');
       my $key=$self->_selector($parts->[$i],$v,$half && $i==$#$parts);
       if (ref $v eq 'ARRAY' && !is_integer($key)) {
          push @canonical,$key;
@@ -467,7 +526,7 @@ sub _probe {
       $v=$present? $self->_child($v,$key) : undef;
       $exists=$present;
    }
-   return [$cell,\@canonical];
+   return [$cell,\@canonical,$loc->[2]];
 }
 
 sub _parent {
@@ -477,6 +536,7 @@ sub _parent {
       $cell->[0]=type_mask($parts->[0])==TYPE_STRING? $self->_new_hash(0):$self->_new_array(0);
       $cell->[1]=1;
    }
+   type_mask($cell->[0])!=TYPE_DATE or $self->_fail('INVALID_TARGET','Date fields are immutable');
    my $v=$self->_cow($cell->[0]);
    $cell->[0]=$v;
    for my $i (0..$#$parts-1) {
@@ -484,6 +544,7 @@ sub _parent {
       my $child;
       if ($self->_present($v,$key)) { $child=$self->_child($v,$key) }
       else { $child=type_mask($parts->[$i+1])==TYPE_STRING? $self->_new_hash(0):$self->_new_array(0) }
+      type_mask($child)!=TYPE_DATE or $self->_fail('INVALID_TARGET','Date fields are immutable');
       $child=$self->_cow($child);
       $self->_put($v,$key,$child);
       $v=$child;
@@ -491,43 +552,79 @@ sub _parent {
    return ($v,$parts->[-1]);
 }
 sub _put {
-   my ($self,$parent,$key,$value)= @_;
+   my ($self,$parent,$key,$value,$source)= @_;
    if (ref $parent eq 'HASH') {
       $self->_charge('mem',64+length($key)) unless exists $parent->{$key};
       $parent->{$key}=$value;
    }
    else {
       my $rec=$self->{pending}{refaddr($parent)};
+      my $inserting=$key==@$parent || ($rec && $rec->{deleted}{0+$key});
+      my $existing_meta=$self->{split_meta}{refaddr($parent)};
+      my $metadata=$inserting && ($source || $existing_meta);
+      $rec=$self->_pending($parent) if $metadata && $self->{moving};
       if ($key==@$parent) {
          $self->_charge('mem',16);
-         if ($rec) { $self->_step(2); $self->_charge('mem',16) }
+         if ($rec) {
+            $self->_step($rec->{metadata} || $metadata?4:2);
+            $self->_charge('mem',$rec->{metadata} || $metadata?112:16);
+         }
+      }
+      if ($metadata) {
+         $self->_charge('mem',96);
+         $self->_step($existing_meta?2:2*(@$parent+1)) unless $self->{moving};
+         my $row=JGraft::_Split->_insert_meta($self,$parent,$source);
+         if (!$row && !$self->{moving} && $existing_meta) {
+            my $previous=$key? $existing_meta->{rows}[$key-1] : undef;
+            $row=[$previous? $previous->[0] : '',$previous? $previous->[1] : '',''];
+         }
+         $self->{split_meta}{refaddr($parent)}{rows}[$key]=$row;
       }
       delete $rec->{deleted}{0+$key} if $rec;
       $parent->[$key]=$value;
+      JGraft::_Split->_fill_meta($self,$parent,1) if $metadata && !$self->{moving} && !$existing_meta;
    }
+   $self->_mark_date_container($parent) if $self->_contains_date($value);
 }
 sub _write {
-   my ($self,$loc,$value)= @_;
+   my ($self,$loc,$value,$source)= @_;
    $self->_step(1+@{$loc->[1]});
+   if (($loc->[2] || '') eq 'node' || refaddr($loc->[0])==refaddr($self->{root})) {
+      $value=$self->_export_dates($value,1,{});
+   }
    $self->{undo_state}->_record($self,$loc) if $self->{undo_state};
    unless (@{$loc->[1]}) { @{$loc->[0]}=($value,1); return }
    my ($parent,$key)=$self->_parent($loc);
    if (ref $parent eq 'ARRAY' && !is_integer($key)) {
       my $rec=$self->_pending($parent);
-      $self->_step(1);
-      $self->_charge('mem',40);
+      $self->_step(4);
+      $self->_charge('mem',168);
+      my $row;
+      $row=JGraft::_Split->_insert_meta($self,$parent,$source) if $source || $self->{split_meta}{refaddr($parent)};
       push @{$rec->{insert}{0+$key}},$value;
+      push @{$rec->{insert_meta}{0+$key}},$row;
    }
-   else { $self->_put($parent,$key,$value) }
+   else { $self->_put($parent,$key,$value,$source) }
+   if ($self->_contains_date($value)) {
+      my $container=$loc->[0][0];
+      $self->_step(scalar @{$loc->[1]});
+      for my $part (@{$loc->[1]}) {
+         last unless ref($container) eq 'ARRAY' || ref($container) eq 'HASH';
+         $self->_mark_date_container($container);
+         last unless $self->_present($container,$part);
+         $container=$self->_child($container,$part);
+      }
+   }
 }
 sub _pending {
    my ($self,$array)= @_;
    my $id=refaddr($array);
    return $self->{pending}{$id} if $self->{pending}{$id};
    # Reserve the final compaction's work and scratch space before editing.
-   $self->_step(2*@$array+1);
-   $self->_charge('mem',192+16*@$array);
-   return $self->{pending}{$id}={array=>$array,deleted=>{},insert=>{}};
+   my $metadata=$self->{split_meta}{$id}?1:0;
+   $self->_step(($metadata?4:2)*@$array+1);
+   $self->_charge('mem',192+($metadata?112:16)*@$array);
+   return $self->{pending}{$id}={array=>$array,deleted=>{},insert=>{},insert_meta=>{},metadata=>$metadata};
 }
 sub _delete {
    my ($self,$loc)= @_;
@@ -546,24 +643,31 @@ sub _finish_moves {
    # Work was charged on first deletion/insertion (and subsequent appends).
    for my $rec (values %{$self->{pending}}) {
       my $array=$rec->{array};
-      my @out;
+      my (@out,@rows);
+      my $meta=$self->{split_meta}{refaddr($array)};
       for my $i (0..$#$array) {
          push @out,@{$rec->{insert}{$i-.5} || []};
+         push @rows,@{$rec->{insert_meta}{$i-.5} || []} if $meta;
          push @out,$array->[$i] unless $rec->{deleted}{0+$i};
+         push @rows,$meta->{rows}[$i] if $meta && !$rec->{deleted}{0+$i};
       }
       push @out,@{$rec->{insert}{@$array-.5} || []};
+      push @rows,@{$rec->{insert_meta}{@$array-.5} || []} if $meta;
       @$array=@out;
+      if ($meta) { $meta->{rows}=\@rows; JGraft::_Split->_fill_meta($self,$array,1) }
    }
    $self->{pending}={};
 }
 sub _move {
    my ($self,$pairs,$depth)= @_;
+   local $self->{moving}=1;
    $self->_step(scalar @$pairs);
    my $ok=eval {
       for my $pair (@$pairs) {
          my $src=defined $pair->[0]? $self->_path($pair->[0],'move_src',$depth+1):undef;
          my $dst=defined $pair->[1]? $self->_path($pair->[1],'move_dst',$depth+1):undef;
          my ($value,$canonical)= $src? $self->_read($src) : (undef,undef);
+         my $metadata=$canonical && keys %{$self->{split_meta}}? JGraft::_Split->_source($self,$canonical) : undef;
          my $dest=$dst? $self->_probe($dst,$canonical,1) : undef;
          if ($canonical && $dest && refaddr($canonical->[0])==refaddr($dest->[0])
             && @{$canonical->[1]}==@{$dest->[1]}) {
@@ -573,7 +677,7 @@ sub _move {
             next if $same;
          }
          $self->_delete($canonical) if $canonical;
-         $self->_write($dest,$value) if $dest;
+         $self->_write($dest,$value,$metadata) if $dest;
       }
       $self->{current}[0][1] or $self->_fail('INVALID_TARGET','MOVE did not replace the current node');
       $self->_read($self->{current});
@@ -593,7 +697,7 @@ sub _match {
    my $parent;
    $self->_step(scalar @$parts);
    for my $key (@$parts) {
-      unless ($exists && (ref($value) eq 'ARRAY' || ref($value) eq 'HASH') && $self->_present($value,$key)) {
+      unless ($exists && (ref($value) eq 'ARRAY' || ref($value) eq 'HASH' || type_mask($value)==TYPE_DATE) && $self->_present($value,$key)) {
          $exists=0; $value=undef; last;
       }
       $parent=$value;
@@ -627,10 +731,14 @@ sub _eval {
       return $result;
    }
    my $t=type_mask($v);
+   return $self->_date($v) if $t==TYPE_DATE;
    if ($t==TYPE_ARRAY) {
       my $out=$self->_new_array(scalar @$v);
       $self->_step(scalar @$v);
-      for my $i (0..$#$v) { $out->[$i]=$self->_eval($v->[$i],$depth+1) }
+      for my $i (0..$#$v) {
+         my ($value,$metadata)=$self->_value_source($v->[$i],$depth+1);
+         $self->_put($out,$i,$value,$metadata);
+      }
       return $out;
    }
    if ($t==TYPE_OBJECT) {
@@ -639,6 +747,7 @@ sub _eval {
       for my $key (keys %$v) {
          $self->_check_string($key,'expression key');
          $out->{$key}=$self->_eval($v->{$key},$depth+1);
+         $self->_mark_date_container($out) if $self->_contains_date($out->{$key});
       }
       return $out;
    }
@@ -647,10 +756,98 @@ sub _eval {
    $t==TYPE_NULL || $t==TYPE_BOOLEAN || $t==TYPE_NUMBER || $t==TYPE_STRING or $self->_fail('UNSUPPORTED_GRAFT','Unsupported literal value');
    return $v;
 }
+sub _value_source {
+   my ($self,$value,$depth)=@_;
+   $self->_depth($depth); $self->_step(1);
+   if (is_expr($value)) {
+      local $self->{expression}=$value;
+      return $self->_value_source($self->_macro($value,$depth+1),$depth+1) if $value->_name eq 'EXPR';
+      if ($value->is_ref && exists $value->{path}) {
+         my ($result,$loc)=$self->_read($self->_path($value,'read',$depth+1));
+         return ($result,keys %{$self->{split_meta}}? JGraft::_Split->_source($self,$loc):undef);
+      }
+   }
+   return ($self->_eval($value,$depth+1),undef);
+}
 sub _input_value {
    my ($self,$expr,$field,$depth)= @_;
    return $self->_eval($expr->{$field},$depth+1) if exists $expr->{$field};
    return ($self->_read($self->{current}))[0];
+}
+sub _date {
+   my ($self,$value)=@_;
+   require JGraft::Date;
+   return $value if blessed($value) && $value->isa('JGraft::Date');
+   my $id=ref($value)?refaddr($value):undef;
+   return $self->{dates}{$id}[1] if defined($id) && $self->{dates}{$id};
+   my $size=ref($value) eq 'HASH'? scalar keys %$value : 0;
+   $self->_step(16+$size+(type_mask($value)==TYPE_STRING?length($value)*.01:0));
+   $self->_allocation(256+128*$size+(type_mask($value)==TYPE_STRING?8*length($value):0));
+   my $date=eval { JGraft::Date->new($value) };
+   unless ($date) {
+      my $error=$@;
+      die $error if ref $error;
+      $self->_fail($error =~ /UNSUPPORTED_GRAFT:/?'UNSUPPORTED_GRAFT':'INVALID_TARGET',"Invalid date: $error");
+   }
+   $self->{dates}{$id}=[$value,$date] if defined $id;
+   return $date;
+}
+sub _contains_date {
+   my ($self,$value)=@_;
+   return 0 unless ref $value;
+   return type_mask($value)==TYPE_DATE || $self->{date_containers}{refaddr($value)};
+}
+sub _mark_date_container {
+   my ($self,$value)=@_;
+   my $id=refaddr($value);
+   return if $self->{date_containers}{$id};
+   $self->_charge('mem',64);
+   $self->{date_containers}{$id}=$value;
+   weaken($self->{date_containers}{$id});
+}
+sub _export_dates {
+   my ($self,$value,$depth,$memo)=@_;
+   return $value unless $self->_contains_date($value);
+   $self->_depth($depth); $self->_step(1);
+   my $id=refaddr($value);
+   if (type_mask($value)==TYPE_DATE) {
+      return $self->{date_output}{$id}[1] if exists $self->{date_output}{$id};
+      my $date=$self->_date($value);
+      my $canonical=refaddr($date);
+      return $self->{date_output}{$canonical}[1] if exists $self->{date_output}{$canonical};
+      $self->_allocation(256+length($date->fraction));
+      my $format=$self->{options}{date_format} || 'iso8601';
+      my $out;
+      if (ref($format) eq 'CODE') { $out=$format->($date) }
+      else {
+         my $ok=eval { $out=$date->format($format); 1 };
+         $self->_fail('UNSUPPORTED_GRAFT',"Cannot export date: $@") unless $ok;
+      }
+      if (type_mask($out)==TYPE_STRING) {
+         $self->_step(length($out)*.001); $self->_charge('mem',4*length($out));
+         $self->_check_string($out,'date output');
+      }
+      $self->{date_output}{$canonical}=[$date,$out];
+      $self->{date_output}{$id}=[$value,$out];
+      $self->{date_output}{refaddr($out)}=[$out,$out] if type_mask($out)==TYPE_DATE;
+      return $out;
+   }
+   return $memo->{$id} if exists $memo->{$id};
+   my $out=ref($value) eq 'ARRAY'? $self->_new_array(scalar @$value) : $self->_new_hash(scalar keys %$value);
+   $memo->{$id}=$out;
+   if (ref($value) eq 'ARRAY') {
+      $self->_step(scalar @$value);
+      for my $i (0..$#$value) {
+         $self->_present($value,$i) or $self->_fail('INVALID_TARGET','Cannot export a deleted array element');
+         $self->_put($out,$i,$self->_export_dates($value->[$i],$depth+1,$memo));
+      }
+      JGraft::_Split->_copy_meta($self,$value,$out,0,scalar @$value) if $self->{split_meta}{$id};
+   }
+   else {
+      $self->_step(scalar keys %$value);
+      for my $key (keys %$value) { $self->_put($out,$key,$self->_export_dates($value->{$key},$depth+1,$memo)) }
+   }
+   return $out;
 }
 sub _expression {
    my ($self,$expr,$depth)= @_;
@@ -700,6 +897,18 @@ sub JGraft::Expr::LENGTH::_execute {
 sub JGraft::Expr::SLICE::_execute {
    my ($expr,$self,$depth)= @_;
    return $self->_slice($expr,$depth+1);
+}
+sub JGraft::Expr::SPLIT::_execute {
+   my ($expr,$self,$depth)=@_;
+   require JGraft::_Split;
+   my $config=JGraft::_Split->_config($self,$expr->split_spec,$depth+1,'split');
+   return JGraft::_Split->_split($self,$config,$self->_input_value($expr,'string_expr',$depth),$depth+1);
+}
+sub JGraft::Expr::JOIN::_execute {
+   my ($expr,$self,$depth)=@_;
+   require JGraft::_Split;
+   my $config=JGraft::_Split->_config($self,$expr->split_spec,$depth+1,'join');
+   return JGraft::_Split->_join($self,$config,$self->_input_value($expr,'array_expr',$depth),$depth+1);
 }
 sub JGraft::Expr::LOCAL::_execute {
    my ($expr,$self,$depth)= @_;
@@ -779,11 +988,74 @@ sub JGraft::Expr::CASTSTR::_execute {
    my $t=type_mask($v);
    return $v if $t==TYPE_STRING;
    return $v? 'true':'false' if $t==TYPE_BOOLEAN;
+   if ($t==TYPE_DATE) {
+      my $date=$self->_date($v);
+      $self->_step(length($date->fraction)*.01+1);
+      $self->_charge('mem',256+4*length($date->fraction));
+      return $date->to_iso8601;
+   }
    if ($t==TYPE_NUMBER) {
       require JGraft;
       return JGraft::_json()->new->allow_nonref->encode($v);
    }
    $self->_fail('INVALID_TARGET','Invalid CASTSTR input');
+}
+sub JGraft::Expr::CASTDATE::_execute {
+   my ($expr,$self,$depth)=@_;
+   return $self->_date($self->_input_value($expr,'value_expr',$depth));
+}
+sub _compare_values {
+   my ($self,$a,$b,$depth)=@_;
+   $self->_depth($depth); $self->_step(1);
+   my $type=type_mask($a);
+   $type==type_mask($b) or $self->_fail('INVALID_TARGET','Comparison requires matching types');
+   if ($type==TYPE_DATE) {
+      ($a,$b)=($self->_date($a),$self->_date($b));
+      $a->type eq $b->type or $self->_fail('INVALID_TARGET','Comparison requires matching date precisions');
+      $self->_step(16+length($a->fraction)+length($b->fraction));
+      return $a->_compare($b);
+   }
+   if ($type==TYPE_NUMBER) {
+      is_finite($a) && is_finite($b) or $self->_fail('INVALID_TARGET','Comparison requires finite numbers');
+      return $a<=>$b;
+   }
+   return $a<=>$b if $type==TYPE_BOOLEAN;
+   if ($type==TYPE_STRING) {
+      my $policy=$self->{options}{codepoint_policy} || 'preserve';
+      if (!ref($policy) && $policy eq 'preserve') {
+         $self->_step((length($a)+length($b))*.001);
+         return $a cmp $b;
+      }
+      require JGraft::_String;
+      my $av=JGraft::_String->_new($self,$a,'comparison');
+      my $bv=JGraft::_String->_new($self,$b,'comparison');
+      my $size=$av->{size}<$bv->{size}?$av->{size}:$bv->{size};
+      $self->_step($size);
+      for my $i (0..$size-1) { my $c=$av->_at($i)<=>$bv->_at($i); return $c if $c }
+      return $av->{size}<=>$bv->{size};
+   }
+   if ($type==TYPE_ARRAY) {
+      my $size=@$a<@$b?scalar @$a:scalar @$b;
+      $self->_step($size);
+      for my $i (0..$size-1) {
+         $self->_present($a,$i) && $self->_present($b,$i) or $self->_fail('INVALID_TARGET','Comparison encounters a deleted element');
+         my $c=$self->_compare_values($a->[$i],$b->[$i],$depth+1); return $c if $c;
+      }
+      return @$a<=>@$b;
+   }
+   $self->_fail('INVALID_TARGET','Values have no defined ordering');
+}
+sub JGraft::Expr::LESS::_execute {
+   my ($expr,$self,$depth)=@_;
+   my $a=$self->_input_value($expr,'expr_a',$depth);
+   my $b=$self->_eval($expr->expr_b,$depth+1);
+   return $self->_compare_values($a,$b,$depth+1)<0? JSON::PP::true : JSON::PP::false;
+}
+sub JGraft::Expr::LESSEQ::_execute {
+   my ($expr,$self,$depth)=@_;
+   my $a=$self->_input_value($expr,'expr_a',$depth);
+   my $b=$self->_eval($expr->expr_b,$depth+1);
+   return $self->_compare_values($a,$b,$depth+1)<=0? JSON::PP::true : JSON::PP::false;
 }
 
 sub _numeric_values {
@@ -879,6 +1151,8 @@ sub _slice {
       $self->_present($value,$i) or $self->_fail('INVALID_TARGET','SLICE contains a deleted element');
       push @$out,$value->[$i];
    }
+   JGraft::_Split->_copy_meta($self,$value,$out,$ofs,$lim-$ofs) if $self->{split_meta}{refaddr($value)};
+   $self->_mark_date_container($out) if $self->{date_containers}{refaddr($value)} && $lim>$ofs;
    return $out;
 }
 
@@ -891,16 +1165,36 @@ sub _slice {
 
 =head1 DESCRIPTION
 
-Executes JGRAFT, AT, MATCH, IF, COPY, and MOVE with namespace references, value
-construction, common expressions, structural matching, LOCAL, LENGTH, SLICE,
-CURPROP, CAPTURE, arithmetic, logical operators, and boolean/number/string casts.
+Executes JGRAFT, AT, ATSPLIT, MATCH, IF, COPY, and MOVE with namespace references, value
+construction, common expressions, structural matching, LOCAL, LENGTH, SLICE, SPLIT, JOIN,
+CURPROP, CAPTURE, arithmetic, logical operators, comparisons, and boolean/number/string/date casts.
 Structural matching supports HAS, IS, ANY, ALL, NONE, EXISTS, ARRAY, NUM, BOOL,
-STR, CHARS, and WITH. Array and string sequences support SEQ, SEQMIN, SEQMAX, REP, START, END,
+STR, CHARS, DATE, and WITH. Array and string sequences support SEQ, SEQMIN, SEQMAX, REP, START, END,
 successor unions/coverage assertions, and preferred named captures.
 STR searches for the leftmost regex match over Unicode codepoints. Regex branching
 uses the sequence engine; quoted literal runs use cached anchored Perl patterns.
-Date and fuzzy matching remain unimplemented.
+Fuzzy matching remains unimplemented.
 Other operations fail with UNSUPPORTED_GRAFT.
+
+SPLIT supports literal and longest-match regex separators, whole-field element
+constraints, retained separators, and ordered left/right trimming. JOIN restores
+hidden separators and trimming where present, using its default for new arrays.
+Constant separators override captured separators; keep modes concatenate elements.
+SPLIT never evaluates an unused default; JOIN does not evaluate trimming/element
+patterns. ATSPLIT evaluates its path and configuration once in the selected-node
+scope, edits a temporary array, and publishes the joined string only after its
+subactions and reassembly succeed. Namespace side effects follow ordinary action
+rules even if reassembly fails.
+
+Hidden SPLIT metadata belongs to array instances within one execution. It is
+preserved through copy-on-write, SLICE, and direct element references in array
+construction and COPY/MOVE insertion. Overwrites retain destination formatting.
+Transfers carry formatting only between arrays of the same origin; foreign or
+new values inherit adjacent separators and preceding left trimming, without
+copying right trimming. Function-derived element values do not carry formatting.
+MOVE resolves adjacency in final element order, including on partial failure.
+JSON serialization contains only visible array values; metadata is not imported
+into a separate execution.
 
 HAS/IS modes propagate through match structures. Match expressions evaluated by
 functions start fresh matching state. INVALID_TARGET/INVALID_OPERAND encountered
@@ -927,8 +1221,8 @@ keeps deferred deletions/insertions attached to array identity until its end.
 
 =constructor new
 
-Options: C<jgraft>, optional C<input>, C<clone>, C<undo>, C<limits>, and
-C<codepoint_policy>. Limits
+Options: C<jgraft>, optional C<input>, C<clone>, C<undo>, C<limits>,
+C<codepoint_policy>, and C<date_format>. Limits
 are estimated cumulative C<ops>, C<mem>, C<new_obj>, and maximum C<depth>. Defaults
 are 1,000,000 operations, 64 MiB, 100,000 data containers, and depth 256. An explicit
 undef disables an individual limit. Memory accounting is a conservative cumulative
@@ -977,6 +1271,26 @@ once; decisions should be consistent. Callback exceptions propagate unchanged.
 
 Values above U+10FFFF always fail with UNSUPPORTED_GRAFT, regardless of policy.
 Neither preserving nor substituting combines adjacent surrogate codepoints.
+
+C<date_format> selects C<iso8601> (default), C<Time::Piece>, C<DateTime>, or a
+callback receiving an immutable L<JGraft::Date>. Dates retain their type in
+CONST/STASH/TEMP and expression values. Writes through NODE export them immediately,
+including inside arrays/objects and ATSPLIT temporary roots. Later actions observe
+the exported value. Unchanged native input dates retain their original format.
+
+The executor caches each date's formatted result and weakly tracks containers
+which may contain dates. Whole-container exports clone only affected branches;
+borrowed input containers remain unchanged. Cached formatter results can be shared
+between output occurrences, subject to the same read-only sharing rule as other
+output values. Callback results are used as supplied, and callback exceptions
+propagate unchanged. Built-in conversion failures produce UNSUPPORTED_GRAFT.
+
+Time::Piece exports use UTC and reject fractional/leap seconds. DateTime exports
+preserve nanoseconds and fixed offsets, require DateTime only when requested, and
+reject unsupported precision/ranges. See L<JGraft::Date> for native precision
+limitations. CASTSTR always uses ISO8601, independently of C<date_format>.
+Undo serializes dates as CASTDATE expressions; choose the appropriate formatter
+when applying undo to restore a native representation.
 
 =method apply
 

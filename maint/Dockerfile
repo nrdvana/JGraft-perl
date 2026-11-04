@@ -45,7 +45,7 @@ RUN cd /tmp \
  && cd /tmp \
  && /opt/perl-5.8.9/bin/perl App-cpanminus-1.7048/bin/cpanm \
       --mirror https://cpan.metacpan.org --mirror-only App::cpanminus \
-      https://cpan.metacpan.org/authors/id/C/CO/CORION/parent-0.238.tar.gz Test2::V0 \
+      https://cpan.metacpan.org/authors/id/C/CO/CORION/parent-0.238.tar.gz Test2::V0 Time::Piece \
  && ln -s /opt/perl-5.8.9/bin/perl /usr/local/bin/perl5.8 \
  && ln -s /opt/perl-5.8.9/bin/prove /usr/local/bin/prove5.8 \
  && perl5.8 -MTest2::V0 -e 'is(sprintf("%vd", $^V), "5.8.9", "legacy interpreter"); done_testing;' \

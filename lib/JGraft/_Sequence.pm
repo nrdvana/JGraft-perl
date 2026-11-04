@@ -314,6 +314,26 @@ sub _text {
    return [$self->_state($state->{pos}+$size,$state->{caps},$state->{prefs},$state->{sub},$state->{seen})];
 }
 
+# Anchored matching for SPLIT separators and whole-field/trim assertions.
+# There are no observable captures here; retain every endpoint until selecting
+# the longest one, optionally requiring the end of a bounded character view.
+sub _span {
+   my ($self,$spec,$depth,$position,$end)=@_;
+   my $match=$self->{match};
+   local $match->{reserved}=$self->{reserved};
+   local $match->{sequence}=$self;
+   $self->_prepare([$spec],$depth+1);
+   my $state=$self->_state($position,$match->{captures},[],[]);
+   my $states=$self->_successors($spec,$state,$depth+1,1,$self->{groups}[0]);
+   my $best;
+   $self->{exec}->_step(scalar @$states);
+   for my $candidate (@$states) {
+      next if defined($end) && $candidate->{pos}!=$end;
+      $best=$candidate->{pos} if !defined($best) || $candidate->{pos}>$best;
+   }
+   return defined($best)? $best-$position : undef;
+}
+
 sub _successors {
    my ($self,$spec,$state,$depth,$root,$group)=@_;
    my $exec=$self->{exec};
