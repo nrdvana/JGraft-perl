@@ -55,6 +55,15 @@ for my $pair ([1e21,'1000000000000000000000'],[1.25e21,'1250000000000000000000']
    [-1e21,'-1000000000000000000000'],[1e100,'1'.('0'x100)]) {
    is(jgexec(COPY(CASTSTR(),NODE()),$pair->[0]),$pair->[1],'CASTSTR expands integer exponent notation to decimal digits');
 }
+{
+   no warnings 'redefine';
+   local *JGraft::_json=sub { 'JSON::PP' };
+   my $fraction=jgexec(COPY(CASTSTR(),NODE()),0.125);
+   is($fraction,'0.125','CASTSTR retains fraction spelling with JSON::PP');
+   is(type_mask($fraction),TYPE_STRING,'CASTSTR clears numeric origin from JSON::PP output');
+   is(jgexec(COPY(IS(CASTSTR(),STR()),NODE()),0.125),JSON::PP::true(),
+      'fraction CASTSTR result matches STR with JSON::PP');
+}
 # Native integer scalars must not pass through floating point during formatting.
 my $unsigned_max = ~0;
 for my $value ($unsigned_max>>1,$unsigned_max) {

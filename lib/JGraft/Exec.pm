@@ -1285,25 +1285,32 @@ sub JGraft::Expr::CASTSTR::_execute {
    if ($t==TYPE_DATE) {
       my $date=$self->_date($v);
       $self->_step(length($date->fraction)*.01+1);
-      $self->_charge('mem',256+4*length($date->fraction));
-      return $date->to_iso8601;
+      my $out=$date->to_iso8601;
+      $self->_charge('mem',length($out));
+      return $out;
    }
    if ($t==TYPE_NUMBER) {
-      require JGraft;
+      my $integer=is_integer($v);
       my $out;
       if (ref $v) {
          my $number=$self->_number($v);
          $out=eval { JGraft::Util::to_decimal_string($number) };
          $@ and $self->_fail('UNSUPPORTED_GRAFT',"$@");
       }
-      else { $out=JGraft::_json()->new->allow_nonref->encode($v) }
-      if (is_integer($v) && $out =~ /\A(-?)([0-9]+)(?:\.([0-9]+))?[eE]([+-]?[0-9]+)\z/) {
+      else {
+         # Support negative zero via sprintf
+         $out= $v? "$v" : sprintf('%g', $v);
+      }
+      # If scientific notation was used for an integer, expand the digits.
+      if ($integer && $out =~ /\A(-?)([0-9]+)(?:\.([0-9]+))?[eE]([+-]?[0-9]+)\z/) {
          my ($sign,$whole,$fraction,$exponent)=($1,$2,defined($3)?$3:'',0+$4);
+         my $length=length($sign)+length($whole)+$exponent;
+         $self->_step($length*.001); $self->_charge('mem',$length);
          my $digits=$whole.$fraction;
          my $zeros=$exponent-length($fraction);
          $out=$sign.($zeros>=0? $digits.('0'x$zeros) : substr($digits,0,length($digits)+$zeros));
       }
-      $self->_step(length($out)*.001); $self->_charge('mem',length($out));
+      else { $self->_step(length($out)*.001); $self->_charge('mem',length($out)) }
       return $out;
    }
    $self->_fail('INVALID_TARGET','Invalid CASTSTR input');
