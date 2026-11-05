@@ -81,6 +81,8 @@ sub apply {
    $self->{root}= [$input,1];
    $self->{current}= [$self->{root},[]];
    my $ok= eval {
+      local $JGraft::JSON::Object::EXEC=$self;
+      local ($Math::BigRat::accuracy,$Math::BigRat::precision);
       if ($self->{options}{undo}) {
          require JGraft::_Undo;
          $self->{undo_state}= JGraft::_Undo->_new($self,$input);
@@ -130,6 +132,7 @@ sub _fail {
 }
 sub _charge {
    my ($self,$key,$amount)= @_;
+   if (ref $amount) { $amount=JGraft::Util::to_native_number($amount) }
    $self->{count}{$key} += $amount;
    my $limit= $self->{limits}{$key};
    !defined $limit || $self->{count}{$key} <= $limit
@@ -175,10 +178,13 @@ sub _inspect {
    }
    my $type= type_mask($v);
    if ($type==TYPE_DATE) { $self->_date($v); return }
-   if (!ref $v || JSON::PP::is_bool($v)) {
+   if (!ref $v || JSON::PP::is_bool($v) || $type==TYPE_NUMBER || $type==TYPE_STRING) {
       $self->_step(length($v)*.001) if $type == TYPE_STRING;
       $self->_check_string($v,$ast?'graft':'input') if $type == TYPE_STRING;
       $type != TYPE_NUMBER || is_finite($v) or $self->_fail('UNSUPPORTED_GRAFT','Non-finite input number');
+      if ($type==TYPE_NUMBER && ref $v) {
+         $self->_step(length($v->isa('JGraft::JSON::Number')?$v->token:$v->isa('Math::BigFloat')?$v->bsstr:$v->bstr));
+      }
       return;
    }
    ref($v) eq 'ARRAY' || ref($v) eq 'HASH' or $self->_fail('UNSUPPORTED_GRAFT','Unsupported data reference '.ref($v));
@@ -200,6 +206,15 @@ sub _inspect {
       }
    }
    else {
+      my $tie=tied %$v;
+      if ($tie && $tie->isa('JGraft::JSON::Object')) {
+         for my $i ($tie->_members) {
+            $self->_check_string($tie->{tokens}[$i],$ast?'graft key':'input key');
+            $self->_inspect($tie->{tokens}[$i+1],$depth+1,$active,$ast,$alloc);
+            $self->_mark_date_container($v) if $self->_contains_date($tie->{tokens}[$i+1]);
+         }
+         return;
+      }
       for my $key (keys %$v) {
          $self->_step(length($key)*.001);
          $self->_check_string($key,$ast?'graft key':'input key');
@@ -227,9 +242,14 @@ sub _cow {
       $self->{lineage}{refaddr($copy)}=$self->{lineage}{refaddr($v)} || refaddr($v) if $self->{undo_state};
       return $copy;
    }
-   my $copy=$self->_new_hash(scalar keys %$v);
-   $self->_step(scalar keys %$v);
-   %$copy=%$v;
+   my $tie=tied %$v;
+   my $copy;
+   if ($tie && $tie->isa('JGraft::JSON::Object')) { $copy=$self->_own($tie->_clone) }
+   else {
+      $copy=$self->_new_hash(scalar keys %$v);
+      $self->_step(scalar keys %$v);
+      %$copy=%$v;
+   }
    $self->_mark_date_container($copy) if $self->{date_containers}{refaddr($v)};
    $self->{lineage}{refaddr($copy)}=$self->{lineage}{refaddr($v)} || refaddr($v) if $self->{undo_state};
    return $copy;
@@ -246,6 +266,10 @@ sub _clone_tree {
    $self->_depth($depth);
    $self->_step(1);
    if (blessed($v) && $v->isa('DateTime')) { $self->_allocation(256); return $v->clone }
+   if (blessed($v) && type_mask($v)==TYPE_NUMBER && !$v->isa('JGraft::JSON::Number')) {
+      $self->_allocation(128+4*length($v->isa('Math::BigFloat')?$v->bsstr:$v->bstr));
+      return $v->copy;
+   }
    return $v unless ref $v eq 'ARRAY' || ref $v eq 'HASH';
    if (ref $v eq 'ARRAY') {
       my $out=$self->_new_array(scalar @$v);
@@ -256,10 +280,17 @@ sub _clone_tree {
       JGraft::_Split->_copy_meta($self,$v,$out,0,scalar @$v) if $self->{split_meta}{refaddr($v)};
       return $out;
    }
-   my $out=$self->_new_hash(scalar keys %$v);
+   my $tie=tied %$v;
+   my $out;
+   if ($tie && $tie->isa('JGraft::JSON::Object')) {
+      $out=$self->_own($tie->_clone(sub { $self->_clone_tree($_[0],$depth+1) }));
+   }
+   else {
+      $out=$self->_new_hash(scalar keys %$v);
+      $self->_step(scalar keys %$v);
+      $out->{$_}=$self->_clone_tree($v->{$_},$depth+1) for keys %$v;
+   }
    $self->{lineage}{refaddr($out)}=$self->{lineage}{refaddr($v)} || refaddr($v) if $self->{undo_state};
-   $self->_step(scalar keys %$v);
-   $out->{$_}=$self->_clone_tree($v->{$_},$depth+1) for keys %$v;
    $self->_mark_date_container($out) if $self->{date_containers}{refaddr($v)};
    return $out;
 }
@@ -518,15 +549,16 @@ sub _selector {
    my $len=@$container;
    return $len if $type==TYPE_BOOLEAN && !$value;
    $type==TYPE_NUMBER && is_finite($value) or $self->_fail('INVALID_TARGET','Array selectors must be numbers');
+   $value=$self->_number($value) if ref $value;
    if (is_integer($value)) {
       my $index=$value<0? $len+$value : 0+$value;
       $index>=0 && $index<=$len or $self->_fail('INVALID_TARGET','Array index out of range');
-      return $index;
+      return ref($index)?JGraft::Util::to_native_number($index):$index;
    }
    $half && $value*2==int($value*2) or $self->_fail('INVALID_OPERAND','Invalid fractional selector');
    my $index=$value<-.5? $len+$value : 0+$value;
    $index>=-.5 && $index<=$len-.5 or $self->_fail('INVALID_TARGET','Array insertion out of range');
-   return $index;
+   return ref($index)?JGraft::Util::to_native_number($index):$index;
 }
 sub _present {
    my ($self,$v,$key)= @_;
@@ -821,6 +853,12 @@ sub _eval {
       return $out;
    }
    if ($t==TYPE_OBJECT) {
+      my $tie=tied %$v;
+      if ($tie && $tie->isa('JGraft::JSON::Object')) {
+         my $out=$self->_own($tie->_clone(sub { $self->_eval($_[0],$depth+1) }));
+         $self->_mark_date_container($out) if $self->{date_containers}{refaddr($v)};
+         return $out;
+      }
       my $out=$self->_new_hash(scalar keys %$v);
       $self->_step(scalar keys %$v);
       for my $key (keys %$v) {
@@ -923,6 +961,12 @@ sub _export_dates {
       JGraft::_Split->_copy_meta($self,$value,$out,0,scalar @$value) if $self->{split_meta}{$id};
    }
    else {
+      my $tie=tied %$value;
+      if ($tie && $tie->isa('JGraft::JSON::Object')) {
+         $out=$self->_own($tie->_clone(sub { $self->_export_dates($_[0],$depth+1,$memo) }));
+         $memo->{$id}=$out;
+         return $out;
+      }
       $self->_step(scalar keys %$value);
       for my $key (keys %$value) { $self->_put($out,$key,$self->_export_dates($value->{$key},$depth+1,$memo)) }
    }
@@ -1246,7 +1290,13 @@ sub JGraft::Expr::CASTSTR::_execute {
    }
    if ($t==TYPE_NUMBER) {
       require JGraft;
-      my $out=JGraft::_json()->new->allow_nonref->encode($v);
+      my $out;
+      if (ref $v) {
+         my $number=$self->_number($v);
+         $out=eval { JGraft::Util::to_decimal_string($number) };
+         $@ and $self->_fail('UNSUPPORTED_GRAFT',"$@");
+      }
+      else { $out=JGraft::_json()->new->allow_nonref->encode($v) }
       if (is_integer($v) && $out =~ /\A(-?)([0-9]+)(?:\.([0-9]+))?[eE]([+-]?[0-9]+)\z/) {
          my ($sign,$whole,$fraction,$exponent)=($1,$2,defined($3)?$3:'',0+$4);
          my $digits=$whole.$fraction;
@@ -1275,6 +1325,7 @@ sub _compare_values {
    }
    if ($type==TYPE_NUMBER) {
       is_finite($a) && is_finite($b) or $self->_fail('INVALID_TARGET','Comparison requires finite numbers');
+      ($a,$b)=($self->_number($a),$self->_number($b)) if ref($a) || ref($b);
       return $a<=>$b;
    }
    return $a<=>$b if $type==TYPE_BOOLEAN;
@@ -1332,11 +1383,25 @@ sub _numeric_values {
    else { @values=map $self->_eval($expr->{$_},$depth+1), qw(value_expr1 value_expr2) }
    $self->_step(scalar @values);
    for my $v (@values) { type_mask($v)==TYPE_NUMBER && is_finite($v) or $self->_fail('INVALID_TARGET','Arithmetic expects finite numbers') }
+   @values=map $self->_number($_),@values if grep ref($_),@values;
    return @values;
+}
+sub _number {
+   my ($self,$value)=@_;
+   my $size=ref($value)?JGraft::Util::estimate_number_digits($value):32;
+   $self->_step(1+$size*$size*.01);
+   $self->_allocation(128+16*$size);
+   my $out=eval { JGraft::Util::to_rational($value) };
+   $@ and $self->_fail('UNSUPPORTED_GRAFT',"Numeric conversion: $@");
+   return $out;
 }
 sub _finite_result {
    my ($self,$result)= @_;
    is_finite($result) or $self->_fail('INVALID_TARGET','Non-finite arithmetic result');
+   if (ref $result) {
+      my $size=length($result->bstr);
+      $self->_step($size); $self->_allocation(128+8*$size);
+   }
    return $result;
 }
 sub JGraft::Expr::ADD::_execute {
@@ -1367,7 +1432,9 @@ sub JGraft::Expr::MOD::_execute {
    my ($a,$b)=$self->_numeric_values($expr,$depth);
    $b!=0 or $self->_fail('INVALID_TARGET','Division by zero');
    require POSIX;
-   return $self->_finite_result($a-POSIX::floor($a/$b)*$b);
+   my $quotient=$a/$b;
+   my $floor=ref($quotient)?$quotient->bfloor:POSIX::floor($quotient);
+   return $self->_finite_result($a-$floor*$b);
 }
 
 sub _slice {
@@ -1387,6 +1454,9 @@ sub _slice {
       }
       else { $value=($self->_read($self->{current}))[0] }
       ($ofs,$len,$lim)=@{$config}{qw(ofs len lim)};
+      if (grep ref($_),($ofs,$len,$lim)) {
+         ($ofs,$len,$lim)=map ref($_)?$self->_number($_):$_,($ofs,$len,$lim);
+      }
       if (defined $ofs && defined $len && defined $lim && $ofs+$len!=$lim) { $self->_fail('INVALID_OPERAND','Inconsistent SLICE bounds') }
       $ofs=defined $len && defined $lim? $lim-$len : 0 unless defined $ofs;
    }
@@ -1395,6 +1465,7 @@ sub _slice {
       $ofs=$self->_eval($expr->ofs,$depth+1);
       $len=$self->_eval($expr->len,$depth+1) if exists $expr->{len};
       is_integer($ofs) && (!exists $expr->{len} || is_integer($len)) or $self->_fail('INVALID_OPERAND','SLICE bounds must be integers');
+      ($ofs,$len)=map ref($_)?$self->_number($_):$_,($ofs,$len) if ref($ofs) || ref($len);
    }
    my $type=type_mask($value);
    $type==TYPE_ARRAY || $type==TYPE_STRING or $self->_fail('INVALID_TARGET','SLICE expects an array or string');
@@ -1402,6 +1473,9 @@ sub _slice {
    $ofs+=$size if $ofs<0;
    $lim=defined $len? ($len<0?$size+$len:$ofs+$len) : $size unless defined $lim;
    $ofs>=0 && $ofs<=$lim && $lim<=$size or $self->_fail('INVALID_TARGET','SLICE is out of range');
+   if (ref($ofs) || ref($lim)) {
+      ($ofs,$lim)=map JGraft::Util::to_native_number($_),($ofs,$lim);
+   }
    if ($type==TYPE_STRING) { $self->_step(($lim-$ofs)*.001); $self->_charge('mem',4*($lim-$ofs)); return substr($value,$ofs,$lim-$ofs) }
    my $out=$self->_new_array($lim-$ofs);
    $self->_step($lim-$ofs);
@@ -1427,6 +1501,14 @@ Executes JGRAFT, RAISE, AT, ATSPLIT, MATCH, IF, COPY, MOVE, and SPLICE with name
 construction, common expressions, structural matching, LOCAL, LENGTH, SLICE, SPLIT, JOIN,
 CONCAT, REDUCE, FILTER, MAP, PROPS, MKOBJ, CASE, CURPROP, CAPTURE, arithmetic,
 logical operators, comparisons, and boolean/number/string/date casts.
+
+Math::BigInt, Math::BigFloat, Math::BigRat, and L<JGraft::JSON::Number> are numeric
+values. Arithmetic involving one promotes its operands to copied Math::BigRat
+values; it does not mutate the original objects or inherit global rational
+rounding settings. Native-only arithmetic retains its usual fast path. Exact
+results can be serialized by L<JGraft::JSON>; nonterminating rational results
+require explicit rounding before JSON emission. Conversion and arithmetic costs
+include conservative charges for digit counts and decimal exponent expansion.
 Structural matching supports HAS, IS, ANY, ALL, NONE, EXISTS, ARRAY, NUM, BOOL,
 STR, CHARS, DATE, and WITH. Array and string sequences support SEQ, SEQMIN, SEQMAX, REP, START, END,
 successor unions/coverage assertions, and preferred named captures.

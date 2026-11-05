@@ -167,6 +167,15 @@ sub _diff {
          return if $wanted eq $have;
       }
       elsif ($wt==TYPE_DATE) { return if _key($wanted) eq _key($have) }
+      elsif ($wt==TYPE_NUMBER && (ref($wanted) || ref($have))) {
+         return if ref($wanted) && ref($have) && refaddr($wanted)==refaddr($have);
+         # Avoid expanding huge exponent tokens just to optimize an undo. A
+         # literal replacement is always correct when comparison is expensive.
+         if (JGraft::Util::estimate_number_digits($wanted)<=10000 && JGraft::Util::estimate_number_digits($have)<=10000) {
+            my $same=eval { !JGraft::Util::to_rational($wanted)->bcmp(JGraft::Util::to_rational($have)) };
+            return if $same;
+         }
+      }
       else { return if $wanted==$have }
    }
    unless ($wt==$ht && ($wt==TYPE_ARRAY || $wt==TYPE_OBJECT) && $self->_origin($wanted)==$self->_origin($have)) {

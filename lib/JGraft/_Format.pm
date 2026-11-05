@@ -103,7 +103,8 @@ sub _scan {
    local $active->{$id}=1;
    if (ref($value) eq 'ARRAY' && @$value) {
       my $head=$value->[0];
-      my $token=ref($head) eq 'JGraft::_JSON::Number'? $$head : $head;
+      my $token=ref($head) eq 'JGraft::_JSON::Number'? $$head
+         : blessed($head) && (type_mask($head)==TYPE_NUMBER || type_mask($head)==JGraft::Util::TYPE_STRING())? "$head" : $head;
       my $graft_id=ref($head) eq 'JGraft::_JSON::Number'? $token eq '-1'
          : type_mask($head)==TYPE_NUMBER && $head==-1;
       if (defined($token) && !ref($token) && ($token eq 'JGRAFT' || $graft_id)) {
@@ -116,7 +117,9 @@ sub _scan {
          }
       }
    }
+   my $tie=ref($value) eq 'HASH'?tied(%$value):undef;
    my $out=ref($value) eq 'ARRAY'? [map $self->_scan($_,$active),@$value]
+      : $tie && $tie->isa('JGraft::JSON::Object')?$tie->_clone(sub { $self->_scan($_[0],$active) })
       : {map +($_=>$self->_scan($value->{$_},$active)),keys %$value};
    $self->{generic}{refaddr($out)}=1;
    return $out;
@@ -136,6 +139,9 @@ sub _copy {
    $active->{$id} and croak 'Cannot format cyclic JSON data';
    local $active->{$id}=1;
    return [map $self->_copy($_,$native,$active),@$value] if ref($value) eq 'ARRAY';
+   my $tie=tied %$value;
+   return $tie->_clone(sub { $self->_copy($_[0],$native,$active) })
+      if $tie && $tie->isa('JGraft::JSON::Object');
    return {map +($_=>$self->_copy($value->{$_},$native,$active)),keys %$value};
 }
 sub _notation {
@@ -183,7 +189,13 @@ sub _scalar {
    no warnings 'utf8';
    my ($self,$value)=@_;
    return $$value if ref($value) eq 'JGraft::_JSON::Number';
-   my $text=$self->{json}->encode($value);
+   my $text;
+   if (blessed($value) && !JSON::PP::is_bool($value)
+      && (type_mask($value)==TYPE_NUMBER || type_mask($value)==JGraft::Util::TYPE_STRING())) {
+      require JGraft::JSON;
+      $text=JGraft::JSON->new->encode($value);
+   }
+   else { $text=$self->{json}->encode($value) }
    $text !~ /[^\x{0}-\x{10ffff}]/ or croak 'Cannot format codepoints above U+10FFFF';
    $text =~ s/$escape_chars/_unicode_escape(ord($1))/eg;
    return $text;
@@ -197,6 +209,9 @@ sub _unicode_escape {
 sub _shape {
    my ($self,$value)=@_;
    if (ref($value) eq 'HASH') {
+      my $tie=tied %$value;
+      return ('{','}',[map +{values=>[@{$tie->{tokens}}[$_,$_+1]],pair=>1,separator=>': '},$tie->_members])
+         if $tie && $tie->isa('JGraft::JSON::Object');
       return ('{','}',[map +{values=>[$_,$value->{$_}],pair=>1,separator=>': '},sort keys %$value]);
    }
    my $info=$self->{directives}{refaddr($value)};
@@ -327,6 +342,18 @@ sub _compact_value {
    if (ref($value) eq 'ARRAY' || ref($value) eq 'HASH') {
       my $object=ref($value) eq 'HASH';
       $self->_emit($state,$object?'{':'[');
+      my $tie=$object?tied(%$value):undef;
+      if ($tie && $tie->isa('JGraft::JSON::Object')) {
+         my $written=0;
+         for my $i ($tie->_members) {
+            $self->_emit($state,',') if $written++;
+            $self->_emit($state,$self->_scalar($tie->{tokens}[$i]));
+            $self->_emit($state,':');
+            $self->_compact_value($tie->{tokens}[$i+1],$state);
+         }
+         $self->_emit($state,'}');
+         return;
+      }
       my @keys=$object? sort keys %$value : (0..$#$value);
       for my $i (0..$#keys) {
          $self->_emit($state,',') if $i;

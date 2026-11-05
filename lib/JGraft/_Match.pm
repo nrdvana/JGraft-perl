@@ -109,6 +109,7 @@ sub _dispatch {
       $exec->_step((length($spec)+length($value))*.001);
       return $spec eq $value;
    }
+   return !$exec->_compare_values($spec,$value,$depth+1) if $type==TYPE_NUMBER;
    return $spec==$value;
 }
 
@@ -128,6 +129,7 @@ sub _elements {
    my ($self,$specs,$value,$offset,$exact,$cursor,$depth,$literal,$suffix)=@_;
    my $size=@$value;
    return 0 if $offset<0 || $offset>$size;
+   if (ref $offset) { $offset=JGraft::Util::to_native_number($offset) }
    $self->{exec}->_step($offset);
    for my $i (0..$offset-1) { return 0 unless $self->{exec}->_present($value,$i) }
    unless ($literal) {
@@ -217,9 +219,10 @@ sub _expression {
       $max=$exec->_eval($expr->max,$depth+1) if exists $expr->{max};
       (!defined($min) || is_finite($min)) && (!defined($max) || is_finite($max))
          or $exec->_fail('INVALID_OPERAND','NUM bounds must be finite numbers or null');
-      !defined($min) || !defined($max) || $min<=$max or $exec->_fail('INVALID_OPERAND','NUM bounds are reversed');
+      !defined($min) || !defined($max) || $exec->_compare_values($min,$max,$depth+1)<=0 or $exec->_fail('INVALID_OPERAND','NUM bounds are reversed');
       return $cursor->{exists} && type_mask($cursor->{value})==TYPE_NUMBER
-         && (!defined($min) || $cursor->{value}>=$min) && (!defined($max) || $cursor->{value}<=$max);
+         && (!defined($min) || $exec->_compare_values($cursor->{value},$min,$depth+1)>=0)
+         && (!defined($max) || $exec->_compare_values($cursor->{value},$max,$depth+1)<=0);
    }
    if ($name eq 'ARRAY') {
       my $bound;

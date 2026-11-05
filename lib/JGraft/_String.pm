@@ -16,9 +16,10 @@ sub _check {
    # encodings as fatal. These are intentional codepoints, checked below.
    no warnings 'utf8';
    my ($class,$exec)=@_;
-   return unless utf8::is_utf8($_[2]);
-   $exec->_charge('mem',4*length($_[2])); # Private scan copy on older Perls.
    my ($text,$kind,$buffer)=@_[2..4];
+   $text=$text->value if ref($text) eq 'JGraft::JSON::String';
+   return unless utf8::is_utf8($text);
+   $exec->_charge('mem',4*length($text)); # Private scan copy on older Perls.
    $exec->_step(length($text)*.002);
    while ($text =~ /$problems/g) {
       $exec->_step(1);
@@ -37,11 +38,12 @@ sub _check {
 }
 sub _new {
    my ($class,$exec)=@_;
-   my $size=length($_[2]);
-   my $wide=$_[4] || utf8::is_utf8($_[2]);
+   my ($text,$kind)=@_[2,3];
+   $text=$text->value if ref($text) eq 'JGraft::JSON::String';
+   my $size=length($text);
+   my $wide=$_[4] || utf8::is_utf8($text);
    $exec->_step($size*.002+1);
    $exec->_charge('mem',128+($wide?8:1)*$size);
-   my ($text,$kind)=@_[2,3];
    my $buffer;
    if ($wide) {
       # CHECK=0 leaves the private source copy intact. Old Encode emits a
@@ -66,6 +68,7 @@ sub _new {
 sub _at { vec($_[0]{buffer},$_[1],8*$_[0]{width}) }
 sub _literal {
    my ($self,$exec,$text,$position)=@_;
+   $text=$text->value if ref($text) eq 'JGraft::JSON::String';
    my $size=length($text);
    return if $position+$size>$self->{size};
    return 0 unless $size;

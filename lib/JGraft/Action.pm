@@ -97,6 +97,13 @@ sub get_class {
    shift if @_ == 2 && ($_[0] eq __PACKAGE__ || $_[0]->isa(__PACKAGE__));
    @_ == 1 or invalid_graft("Expected one argument");
    my $name= $_[0];
+   if (ref $name) {
+      my $type=JGraft::Util::type_mask($name);
+      if ($type==JGraft::Util::TYPE_NUMBER() && JGraft::Util::is_integer($name)) {
+         my $id=int($name); $name="$id";
+      }
+      $name="$name" if $type==JGraft::Util::TYPE_STRING();
+   }
    defined $name && !ref $name or invalid_graft("Expected an action name or ID");
    $to_class{$name} or invalid_graft("Unknown JGraft action: '$name'");
 }

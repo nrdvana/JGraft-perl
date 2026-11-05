@@ -86,13 +86,22 @@ sub new {
       $fraction =~ s/0+\z//;
    }
    is_integer($v{tz_offset}) && abs($v{tz_offset})<1440 or croak 'Invalid timezone offset' if exists $v{tz_offset};
+   if (grep ref($v{$_}),keys %v) {
+      $v{$_}=JGraft::Util::to_native_number($v{$_}) for grep ref($v{$_}),keys %v;
+   }
    my $self=bless {%v,type=>$type,fraction=>defined($fraction)?$fraction:''},$class;
    lock_hash(%$self);
    return $self;
 }
 sub _fraction {
-   my $seconds=JSON::PP->new->allow_nonref->encode($_[0]);
-   0+$seconds==$_[0] or croak 'UNSUPPORTED_GRAFT: Numeric seconds cannot round trip through JSON';
+   my $seconds;
+   if (ref $_[0]) {
+      $seconds=JGraft::Util::to_decimal_string(JGraft::Util::to_rational($_[0]));
+   }
+   else {
+      $seconds=JSON::PP->new->allow_nonref->encode($_[0]);
+      0+$seconds==$_[0] or croak 'UNSUPPORTED_GRAFT: Numeric seconds cannot round trip through JSON';
+   }
    if ($seconds =~ /\A([0-9]+)(?:\.([0-9]*))?[eE]([+-]?[0-9]+)\z/) {
       my ($digits,$point)=($1.(defined($2)?$2:''),length($1)+$3);
       $seconds=$point<=0? '0.'.('0'x(-$point)).$digits

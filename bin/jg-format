@@ -13,23 +13,38 @@ BEGIN {
    }
 }
 use JGraft 'jgformat';
-use JGraft::_JSON ();
+use JGraft::JSON ();
 use Getopt::Long;
 use Pod::Usage;
 
-=head1 USAGE
+=head1 SYNOPSIS
 
   jg-format [OPTIONS] [FILE|-]
+  
+Read UTF-8 JSON from FILE or standard input, convert JGraft directive IDs to
+names (or vice versa) then write formatted UTF-8 JSON.
 
-Read UTF-8 JSON from FILE or standard input and write readable JSON. Valid embedded
-JGRAFT arrays use directive formatting; invalid grafts remain ordinary JSON. Numeric
-tokens and lone surrogates are preserved.
+  Common Options:
+    -o FILE        Redirect output
+    --ids          Convert JGraft names to IDs
+    --indent N     Spaces per indent level, 0 to strip whitespace
+    --wrap N       Wrap at N columns, 0 for unlimited line length
+    --help         Full help text
 
-  jg-format patch.json
-  jg-format --wrap 100 --close inline patch.json > readable.json
-  jg-format --ids < patch.json
-  jg-format conformance.json --output readable.json
-  jg-format --indent 0 --wrap 0 conformance.json > compact.json
+=head1 DESCRIPTION
+
+This tool parses the tokens of a JSON file and re-formats the whitespace
+between them.  Any sub-structure that parses as a valid JGRAFT tree uses
+special rules for formatting, and gets directive IDs converted to names, or
+the reverse with option C<--ids>.  Invalid grafts get formatted the same as
+ordinary JSON.  JSON tokens (other than directive IDs) are preserved exactly;
+numeric spelling, string escapes, property order, duplicate keys, and lone
+Unicode surrogates are preserved.
+
+This is a simple wrapper around L<JGraft/jgformat> while also using
+L<JGraft::JSON> to decode and re-encode the file so that JSON tokens can be
+preserved in their original form.
+Formatting options correspond to the options of L<JGraft::Action/format>.
 
 =head1 OPTIONS
 
@@ -65,13 +80,11 @@ Whitespace prefix for every line. Ignored with zero indentation.
 Write to FILE instead of standard output. Output is opened only after parsing and
 formatting succeed, so input and output may name the same file.
 
-=item --help, -h
+=item --man
 
-Show this usage and option documentation.
+Full documentation
 
 =back
-
-Formatting options correspond to L<JGraft::Action/format>.
 
 =cut
 
@@ -84,8 +97,9 @@ GetOptions(
    'ids!'       => \$options{ids},
    'names'      => sub { $options{ids}= 0 },
    'output|o=s' => \my $output,
-   'help|h'     => sub { pod2usage(-exitval => 0, -verbose => 99, -sections => 'USAGE|OPTIONS') },
-) && @ARGV <= 1 or pod2usage(-exitval => 2, -verbose => 99, -sections => 'USAGE');
+   'help|h'     => sub { pod2usage(1) },
+   'man'        => sub { pod2usage(-verbose => 2) },
+) && @ARGV <= 1 or pod2usage(2);
 
 my $input= @ARGV? $ARGV[0] : '-';
 my $ok= eval {
@@ -102,7 +116,7 @@ my $ok= eval {
       defined($n) or die "$input: $!\n";
       last unless $n;
    }
-   my $data= JGraft::_JSON::decode($buffer, preserve_numbers => 1);
+   my $data= JGraft::JSON->new(utf8 => 1)->decode($buffer);
    close $fh or die "$input: $!\n" unless $input eq '-';
    my $text= jgformat($data, %options);
    $text .= "\n" if $options{indent} || $options{wrap};

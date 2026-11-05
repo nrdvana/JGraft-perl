@@ -163,7 +163,7 @@ sub _argument {
    if ($context =~ /^(?:path|node_path|write_path|move_src|move_dst)$/) {
       return undef if !defined $value && $context =~ /^move_/;
       $value= _tree($value, $parse, $seen);
-      if (!_is_expr($value) && (!ref $value || JSON::PP::is_bool($value))) {
+      if (!_is_expr($value) && (_type($value) & (TYPE_NULL|TYPE_BOOLEAN|TYPE_NUMBER|TYPE_STRING))) {
          $value= JGraft::Expr::NODE->new([$value]);
       }
       _is_expr($value) && $value->is_ref or _bad('Path must be a reference expression');
@@ -243,6 +243,7 @@ sub _expect {
 sub _tree {
    my ($value, $parse, $seen, $plain)= @_;
    return $value if !ref $value || JSON::PP::is_bool($value);
+   return $value if !_is_expr($value) && (_type($value)==TYPE_NUMBER || _type($value)==TYPE_STRING);
    if (!_is_expr($value) && _type($value)==TYPE_DATE) {
       require JGraft::Date;
       my $date=eval { JGraft::Date->new($value) };
@@ -270,6 +271,9 @@ sub _tree {
    my $addr= refaddr($value);
    $seen->{$addr} and _bad('Cyclic data');
    local $seen->{$addr}= 1;
+   my $tie=tied %$value;
+   return $tie->_clone(sub { _tree($_[0],$parse,$seen,$plain) })
+      if $tie && $tie->isa('JGraft::JSON::Object');
    my %copy;
    $copy{$_}= _tree($value->{$_}, $parse, $seen, $plain) for keys %$value;
    return \%copy;
@@ -391,6 +395,7 @@ sub _encode_tree {
    my ($v,$encode_node)= @_;
    return $v unless ref $v;
    return $v if JSON::PP::is_bool($v);
+   return $v if !_is_expr($v) && (_type($v)==TYPE_NUMBER || _type($v)==TYPE_STRING);
    if (!_is_expr($v) && _type($v)==TYPE_DATE) {
       require JGraft::Date;
       my $text=JGraft::Date->new($v)->to_iso8601;
@@ -398,7 +403,12 @@ sub _encode_tree {
    }
    return $encode_node? $encode_node->($v) : $v->to_json_data if _is_expr($v) || _is_action($v);
    return [[map _encode_tree($_,$encode_node), @$v]] if ref $v eq 'ARRAY';
-   return { map +($_ => _encode_tree($v->{$_},$encode_node)), keys %$v } if ref $v eq 'HASH';
+   if (ref $v eq 'HASH') {
+      my $tie=tied %$v;
+      return $tie->_clone(sub { _encode_tree($_[0],$encode_node) })
+         if $tie && $tie->isa('JGraft::JSON::Object');
+      return { map +($_ => _encode_tree($v->{$_},$encode_node)), keys %$v };
+   }
    _bad('Cannot serialize ', ref($v));
 }
 

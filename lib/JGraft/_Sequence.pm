@@ -461,6 +461,7 @@ sub _repeat {
    my $max=exists $expr->{max}? $exec->_eval($expr->max,$depth+1) : -1;
    is_integer($min) && $min>=0 && is_integer($max) && $max>=-1
       or $exec->_fail('INVALID_OPERAND','Invalid REP bounds');
+   ($min,$max)=map $exec->_number($_),($min,$max) if ref($min) || ref($max);
    $max=$min if $max==0;
    $max==-1 || $max>=$min or $exec->_fail('INVALID_OPERAND','REP maximum is below minimum');
    local $self->{match}{suppress_captures}=1;

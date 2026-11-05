@@ -153,6 +153,9 @@ flat containers wrap at member boundaries. Options match L<JGraft::Action/format
 
 Strings are literal JSON string values, not JSON text to decode. For UTF-8 files,
 L<jg-format> also preserves original numeric tokens and lone surrogate escapes.
+For exact numeric values, original escape spelling, ordered members, and untouched
+duplicate keys, decode input with L<JGraft::JSON> and encode the execution result
+with that same codec. Ordinary JSON decoders and native data remain supported.
 
 =cut
 

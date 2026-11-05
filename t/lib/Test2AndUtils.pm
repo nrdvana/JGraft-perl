@@ -29,9 +29,10 @@ sub run_perl {
 # supported => [operation names] or {name => bool/coderef} filters operations
 # and partially implemented forms; predicates receive the parsed node.
 # undo => 0 disables undo round trips (enabled by default).
+# json => $codec selects an alternate encoder/decoder for fixtures and undo.
 sub test_conformance {
    my ($source,%options)=@_;
-   $_ eq 'supported' || $_ eq 'undo' or die "Unknown conformance option '$_'" for keys %options;
+   $_ eq 'supported' || $_ eq 'undo' || $_ eq 'json' or die "Unknown conformance option '$_'" for keys %options;
    require JGraft;
    require JGraft::Exec;
    require JSON::PP;
@@ -43,10 +44,11 @@ sub test_conformance {
          return;
       }
       open my $fh,'<:raw',$source or die "open($source): $!";
-      $suite=_conformance_json(do {local $/; <$fh>});
+      my $text=do {local $/; <$fh>};
+      $suite=$options{json}?$options{json}->decode($text):_conformance_json($text);
       close $fh or die "close($source): $!";
    }
-   my $config={json=>JSON::PP->new->canonical->allow_nonref,
+   my $config={json=>$options{json} || JSON::PP->new->canonical->allow_nonref,
       undo=>exists $options{undo}? $options{undo} : 1};
    if (exists $options{supported}) {
       $config->{supported}=ref($options{supported}) eq 'HASH'? $options{supported}
@@ -95,6 +97,9 @@ sub _conformance_same {
       return 0 unless keys(%$a)==keys(%$b);
       for my $key (keys %$a) { return 0 unless exists($b->{$key}) && _conformance_same($a->{$key},$b->{$key}) }
       return 1;
+   }
+   if ($type==JGraft::Util::TYPE_NUMBER() && (ref($a) || ref($b))) {
+      return !JGraft::Util::to_rational($a)->bcmp(JGraft::Util::to_rational($b));
    }
    return $a==$b if $type==JGraft::Util::TYPE_NUMBER() || $type==JGraft::Util::TYPE_BOOLEAN();
    return $a eq $b;
@@ -147,7 +152,8 @@ sub _conformance_cases {
    }
    is($json->encode([$case->{input},$case->{jgraft}]),$before,"$name: input and graft preserved");
    return unless $config->{undo};
-   my $data=_conformance_json($json->encode($exec->undo->to_json_data));
+   my $data=ref($json) eq 'JSON::PP'?_conformance_json($json->encode($exec->undo->to_json_data))
+      :$json->decode($json->encode($exec->undo->to_json_data));
    my $restore=JGraft::Exec->new(jgraft=>$data);
    $restore->apply($exec->output);
    ok($restore->success,"$name: undo succeeds") or diag "$restore",explain($data);
