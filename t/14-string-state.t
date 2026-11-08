@@ -121,7 +121,7 @@ my $graft=JGRAFT(COPY(1,'changed'),MATCH({text=>STR(SEQ(REP(),'needle'))}));
 my $input={text=>chr(0x100)x200};
 my $baseline=JGraft::Exec->new(jgraft=>$graft,undo=>1);
 $baseline->apply($input);
-$exec=JGraft::Exec->new(jgraft=>$graft,undo=>1,limits=>{mem=>$baseline->counters->{mem}*.8});
+$exec=JGraft::Exec->new(jgraft=>$graft,undo=>1,limits=>{mem=>$baseline->counters->{mem}*2});
 $exec->apply($input);
 is($exec->error,'RESOURCE_LIMIT','packed conversion and search respect memory limits');
 is($exec->output->{changed},1,'regex resource failure retains preceding actions');
@@ -134,4 +134,111 @@ $exec->apply('x');
 is($exec->output,$true,'literal cache is populated');
 $exec->apply('y');
 is($exec->output,$false,'reused execution contexts reset regex state');
+{
+   my $graft=JGRAFT(COPY(7,'before'),COPY(LESS(NODE('a'),NODE('b')),'result'));
+   my ($short_mem,$long_mem);
+   my $input;
+   for my $size (16,4096) {
+      $input={a=>chr(0x100)x$size,b=>chr(0x101)x$size};
+      my $exec=JGraft::Exec->new(jgraft=>$graft,undo=>1,codepoint_policy=>'substitute');
+      $exec->apply($input);
+      ok($exec->success,'packed comparison succeeds with scoped views');
+      is($exec->output->{result},$true,'packed comparison preserves codepoint ordering');
+      is($exec->{scratch_mem},0,'comparison workspace unwinds on success');
+      if ($size==16) { $short_mem=$exec->counters->{mem} }
+      else { $long_mem=$exec->counters->{mem} }
+   }
+   is($long_mem,$short_mem,'larger comparison buffers do not accumulate retained mem');
+   my $exec=JGraft::Exec->new(jgraft=>$graft,undo=>1,codepoint_policy=>'substitute',
+      limits=>{mem=>$long_mem+8*4096});
+   $exec->apply($input);
+   is($exec->error,'RESOURCE_LIMIT','simultaneous comparison buffers respect the memory limit');
+   like($exec->message,qr/scratch/,'comparison failure identifies live workspace');
+   is($exec->output,{%$input,before=>7},'scratch failure retains prior edit and leaves comparison unpublished');
+   is(jgexec($exec->undo,$exec->output),$input,'undo restores partial result after comparison scratch failure');
+   is($exec->{scratch_mem},0,'comparison failure unwinds all scratch');
+   is($input,{a=>chr(0x100)x4096,b=>chr(0x101)x4096},'scratch failure preserves input');
+   $exec->apply({a=>'a',b=>'b'});
+   ok($exec->success,'comparison context reusable after scratch failure');
+}
+for my $case (
+   ['comparison',COPY(LESS(NODE(),NODE()),NODE())],
+   ['subject',COPY(STR('x'),NODE())],
+   ['pattern',COPY(STR(chr(0xfdd0)x512),NODE())],
+   ['split subject',COPY(SPLIT(',',NODE()),NODE())],
+   ['split field',COPY(SPLIT({sep=>',',trim=>' '},NODE()),NODE())],
+) {
+   my ($kind,$graft)=@$case;
+   my $sentinel="exception in $kind view\n";
+   my $exec=JGraft::Exec->new(jgraft=>$graft,codepoint_policy=>sub {
+      die $sentinel if $_[1]{kind} eq $kind;
+      return 'preserve';
+   });
+   my $error=dies { $exec->apply(chr(0xfdd0)x512) };
+   is($error,$sentinel,"$kind callback exception propagates");
+   is($exec->{scratch_mem},0,"$kind callback unwinds temporary view reservation");
+   $exec->apply('safe');
+   ok($exec->success,"$kind callback context reusable after exception");
+}
+{
+   # Small view/preparation buffers must stay covered together while matching
+   # calls resource-tracked helpers, as must their caller's cursor frames.
+   my $graft=COPY(STR(''),NODE());
+   my $input=chr(0x100)x88;
+   my $baseline=JGraft::Exec->new(jgraft=>$graft);
+   $baseline->apply($input);
+   ok($baseline->success,'combined view/preparation baseline succeeds');
+   my $limited=JGraft::Exec->new(jgraft=>$graft,limits=>{mem=>$baseline->counters->{mem}});
+   $limited->apply($input);
+   is($limited->error,'RESOURCE_LIMIT','small subject and preparation buffers combine at their common owner');
+   like($limited->message,qr/scratch/,'combined small buffers report scratch exhaustion');
+   is($limited->{scratch_mem},0,'combined buffer reservation unwinds');
+}
+{
+   my @mem;
+   for my $size (8,2000) {
+      my $exec=JGraft::Exec->new(jgraft=>COPY(STR('z'),NODE()));
+      $exec->apply('a'x$size);
+      ok($exec->success,'unanchored search completes after unsuccessful starts');
+      is($exec->output,$false,'all unsuccessful starts remain a mismatch');
+      is($exec->{scratch_mem},0,'search releases each start and final invocation');
+      push @mem,$exec->counters->{mem};
+   }
+   is($mem[1],$mem[0],'repeated unsuccessful starts reuse workspace');
+}
+{
+   my @contexts;
+   my $baseline=JGraft::Exec->new(jgraft=>JGRAFT());
+   $baseline->apply(chr(0xfdd0)x2);
+   my $exec=JGraft::Exec->new(jgraft=>JGRAFT(),codepoint_policy=>sub {
+      push @contexts,$_[1];
+      return 'preserve';
+   });
+   $exec->apply(chr(0xfdd0)x2);
+   ok($exec->success,'callback may retain context values');
+   is(\@contexts,[{index=>0,kind=>'input'},{index=>1,kind=>'input'}],
+      'retained callback contexts preserve each occurrence');
+   is($exec->counters->{new_obj}-$baseline->counters->{new_obj},2,
+      'callback context allocations contribute to object count');
+   cmp_ok($exec->counters->{mem},'>',$baseline->counters->{mem},
+      'callback contexts remain in cumulative retained memory');
+   $contexts[0]{index}=99;
+   is($contexts[1]{index},1,'callback contexts are independent values');
+   my $calls=0;
+   my $limited=JGraft::Exec->new(jgraft=>JGRAFT(),limits=>{new_obj=>0},
+      codepoint_policy=>sub {++$calls;return 'preserve'});
+   $limited->apply(chr(0xfdd0));
+   is($limited->error,'RESOURCE_LIMIT','callback value allocation reserves before invocation');
+   is($calls,0,'exhausted object budget does not invoke the callback');
+   is($limited->{scratch_mem},0,'callback allocation failure unwinds the scan');
+   my $mem_calls=0;
+   my $memory_limited=JGraft::Exec->new(jgraft=>JGRAFT(),limits=>{mem=>300},
+      codepoint_policy=>sub {++$mem_calls;return 'preserve'});
+   $memory_limited->apply(chr(0xfdd0));
+   is($memory_limited->error,'RESOURCE_LIMIT','callback context checks the memory budget with the scan live');
+   like($memory_limited->message,qr/scratch/,'callback allocation failure identifies active scratch');
+   is($mem_calls,0,'insufficient context memory does not invoke callback');
+   cmp_ok($memory_limited->counters->{mem},'>',0,'failed callback reservation remains consumed');
+   is($memory_limited->{scratch_mem},0,'context memory failure unwinds small scan reservations');
+}
 done_testing;

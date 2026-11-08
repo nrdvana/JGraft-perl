@@ -10,35 +10,37 @@ use JGraft::Util qw(:types type_mask);
 sub _new {
    my ($class,$exec,$input)=@_;
    return bless {target=>$input, paths=>{children=>{}}, original_ids=>{},
-      lineage=>$exec->{lineage}}, $class;
+      identities=>{}}, $class;
 }
 
 # Canonical paths are rooted in the data, independent of AT and namespaces.
 # Record before writing: a resource failure during autovivification may leave
 # new ancestors even when the final assignment did not happen.
 sub _record {
-   my ($self,$exec,$loc,$delete)=@_;
+   my ($self,$exec,$loc,$delete,$frames)=@_;
    return unless refaddr($loc->[0])==refaddr($exec->{root});
    my $parts=$loc->[1];
-   $exec->_step(1+@$parts);
+   $exec->_tick(1+@$parts);
    my $node=$self->{paths};
    my $value=$loc->[0][1]? $loc->[0][0] : undef;
    for my $i (0..$#$parts) {
       return if $node->{whole};
       my $key=$parts->[$i];
-      if (ref($value) eq 'ARRAY' && $i==$#$parts
-         && ($delete || $key!=int($key) || $key==@$value)) {
+      my $array=$frames?$frames->[$i][JGraft::Exec::_F_KIND()]==TYPE_ARRAY:ref($value) eq 'ARRAY';
+      my $container=$frames?$frames->[$i][JGraft::Exec::_F_CONTAINER()]:$value;
+      if ($array && $i==$#$parts
+         && ($delete || $key!=int($key) || $key==(defined($container)?scalar @$container:0))) {
          $node->{array}=1;
       }
-      $exec->_step(length($key)*.001) if type_mask($key)==TYPE_STRING;
+      $exec->_tick(length($key)*.001) if type_mask($key)==TYPE_STRING;
       my $token=_key($key);
       unless (exists $node->{children}{$token}) {
-         $exec->_charge('mem',160+4*length($token));
+         $exec->_reserve(0,160+4*length($token),0);
          $node->{children}{$token}=[$key,{children=>{}}];
       }
       $node=$node->{children}{$token}[1];
       $value=(ref($value) eq 'ARRAY' || ref($value) eq 'HASH') && $exec->_present($value,$key)
-         ? $exec->_child($value,$key) : undef;
+         ? $exec->_child($value,$key) : undef unless $frames;
    }
    $node->{whole}=1;
    $node->{children}={};
@@ -65,7 +67,23 @@ sub _key {
    return 'r'.refaddr($value) if $type==TYPE_ARRAY || $type==TYPE_OBJECT;
    return $type.':'.(!defined $value? '' : $type==TYPE_BOOLEAN? ($value?1:0) : $value);
 }
-sub _origin { my ($self,$value)=@_; $self->{lineage}{refaddr($value)} || refaddr($value) }
+sub _identity {
+   my ($self,$value)=@_;
+   my $address=refaddr($value);
+   my $identity=$self->{identities}{$address};
+   return $identity if $identity && defined($identity->[0]) && refaddr($identity->[0])==$address;
+   return;
+}
+sub _id {
+   my ($self,$value)=@_;
+   my $identity=$self->_identity($value);
+   return $identity?$identity->[1]:'r'.refaddr($value);
+}
+sub _origin {
+   my ($self,$value)=@_;
+   my $identity=$self->_identity($value);
+   return $identity?$identity->[2]:'r'.refaddr($value);
+}
 sub _fingerprint {
    my ($self,$value)=@_;
    my $type=type_mask($value);
@@ -86,7 +104,7 @@ sub _copy {
 sub _assign {
    my ($self,$actions,$value,$destination)=@_;
    my $pair=[$value,$destination];
-   if (@$actions && $actions->[-1]->_name eq 'COPY') {
+   if (@$actions && $actions->[-1]->name eq 'COPY') {
       push @{$actions->[-1]->assignments},$pair;
    }
    else {
@@ -117,7 +135,7 @@ sub _index {
    my ($self,$value,$link)=@_;
    my $type=type_mask($value);
    return unless $type==TYPE_ARRAY || $type==TYPE_OBJECT;
-   my $id=refaddr($value);
+   my $id=$self->_id($value);
    return if exists $self->{exact}{$id};
    my $entry=[$value,$link];
    $self->{exact}{$id}=$entry;
@@ -138,10 +156,10 @@ sub _restore {
          $self->{exact}={}; $self->{origins}={};
          $self->_index($self->{output},undef);
       }
-      my $entry=$self->{exact}{refaddr($wanted)} || $self->{origins}{$self->_origin($wanted)};
+      my $entry=$self->{exact}{$self->_id($wanted)} || $self->{origins}{$self->_origin($wanted)};
       if ($entry) {
          my ($available,$link)=@$entry;
-         my $id=refaddr($available);
+         my $id=$self->_id($available);
          unless (exists $self->{saved}{$id}) {
             my $slot=$self->{next_slot}++;
             $self->_assign($self->_save_scope($link),$self->_path([]),$self->_path([$slot],'STASH'));
@@ -178,7 +196,7 @@ sub _diff {
       }
       else { return if $wanted==$have }
    }
-   unless ($wt==$ht && ($wt==TYPE_ARRAY || $wt==TYPE_OBJECT) && $self->_origin($wanted)==$self->_origin($have)) {
+   unless ($wt==$ht && ($wt==TYPE_ARRAY || $wt==TYPE_OBJECT) && $self->_origin($wanted) eq $self->_origin($have)) {
       $self->_restore($wanted,$parts);
       return;
    }

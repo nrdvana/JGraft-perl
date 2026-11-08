@@ -19,15 +19,20 @@ sub _check {
    my ($text,$kind,$buffer)=@_[2..4];
    $text=$text->value if ref($text) eq 'JGraft::JSON::String';
    return unless utf8::is_utf8($text);
-   $exec->_charge('mem',4*length($text)); # Private scan copy on older Perls.
-   $exec->_step(length($text)*.002);
+   my $scratch_base=$exec->{scratch_mem};
+   local $exec->{scratch_mem}=$scratch_base;
+   $exec->_scratch_set($scratch_base,4*length($text)); # Private scan copy on older Perls.
+   $exec->_tick(length($text)*.002);
    while ($text =~ /$problems/g) {
-      $exec->_step(1);
+      $exec->_tick(1);
       my $cp=ord($1);
       my $index=pos($text)-1;
       $cp<=0x10ffff or $exec->_fail('UNSUPPORTED_GRAFT',sprintf('Codepoint U+%X exceeds Unicode maximum',$cp));
       my $policy=$exec->{options}{codepoint_policy} || 'preserve';
       if (ref($policy) eq 'CODE') {
+         # The callback may retain its argument. This value is neither a node
+         # location nor an execution-owned container and needs no COW record.
+         $exec->_reserve(0,265,1); # Hash, two slots, and index/kind key bytes.
          $policy=$policy->($cp,{index=>$index,kind=>$kind});
          defined($policy) && !ref($policy) && $policy =~ /\A(?:preserve|reject|substitute)\z/
             or $exec->_fail('UNSUPPORTED_GRAFT','codepoint_policy callback must return preserve, reject, or substitute');
@@ -36,14 +41,21 @@ sub _check {
       vec($$buffer,$index,32)=$cp if $buffer && $policy eq 'preserve';
    }
 }
+# A caller may cover a temporary view in its own reservation. Default creation
+# remains retained, for independent callers and any view that can escape.
+sub _workspace {
+   my ($class,$text,$wide)=@_;
+   $text=$text->value if ref($text) eq 'JGraft::JSON::String';
+   return 128+($wide || utf8::is_utf8($text)?8:1)*length($text);
+}
 sub _new {
    my ($class,$exec)=@_;
    my ($text,$kind)=@_[2,3];
    $text=$text->value if ref($text) eq 'JGraft::JSON::String';
    my $size=length($text);
    my $wide=$_[4] || utf8::is_utf8($text);
-   $exec->_step($size*.002+1);
-   $exec->_charge('mem',128+($wide?8:1)*$size);
+   $exec->_tick($size*.002+1);
+   $exec->_reserve(0,128+($wide?8:1)*$size,0) unless $_[5];
    my $buffer;
    if ($wide) {
       # CHECK=0 leaves the private source copy intact. Old Encode emits a
@@ -73,18 +85,21 @@ sub _literal {
    return if $position+$size>$self->{size};
    return 0 unless $size;
    my $cache=$exec->{regex_literals}{$self->{width}} ||= {};
-   $exec->_step(length($text)*.001+1);
+   $exec->_tick(length($text)*.001+1);
    my $test=$cache->{$text};
    unless ($test) {
       if ($self->{width}==1 && utf8::is_utf8($text)) {
          return unless utf8::downgrade($text,1);
       }
-      my $pattern=__PACKAGE__->_new($exec,$text,'pattern',$self->{width}==4);
+      my $scratch_base=$exec->{scratch_mem};
+      local $exec->{scratch_mem}=$scratch_base;
+      $exec->_scratch_set($scratch_base,__PACKAGE__->_workspace($text,$self->{width}==4));
+      my $pattern=__PACKAGE__->_new($exec,$text,'pattern',$self->{width}==4,1);
       my $bytes=$pattern->{buffer};
-      $exec->_charge('mem',128+4*length($bytes)+4*length($text));
+      $exec->_reserve(0,128+4*length($bytes)+4*length($text),0);
       $test=$cache->{$text}=$size==1? [$pattern->_at(0)] : qr/\G\Q$bytes\E/;
    }
-   $exec->_step($size*.001+1);
+   $exec->_tick($size*.001+1);
    return $self->_at($position)==$test->[0]? 1 : undef if ref($test) eq 'ARRAY';
    pos($self->{buffer})=$position*$self->{width};
    return $self->{buffer} =~ /$test/gc ? $size : undef;

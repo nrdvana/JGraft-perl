@@ -172,4 +172,94 @@ is(jgexec($first,{a=>2}),{a=>1},'previous undo remains usable');
 $exec=JGraft::Exec->new(jgraft=>JGRAFT());
 $exec->apply({});
 is($exec->undo,undef,'undo remains opt in');
+{
+   my $input={a=>{x=>1},keep=>[]};
+   my $exec=JGraft::Exec->new(jgraft=>COPY(2,NODE('a','x')),undo=>1);
+   $exec->apply($input);
+   my $state=$exec->{undo_state};
+   my $original=$state->_id($input);
+   my $changed=$state->_id($exec->output);
+   isnt($changed,$original,'COW containers have distinct serial identities');
+   is($state->_origin($exec->output),$original,'COW retains the original serial lineage');
+   ok($state->{original_ids}{$original},'original membership uses the original serial');
+   ok(!$state->{original_ids}{$changed},'a clone is not mistaken for a borrowed original');
+   ok(!exists($exec->{containers}),'application releases its container lookup before lazy undo');
+   my $counts=$exec->counters;
+   is(jgexec($exec->undo->to_json_data,$exec->output),$input,'independent identities support serialized undo after cleanup');
+   is($exec->counters,$counts,'serial lookup during undo does not consume execution counters');
+}
+{
+   my $value=[{x=>1}];
+   my $dead=[];
+   my $identity=[$dead,1,1];
+   weaken($identity->[0]);
+   undef $dead;
+   my $state=bless {identities=>{refaddr($value)=>$identity},original_ids=>{1=>1},
+      exact=>{},origins=>{}},'JGraft::_Undo';
+   is($state->_id($value),'r'.refaddr($value),'expired undo identity uses a separate fallback namespace');
+   is($state->_origin($value),'r'.refaddr($value),'expired undo identity cannot supply lineage');
+   $state->_index($value,undef);
+   is(scalar keys %{$state->{exact}},2,'stale original membership cannot stop indexing a new subtree');
+   my $other=[];
+   $identity->[0]=$other;
+   weaken($identity->[0]);
+   is($state->_id($value),'r'.refaddr($value),'mismatched live undo identities are rejected too');
+}
+{
+   my $input={a=>1};
+   my $exec=JGraft::Exec->new(jgraft=>COPY(CASTDATE('2024-01-02'),NODE()),
+      undo=>1,date_format=>sub { return {formatted=>[7]} });
+   $exec->apply($input);
+   ok($exec->success,'formatter can return an ordinary unregistered container');
+   like($exec->{undo_state}->_id($exec->output),qr/^r/,'callback result uses the guarded fallback identity namespace');
+   is(jgexec($exec->undo->to_json_data,$exec->output),$input,'serialized undo restores input after an unregistered callback result');
+   is($exec->output,{formatted=>[7]},'undo leaves the callback result unchanged');
+}
+for my $undo (0,1) {
+   for my $fail (0,1) {
+      my $input={a=>1};
+      my $weak=$input;
+      weaken($weak);
+      my $graft=JGRAFT(COPY(NODE(),STASH('discarded')),COPY(2,'a'),
+         $fail?RAISE('fail','stop'):JGRAFT());
+      my $exec=JGraft::Exec->new(jgraft=>$graft,undo=>$undo);
+      $exec->apply($input);
+      undef $input;
+      is($exec->output,{a=>2},'cleanup preserves successful and partial output');
+      is($exec->error,$fail?'NO_MATCH':undef,'cleanup preserves the expected failure status');
+      ok(!exists($exec->{stash}) && !exists($exec->{containers}),'completed application releases namespaces and metadata lookup');
+      if ($undo) {
+         ok(defined($weak),'lazy undo still retains its original target');
+         my $graft=$exec->undo;
+         is(jgexec($graft->to_json_data,$exec->output),{a=>1},'undo survives application cleanup');
+      }
+      is($weak,undef,'unused namespace snapshots no longer retain the original root');
+      $exec->apply({a=>3});
+      is($exec->output,{a=>2},'cleaned application can be reused');
+   }
+}
+{
+   my $input={a=>[1,2]};
+   my $weak=$input;
+   weaken($weak);
+   my $exec=JGraft::Exec->new(jgraft=>JGRAFT(),clone=>1);
+   $exec->apply($input);
+   undef $input;
+   is($weak,undef,'clone completion releases the borrowed pre-clone root');
+   is($exec->output,{a=>[1,2]},'clone cleanup keeps the detached public output');
+}
+{
+   my $input={a=>1};
+   my $weak=$input;
+   weaken($weak);
+   my $sentinel=bless {},'Test::RecordException';
+   my $exec=JGraft::Exec->new(jgraft=>JGRAFT(COPY(NODE(),STASH('discarded')),
+      COPY(2,'a'),COPY(CASTDATE('2024-01-02'),'date')),date_format=>sub { die $sentinel });
+   my $error=dies { $exec->apply($input) };
+   is(refaddr($error),refaddr($sentinel),'unexpected callback exceptions propagate unchanged');
+   undef $input;
+   is($weak,undef,'unexpected exceptions also release private namespace snapshots');
+   ok(!exists($exec->{containers}) && !exists($exec->{date_output}),'unexpected exceptions release application caches');
+   is($exec->{scratch_mem},0,'unexpected exception unwinds scratch before cleanup');
+}
 done_testing;

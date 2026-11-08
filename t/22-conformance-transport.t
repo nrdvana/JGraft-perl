@@ -38,18 +38,42 @@ ok(Test2AndUtils::_conformance_same(1e20,0+'100000000000000000000'),'conformance
 ok(!Test2AndUtils::_conformance_same(1,'1'),'conformance comparison distinguishes strings from numbers');
 ok(!Test2AndUtils::_conformance_same(JSON::PP::true(),1),'conformance comparison distinguishes booleans from numbers');
 ok(!Test2AndUtils::_conformance_same([1,2],[2,1]),'conformance comparison preserves array order');
-for my $invalid ('','[1,]','{"x":1,}','01','1.','1e','true false','{"x" 1}',
+for my $invalid ('','[1,]','{"x":1,}','01','+1','1.','1e','true false','{"x" 1}',
    '"bad'.chr(1).'"','"\\q"','"\\uFFFFF', '["unterminated', '"'.chr(0xff).'"') {
    ok(!eval {Test2AndUtils::_conformance_json($invalid);1},'invalid fixture JSON is rejected');
 }
 
-for my $token ('1e-400','-1e-999999') {
+for my $token ('1e-400','-1e-999999','+1e-400') {
    my $exec=JGraft::Exec->new(jgraft=>COPY(CASTNUM(),NODE()));
    $exec->apply($token);
    is($exec->error,'UNSUPPORTED_GRAFT','CASTNUM reports nonzero underflow rather than silently producing zero');
 }
-for my $token ('0e-999999','-0.000e-999999') {
+for my $token ('0e-999999','-0.000e-999999','+0e-999999') {
    is(jgexec(COPY(CASTNUM(),NODE()),$token),0,'zero mantissas are valid even with extreme exponents');
+}
+for my $pair (['+0',0],['+12',12],['+0.125',0.125],['0.',0],['-12.',-12],['+2.',2]) {
+   my ($token,$expected)=@$pair;
+   my $value=jgexec(COPY(CASTNUM(),NODE()),$token);
+   is($value,$expected,'CASTNUM accepts the extended sign/decimal syntax');
+   is(type_mask($value),TYPE_NUMBER,'extended CASTNUM token returns a number');
+   is(type_mask($token),TYPE_STRING,'CASTNUM preserves caller token typing');
+}
+for my $token ('+.5','.5','+01','--1','1..','1e2.',' 1.','1. ') {
+   my $exec=JGraft::Exec->new(jgraft=>COPY(CASTNUM(),NODE()));
+   $exec->apply($token);
+   is($exec->error,'INVALID_TARGET','CASTNUM still rejects malformed whole tokens');
+}
+{
+   my $token=('1'x100000).'x';
+   my @ops;
+   for my $count (1,2) {
+      my $exec=JGraft::Exec->new(jgraft=>COPY(ANY(map {IS(CASTNUM(),NUM())} 1..$count),NODE()));
+      $exec->apply($token);
+      ok($exec->success,'matching traps invalid whole CASTNUM tokens');
+      is($exec->output,JSON::PP::false,'invalid token remains a mismatch for every alternative');
+      push @ops,$exec->counters->{ops};
+   }
+   cmp_ok($ops[1]-$ops[0],'>=',length($token)*.001,'rejected numeric scans still consume work per attempt');
 }
 for my $pair ([1e21,'1000000000000000000000'],[1.25e21,'1250000000000000000000'],
    [-1e21,'-1000000000000000000000'],[1e100,'1'.('0'x100)]) {

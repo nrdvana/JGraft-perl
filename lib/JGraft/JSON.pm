@@ -187,7 +187,8 @@ sub _encode {
    my $tie=tied %$v;
    my @out;
    if ($tie && $tie->isa('JGraft::JSON::Object')) {
-      for my $i ($tie->_members) {
+      for (my $i=$tie->{head};defined $i;$i=$tie->{seq}[$i+1]) {
+         $JGraft::JSON::Object::EXEC->_tick(1) if $JGraft::JSON::Object::EXEC;
          push @out,$s->_encode($tie->{tokens}[$i],$depth+1,$active).':'.$s->_encode($tie->{tokens}[$i+1],$depth+1,$active);
       }
    }

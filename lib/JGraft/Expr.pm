@@ -432,8 +432,11 @@ sub _define_expr {
    @{$class.'::ISA'}= $id <= 0? 'JGraft::Expr::Ref'
                     : $id < 50? 'JGraft::Expr::Match'
                     : 'JGraft::Expr::Fn';
+   my @operands=sort keys %attrs;
+   *{$class.'::_operand_fields'}= sub { (ref($_[0]) || $_[0]) eq $class?\@operands:undef };
    # TODO: use Class::XSAccessor if available
    *{$class.'::new'}= \&JGraft::_Node::_new;
+   *{$class.'::name'}= sub { $name };
    *{$class.'::id'}= sub { $id };
    *{$class.'::returns'}= sub { $returns } unless defined &{$class.'::returns'};
    *{$class.'::forms'}= sub { \@forms };

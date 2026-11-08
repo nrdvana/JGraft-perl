@@ -208,7 +208,10 @@ sub _define_action {
    }
    no strict 'refs';
    @{$class.'::ISA'}= (__PACKAGE__);
+   my @operands=sort keys %attrs;
+   *{$class.'::_operand_fields'}= sub { (ref($_[0]) || $_[0]) eq $class?\@operands:undef };
    *{$class.'::id'}= sub { $id };
+   *{$class.'::name'}= sub { $name };
    *{$class.'::forms'}= sub { \@forms };
    *{$class.'::new'}= \&JGraft::_Node::_new;
    for (keys %attrs) {

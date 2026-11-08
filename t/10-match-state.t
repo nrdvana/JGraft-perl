@@ -5,6 +5,7 @@ use Test2AndUtils;
 use JGraft qw(:constructors jgexec);
 use JGraft::Exec;
 use JSON::PP ();
+use Scalar::Util 'weaken';
 my $true=JSON::PP::true;
 my $false=JSON::PP::false;
 sub boolean_case {
@@ -101,16 +102,11 @@ is($exec->error,'UNSUPPORTED_GRAFT','unsupported errors remain fatal');
    is($exec->error,'UNSUPPORTED_GRAFT','ANY does not swallow unsupported expressions');
 }
 {
-   package Test::UnexpectedMatchError;
-   our @ISA=('JGraft::Exec');
-   sub _expression {
-      my ($self,$expr,$depth)=@_;
-      die "unexpected evaluation failure\n" if $expr->_name eq 'LENGTH';
-      return $self->SUPER::_expression($expr,$depth);
-   }
+   no warnings 'redefine';
+   local *JGraft::Expr::LENGTH::_execute=sub { die "unexpected evaluation failure\n" };
+   $exec=JGraft::Exec->new(jgraft=>COPY(ANY(LENGTH()),NODE()));
+   like(dies { $exec->apply([]) },qr/unexpected evaluation failure/,'unexpected exceptions escape match guards');
 }
-$exec=Test::UnexpectedMatchError->new(jgraft=>COPY(ANY(LENGTH()),NODE()));
-like(dies { $exec->apply([]) },qr/unexpected evaluation failure/,'unexpected exceptions escape match guards');
 my $long='x' x 100000;
 my $graft=JGRAFT(COPY(1,'changed'),MATCH({long=>$long}));
 my $baseline=JGraft::Exec->new(jgraft=>$graft,undo=>1);
@@ -129,4 +125,32 @@ is($exec->error,'NO_MATCH','MATCH reports mismatch');
 $exec->apply({a=>undef});
 ok($exec->success,'match state and diagnostic reset when context is reused');
 is($exec->error,undef,'recovered match probes leave no stale error');
+{
+   my $new=JGraft::_Match->can('_new');
+   my @states;
+   no warnings 'redefine';
+   local *JGraft::_Match::_new=sub {
+      my $state=$new->(@_);
+      push @states,$state;
+      weaken($states[-1]);
+      return $state;
+   };
+   for my $graft (
+      MATCH(EXISTS(),COPY(CAP(),'capture'),COPY(CASTDATE('2024-01-02'),'date')),
+      IF(EXISTS(),JGRAFT(COPY(CAP(),'capture'),COPY(CASTDATE('2024-01-02'),'date'))),
+      JGRAFT(COPY(CAPTURE(EXISTS()),'capture'),COPY(CASTDATE('2024-01-02'),'date')),
+   ) {
+      my $called=0;
+      my $exec=JGraft::Exec->new(jgraft=>$graft,date_format=>sub {
+         ++$called;
+         ok(!grep(defined($_),@states),'private match state is released before consuming captures');
+         return 'formatted';
+      });
+      $exec->apply({});
+      ok($exec->success,'capture consumers succeed with only the completed capture table');
+      is($called,1,'capture consumer reaches the date callback');
+      is($exec->output,{capture=>{},date=>'formatted'},'empty successful captures remain distinct from mismatch');
+      is($exec->{scratch_mem},0,'match-state workspace unwinds after capture consumption');
+   }
+}
 done_testing;

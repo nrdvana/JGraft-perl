@@ -13,8 +13,6 @@ use JSON::PP ();
 *_integer= \&JGraft::Util::is_integer;
 *_is_expr= \&JGraft::Util::is_expr;
 *_is_action= \&JGraft::Util::is_action;
-
-sub _name { (my $name= ref($_[0]) || $_[0]) =~ s/.*:://; $name }
 *_bad= \&JGraft::Util::invalid_graft;
 
 sub _new {
@@ -167,7 +165,7 @@ sub _argument {
          $value= JGraft::Expr::NODE->new([$value]);
       }
       _is_expr($value) && $value->is_ref or _bad('Path must be a reference expression');
-      my $name= $value->_name;
+      my $name= $value->name;
       # A common expression can name a reference in any lexical scope. Check
       # the resolved namespace and path restrictions when it is invoked.
       return $value if $name eq 'EXPR';
@@ -453,7 +451,7 @@ sub to_json_data {
    if (my $tail= $form->{tail}) {
       push @args, _encode_argument($self->{$tail->[0]}, $tail->[1],$encode_node) if exists $self->{$tail->[0]};
    }
-   return [$self->_name, @args];
+   return [$self->name, @args];
 }
 
 sub TO_JSON { shift->to_json_data(@_) }

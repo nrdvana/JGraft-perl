@@ -5,6 +5,7 @@ use Test2AndUtils;
 use JGraft qw(:constructors jgexec);
 use JGraft::Date;
 use JGraft::Exec;
+use JGraft::JSON;
 use Scalar::Util 'refaddr';
 use Storable 'dclone';
 use JSON::PP ();
@@ -133,8 +134,65 @@ for my $out (undef,0,JSON::PP::false) {
       'formatter may return null, zero, or false');
 }
 my $sentinel=bless {},'DateFormatterError';
+for my $visible (0,1) {
+   my $input={};
+   my $calls=0;
+   my $exec=JGraft::Exec->new(jgraft=>JGRAFT(
+      COPY(CASTDATE('2024-01-02'),STASH('date')),
+      COPY([$visible?STASH('date'):'first','last'],STASH('items')),
+      COPY(STASH('items'),STASH('saved')),
+      MOVE(STASH('date'),STASH('items',.5),STASH('items'),NODE('moved')),
+      COPY(STASH('saved'),NODE('saved'))),undo=>1,date_format=>sub { ++$calls; 'D' });
+   $exec->apply($input);
+   ok($exec->success,'pending insertions survive a NODE representation conversion');
+   is($exec->output,{moved=>[$visible?'D':'first','D','last'],saved=>[$visible?'D':'first','last']},
+      'conversion exports queued dates and preserves a frozen sibling snapshot');
+   is($calls,1,'queued and visible occurrences share the per-application date cache');
+   is($input,{},'pending conversion preserves caller input');
+   is($exec->{scratch_mem},0,'pending conversion releases transfer workspace');
+   is(jgexec($exec->undo->to_json_data,$exec->output),{},'serialized undo restores input after pending conversion');
+}
+{
+   my $exec=JGraft::Exec->new(jgraft=>JGRAFT(COPY(1,'before'),
+      COPY([CASTDATE('2024-01-02'),'last'],STASH('items')),
+      MOVE(STASH('items',1),undef,STASH('items'),NODE('moved'))),undo=>1);
+   $exec->apply({});
+   is($exec->error,'INVALID_TARGET','representation conversion still rejects deleted visible elements');
+   is($exec->output,{before=>1},'failed conversion preserves earlier NODE edits');
+   is($exec->{scratch_mem},0,'failed conversion unwinds its MOVE reservation');
+   is(jgexec($exec->undo->to_json_data,$exec->output),{},'partial conversion failure has a valid serialized undo');
+}
 ok(!eval {jgexec(COPY(CASTDATE($iso),NODE()),undef,date_format=>sub {die $sentinel});1},'formatter exception propagates');
 is($@,$sentinel,'formatter exception identity is preserved');
+{
+   my $graft=JGRAFT(COPY(1,'before'),COPY(CASTDATE('2024-01-02'),STASH('date')),
+      COPY(['first','last'],STASH('items')),
+      MOVE(STASH('date'),STASH('items',.5),STASH('items'),NODE('moved')));
+   my $exec=JGraft::Exec->new(jgraft=>$graft,undo=>1);
+   my $grow=JGraft::Exec->can('_grow_array');
+   my $at_conversion=0;
+   {
+      no warnings 'redefine';
+      local *JGraft::Exec::_grow_array=sub {
+         my ($self,$array,$size)=@_;
+         if ($self->{moving} && $size==3 && @$array==2 && !$self->_container($array)->{pending}) {
+            ++$at_conversion;
+            $self->{limits}{mem}=$self->counters->{mem}+$self->{scratch_mem};
+         }
+         return $grow->(@_);
+      };
+      $exec->apply({});
+   }
+   is($at_conversion,1,'resource limit is applied while preparing a replacement pending array');
+   is($exec->error,'RESOURCE_LIMIT','pending conversion checks capacity before rebinding its batch');
+   is($exec->output,{before=>1},'pending conversion failure preserves earlier output');
+   is($exec->{scratch_mem},0,'pending conversion resource failure releases workspace');
+   is(jgexec($exec->undo->to_json_data,$exec->output),{},'pending conversion resource failure has serialized partial undo');
+   $exec->{limits}{mem}=undef;
+   $exec->apply({});
+   ok($exec->success,'context is reusable after a failed pending conversion');
+   is($exec->output->{moved},['first','2024-01-02','last'],'reuse exports the queued date and finalizes its new array');
+}
 $calls=0;
 $exec=JGraft::Exec->new(jgraft=>JGRAFT(COPY(CASTDATE($iso),STASH('date')),COPY(1,NODE())),date_format=>sub {++$calls;'unused'});
 $exec->apply(undef);
@@ -170,5 +228,87 @@ is($status,0,'ISO formatting works without loading DateTime');
 is($loading,'optional','DateTime is loaded only when requested');
 for my $bad (undef,'bad',[]) {
    ok(!eval {JGraft::Exec->new(date_format=>$bad);1},'invalid date formatter option is rejected');
+}
+{
+   package DateExportAccountingExec;
+   our @ISA=('JGraft::Exec');
+   sub _export_dates {
+      my $self=shift;
+      local $self->{exporting}=1;
+      return $self->SUPER::_export_dates(@_);
+   }
+   sub _alloc_hash {
+      my $self=shift;
+      ++$self->{export_hashes} if $self->{exporting};
+      return $self->SUPER::_alloc_hash(@_);
+   }
+}
+{
+   my $json=JGraft::JSON->new;
+   my $input=$json->decode('{"date":null,"date":null,"nested":{"date":null,"keep":1}}');
+   my $first=JGraft::Date->new('2024-01-02');
+   my $second=JGraft::Date->new('2025-03-04');
+   my $tie=tied %$input;
+   $tie->{tokens}[1]=$first;
+   $tie->{tokens}[3]=$second;
+   my $nested=$input->{nested};
+   $nested->{date}=$first;
+   my @calls;
+   my $exec=DateExportAccountingExec->new(jgraft=>COPY(NODE(),NODE()),
+      date_format=>sub {push @calls,$_[0]->to_iso8601; $_[0]->to_iso8601});
+   $exec->apply($input);
+   ok($exec->success,'date export preserves the exact-object representation');
+   is($json->encode($exec->output),'{"date":"2024-01-02","date":"2025-03-04","nested":{"date":"2024-01-02","keep":1}}',
+      'date export transforms hidden duplicates as well as visible nested members');
+   is(\@calls,['2024-01-02','2025-03-04'],'date output cache preserves callback order and reuse');
+   is($exec->{export_hashes} || 0,0,'exact date export allocates no ordinary-hash placeholders');
+   is($exec->{scratch_mem},0,'exact date export releases its memo and adapter workspaces');
+   is(refaddr($tie->{tokens}[1]),refaddr($first),'export preserves hidden caller date identity');
+   is(refaddr($tie->{tokens}[3]),refaddr($second),'export preserves visible caller date identity');
+   is(refaddr($nested->{date}),refaddr($first),'export preserves nested caller date identity');
+
+   my $shared={date=>$first};
+   $input={a=>$shared,b=>$shared,untouched=>{keep=>1}};
+   $exec=JGraft::Exec->new(jgraft=>COPY(NODE(),NODE()));
+   $exec->apply($input);
+   ok($exec->success,'memoized date export handles repeated container occurrences');
+   is(refaddr($exec->output->{a}),refaddr($exec->output->{b}),'date export shares the completed memoized container');
+   isnt(refaddr($exec->output->{a}),refaddr($shared),'date export detaches the transformed container');
+   is(refaddr($exec->output->{untouched}),refaddr($input->{untouched}),'date export preserves unmarked subtree sharing');
+   is($exec->{scratch_mem},0,'memoized date export releases its scratch table');
+}
+{
+   my $date=JGraft::Date->new('2024-01-02');
+   my $input={value=>{(map {('k'.$_=>$_)} 1..300),date=>$date}};
+   my ($weak,$active);
+   my $throw=1;
+   my $sentinel=bless {},'DateExportWorkspaceException';
+   my $graft=JGRAFT(COPY(1,'changed'),COPY(NODE('value'),'result'));
+   my $exec=JGraft::Exec->new(jgraft=>$graft,undo=>1,date_format=>sub {
+      $active=$weak->{scratch_mem};
+      die $sentinel if $throw;
+      return $_[0]->to_iso8601;
+   });
+   $weak=$exec; Scalar::Util::weaken($weak);
+   is(refaddr(dies {$exec->apply($input)}),refaddr($sentinel),'date export propagates formatter exceptions');
+   cmp_ok($active,'>',16*300,'export key vectors stay reserved through formatter callbacks');
+   is($exec->{scratch_mem},0,'formatter exception unwinds the memo and active key vectors');
+   is(refaddr($input->{value}{date}),refaddr($date),'formatter exception preserves caller date identity');
+   $throw=0;
+   $exec->apply($input);
+   ok($exec->success,'date export context reusable after formatter exception');
+   is($exec->output->{result}{date},'2024-01-02','reused export rebuilds its cache and memo');
+   is($exec->{scratch_mem},0,'reused date export has no stale workspace');
+
+   my $baseline=JGraft::Exec->new(jgraft=>$graft,undo=>1);
+   $baseline->apply($input);
+   my $limits={mem=>$baseline->counters->{mem}};
+   my $limited=JGraft::Exec->new(jgraft=>$graft,undo=>1,limits=>$limits);
+   $limited->apply($input);
+   is($limited->error,'RESOURCE_LIMIT','date export includes live scratch during retained allocation');
+   is($limited->output->{changed},1,'date export resource failure retains preceding edits');
+   ok(!exists($limited->output->{result}),'date export failure publishes no partial container');
+   is($limited->{scratch_mem},0,'date export resource failure releases its workspace');
+   is(jgexec($limited->undo,$limited->output),$input,'undo restores prior edits after export resource failure');
 }
 done_testing;

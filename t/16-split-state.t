@@ -5,7 +5,7 @@ use Test2AndUtils;
 use JGraft qw(:constructors jgexec);
 use JGraft::Exec;
 use JGraft::_Split;
-use Scalar::Util 'refaddr';
+use Scalar::Util qw(refaddr weaken);
 
 my $spec={sep=>ANY(':','|'),default=>'/',trim=>REP(0,-1,CHARS(' '))};
 my $text=' a :  b |   c ';
@@ -100,4 +100,144 @@ $reuse->apply($text);
 is($reuse->output,$text,'round trip creates metadata');
 $reuse->apply('x:y');
 is($reuse->output,'x:y','new execution resets metadata origins');
+{
+   my @mem;
+   for my $count (1,10) {
+      my $exec=JGraft::Exec->new(jgraft=>COPY(map {(JOIN(',',NODE('parts')),'result')} 1..$count));
+      $exec->apply({parts=>['a','b']});
+      ok($exec->success,'repeated JOIN configuration resolves successfully');
+      is($exec->output->{result},'a,b','JOIN configuration preserves the separator');
+      is($exec->{scratch_mem},0,'consuming JOIN call releases configuration workspace');
+      push @mem,$exec->counters->{mem};
+   }
+   cmp_ok($mem[1]-$mem[0],'>=',9*length('a,b'),'each constructed JOIN string remains retained');
+   cmp_ok($mem[1]-$mem[0],'<=',9*8*length('a,b'),'completed private configurations do not accumulate retained mem');
+}
+{
+   my (@mem,@objects);
+   for my $count (1,25) {
+      my $graft=ATSPLIT(NODE(),$spec,COPY(map {(NODE(0),STASH('sink'))} 1..$count));
+      my $exec=JGraft::Exec->new(jgraft=>$graft,undo=>1);
+      $exec->apply($text);
+      ok($exec->success,'repeated direct references preserve split provenance');
+      is($exec->output,$text,'private element transfers preserve the original formatting');
+      is($exec->{scratch_mem},0,'provenance reservation unwinds after its consuming COPY');
+      push @mem,$exec->counters->{mem};
+      push @objects,$exec->counters->{new_obj};
+      my $count=$exec->counters;
+      is(jgexec($exec->undo,$exec->output),$text,'undo of private provenance transfers restores input');
+      is($exec->counters,$count,'lazy undo does not consume the execution budget');
+   }
+   is($mem[1],$mem[0],'discarded provenance records do not accumulate retained memory');
+   is($objects[1],$objects[0],'provenance lifetime does not alter value allocation counts');
+}
+{
+   my $input={text=>$text,items=>['left','right']};
+   my $graft=JGRAFT(COPY(1,'before',SPLIT($spec,NODE('text')),STASH('parts')),
+      MOVE(NODE('items',0),undef,STASH('parts',2),NODE('items',2)));
+   my $exec=JGraft::Exec->new(jgraft=>$graft,undo=>1);
+   my $put=JGraft::Exec->can('_set_member');
+   my $seen=0;
+   {
+      no warnings 'redefine';
+      local *JGraft::Exec::_set_member=sub {
+         my ($self,$array,$key,$value,$source)=@_;
+         if (refaddr($self)==refaddr($exec) && $source && ref($array) eq 'ARRAY' && $value eq 'c') {
+            ++$seen;
+            cmp_ok($self->{scratch_mem},'>',0,'destination allocation sees live source workspace');
+            $self->{limits}{mem}=$self->counters->{mem}+$self->{scratch_mem};
+         }
+         return $put->(@_);
+      };
+      $exec->apply($input);
+   }
+   is($seen,1,'resource failure occurs while consuming direct-reference provenance');
+   is($exec->error,'RESOURCE_LIMIT','retained growth checks memory including live provenance');
+   is($exec->output,{text=>$text,items=>['right'],before=>1},'MOVE finalizes earlier deletion after provenance failure');
+   is($input,{text=>$text,items=>['left','right']},'failed provenance transfer leaves caller input unchanged');
+   is($exec->{scratch_mem},0,'MOVE failure releases source and path workspace');
+   my $count=$exec->counters;
+   my $undo=$exec->undo;
+   is($exec->counters,$count,'partial undo leaves failed execution counters unchanged');
+   is(jgexec($undo->to_json_data,$exec->output),$input,'serialized undo restores the finalized partial MOVE');
+   $exec->{limits}{mem}=undef;
+   $exec->apply($input);
+   ok($exec->success,'context reuse clears the provenance failure');
+   is($exec->output->{items},['right','c'],'reuse performs the requested element transfer');
+   is($exec->{scratch_mem},0,'successful reuse releases provenance workspace');
+}
+{
+   my $many=join(':',(' x ')x100);
+   my @prepare=(COPY(1,'before',SPLIT($spec,NODE('text')),STASH('parts')),
+      COPY(STASH('parts'),STASH('saved')));
+   for my $case (
+      ['_copy_meta',MAP(NODE(),STASH('parts'))],
+      ['_copy_meta',FILTER(STR(),STASH('parts'))],
+      ['_append_meta',CONCAT(STASH('parts'),STASH('parts'))],
+   ) {
+      my ($method,$expr)=@$case;
+      my $graft=JGRAFT(@prepare,COPY($expr,STASH('result')));
+      my $input={text=>$many};
+      my $exec=JGraft::Exec->new(jgraft=>$graft,undo=>1);
+      my $required;
+      our $active;
+      my $helper=JGraft::_Split->can($method);
+      my $scratch=JGraft::Exec->can('_scratch_set');
+      {
+         no warnings 'redefine';
+         no strict 'refs';
+         local *{"JGraft::_Split::$method"}=sub {
+            local $active=1;
+            return $helper->(@_);
+         };
+         local *JGraft::Exec::_scratch_set=sub {
+            my ($self,$base,$bytes)=@_;
+            $required=$self->counters->{mem}+$base+$bytes if $active && !defined($required);
+            return $scratch->(@_);
+         };
+         $exec->apply($input);
+      }
+      ok($exec->success,"$method baseline succeeds");
+      ok(defined($required),"$method reserves its copy workspace");
+      my $limited=JGraft::Exec->new(jgraft=>$graft,undo=>1,limits=>{mem=>$required-1});
+      $limited->apply($input);
+      is($limited->error,'RESOURCE_LIMIT',"$method rejects insufficient copy workspace");
+      like($limited->message,qr/scratch/,"$method fails while reserving temporary storage");
+      is($limited->output,{text=>$many,before=>1},"$method failure preserves prior edits");
+      is($limited->{scratch_mem},0,"$method failure unwinds workspace");
+      is(jgexec($limited->undo->to_json_data,$limited->output),$input,"$method partial undo restores input");
+      is($input,{text=>$many},"$method failure preserves caller input");
+      $limited->{limits}{mem}=undef;
+      $limited->apply($input);
+      ok($limited->success,"$method context can be reused after failure");
+   }
+}
+{
+   my $meta=JGraft::Exec->can('_split_meta');
+   my (@owners,@metadata);
+   my $called=0;
+   my $exec=JGraft::Exec->new(jgraft=>JGRAFT(
+      COPY(SPLIT($spec,' a :  b '),STASH('parts')),COPY(undef,STASH('parts')),
+      COPY(CASTDATE('2024-01-02'),'date')),date_format=>sub {
+         ++$called;
+         ok(@owners && !grep(defined($_),@owners),'discarded split owners die before application cleanup');
+         return 'formatted';
+      });
+   {
+      no warnings 'redefine';
+      local *JGraft::Exec::_split_meta=sub {
+         if (@_>2 && defined($_[2])) {
+            push @owners,$_[1];
+            weaken($owners[-1]);
+            push @metadata,$_[2];
+         }
+         return $meta->(@_);
+      };
+      $exec->apply({});
+   }
+   ok($exec->success,'metadata owner lifetime does not affect later execution');
+   is($called,1,'later formatter observes the discarded split owner');
+   ok(!grep(exists($_->{array}),@metadata),'split metadata has no owner back-reference');
+   is($exec->output,{date=>'formatted'},'discarding split metadata leaves public output unchanged');
+}
 done_testing;

@@ -5,6 +5,7 @@ use strict;
 use warnings;
 use Carp 'croak';
 use JGraft::Util 'to_rational';
+our $EXEC;
 use overload
    '""'=>sub { $_[0]{token} },
    '0+'=>sub { 0+$_[0]{token} },
@@ -29,6 +30,9 @@ sub value {
    my $s=shift;
    return $s->{value}->copy if ref $s->{value};
    return $s->{value} if exists $s->{value};
+   my $scratch_base=$EXEC?$EXEC->{scratch_mem}:0;
+   local $EXEC->{scratch_mem}=$scratch_base if $EXEC;
+   $EXEC->_scratch_set($scratch_base,128+4*length($s->{token})) if $EXEC;
    my ($mantissa,$exp)=split /[eE]/,$s->{token},2;
    my $digits=length($mantissa);
    # Compare exponents as strings before coercing: an exponent can itself have
@@ -38,7 +42,12 @@ sub value {
    $magnitude =~ s/^0+//;
    if ($s->{max_number_digits} && (length($magnitude)>9 || $digits+($magnitude||0)>$s->{max_number_digits})) {
       croak 'JSON number exceeds max_number_digits' if $s->{number_overflow} eq 'reject';
+      $EXEC->_reserve(1+length($s->{token})*.001,64,0) if $EXEC;
       return $s->{value}=0+$s->{token};
+   }
+   if ($EXEC) {
+      my $size=JGraft::Util::estimate_number_digits($s);
+      $EXEC->_reserve(1+$size*$size*.01,256+16*$size,1);
    }
    require Math::BigRat;
    local ($Math::BigRat::accuracy,$Math::BigRat::precision);
@@ -71,7 +80,8 @@ so arithmetic cannot modify the token or its cached value. Arithmetic overloads
 also use exact rationals. Native numeric coercion necessarily uses Perl's numeric
 range and precision. C<0 + $number> uses the exact addition
 overload, just like other addition expressions; C<value> is the explicit accessor
-for its rational value.
+for its rational value. During execution, creating its persistent cache is a
+retained allocation; private conversion copies use their caller's workspace.
 
 =constructor new
 

@@ -148,7 +148,10 @@ sub _point {
       return $cp unless $exec && exists($exec->{options}{codepoint_policy})
          && (ref($exec->{options}{codepoint_policy}) || $exec->{options}{codepoint_policy} ne 'preserve');
       require JGraft::_String;
-      return JGraft::_String->_new($exec,$v,'character class')->_at(0);
+      my $scratch_base=$exec->{scratch_mem};
+      local $exec->{scratch_mem}=$scratch_base;
+      $exec->_scratch_set($scratch_base,JGraft::_String->_workspace($v));
+      return JGraft::_String->_new($exec,$v,'character class',undef,1)->_at(0);
    }
    return;
 }
@@ -158,15 +161,20 @@ sub _bad {
    JGraft::_Node::_bad($message);
 }
 sub _charge {
-   my ($exec,$n)=@_;
+   my ($exec,$n,$workspace)=@_;
    return unless $exec;
-   $exec->_step($n+1); $exec->_charge('mem',64+16*$n);
+   $exec->_tick($n+1);
+   if ($workspace) {
+      $workspace->[1]+=64+16*$n;
+      $exec->_scratch_set(@$workspace);
+   }
+   else { $exec->_reserve(0,64+16*$n,0) }
 }
 # Every interval is [start, limit), within the closed Unicode universe. Lists
 # have even length, sorted boundaries, and no adjacent or overlapping intervals.
 sub _combine {
-   my ($a,$b,$subtract,$exec)=@_;
-   _charge($exec,@$a+@$b);
+   my ($a,$b,$subtract,$exec,$workspace)=@_;
+   _charge($exec,@$a+@$b,$workspace);
    my ($i,$j,$in_a,$in_b,$included)=(0,0,0,0,0);
    my @out;
    while ($i<@$a || $j<@$b) {
@@ -180,9 +188,9 @@ sub _combine {
 }
 sub _complement { _combine([0,0x110000],$_[0],1,$_[1]) }
 sub _ranges {
-   my ($pairs,$exec)=@_;
+   my ($pairs,$exec,$workspace)=@_;
    my $n=@$pairs;
-   if ($exec) { $exec->_step($n*log($n+1)/log(2)); _charge($exec,2*$n) }
+   if ($exec) { $exec->_tick($n*log($n+1)/log(2)); _charge($exec,2*$n,$workspace) }
    my @pairs=sort {$a->[0]<=>$b->[0] || $a->[1]<=>$b->[1]} @$pairs;
    my @out;
    for my $pair (@pairs) {
@@ -195,26 +203,41 @@ sub _ranges {
    return \@out;
 }
 sub _compile {
-   my ($self,$exec,$depth)=@_;
-   $exec->_depth($depth); $exec->_step(1);
+   my ($self,$exec,$depth,$workspace)=@_;
+   $exec->_enter($depth);
    my $cache=$exec->{char_classes};
    my $id=refaddr($self);
    return $cache->{$id}[1] if $cache->{$id};
    my $policy=$exec->{options}{codepoint_policy} || 'preserve';
    if (exists($self->{_invlist}) && !ref($policy) && $policy eq 'preserve') {
-      $exec->_step(scalar @{$self->{_invlist}}); $exec->_charge('mem',64);
+      $exec->_tick(scalar @{$self->{_invlist}}); $exec->_reserve(0,64,0);
       return ($cache->{$id}=[$self,_freeze($self->{_invlist})])->[1];
    }
-   my ($inv,$static)=$self->_build($exec,$depth);
-   $cache->{$id}=[$self,$inv] if $static;
+   my ($inv,$static)=$self->_build($exec,$depth,$workspace);
+   if ($static) { $exec->_reserve(0,64,0); $cache->{$id}=[$self,$inv] }
    return $inv;
 }
 sub _build {
-   my ($self,$exec,$depth)=@_;
+   my ($self,$exec,$depth,$workspace)=@_;
    my $entries=$self->entries;
-   _charge($exec,scalar @$entries);
+   $workspace ||= [0,0]; # Unmetered public invlist/regexp construction.
+   my $floor=$workspace->[1];
+   $exec->_tick(1+@$entries) if $exec;
+   # Trailing switches do not change the completed set. Only its last combine
+   # can escape into the application cache; all earlier builds are workspace.
+   my $last=$#$entries;
+   while ($last>=0 && type_mask($entries->[$last])==TYPE_BOOLEAN) {
+      $exec->_tick(1) if $exec;
+      --$last;
+   }
+   $exec->_reserve(0,96,0) if $exec && $last<0;
    my ($inv,$include,$static)=([],1,1);
+   my $retained=$last<0;
    for (my $i=0;$i<@$entries;++$i) {
+      if ($exec) {
+         $workspace->[1]=$floor+256+($retained?0:16*@$inv);
+         $exec->_scratch_set(@$workspace);
+      }
       my $v=$entries->[$i];
       my $type=type_mask($v);
       if ($type==TYPE_BOOLEAN) {
@@ -227,13 +250,13 @@ sub _build {
          _bad($exec,'CHARS requires an execution scope to resolve EXPR') unless $exec;
          $static=0;
          my $alias_depth=$depth;
-         $v->_name eq 'EXPR' or _bad($exec,'CHARS requires a common CHARS expression');
-         while (is_expr($v) && $v->_name eq 'EXPR') {
-            $exec->_depth(++$alias_depth); $exec->_step(1);
+         $v->name eq 'EXPR' or _bad($exec,'CHARS requires a common CHARS expression');
+         while (is_expr($v) && $v->name eq 'EXPR') {
+            $exec->_enter(++$alias_depth);
             $v=$exec->_macro($v,$alias_depth);
          }
-         is_expr($v) && $v->_name eq 'CHARS' or _bad($exec,'CHARS alias must resolve to CHARS');
-         $part=$v->_compile($exec,$alias_depth+1);
+         is_expr($v) && $v->name eq 'CHARS' or _bad($exec,'CHARS alias must resolve to CHARS');
+         $part=$v->_compile($exec,$alias_depth+1,$workspace);
       }
       else {
          my $lo=_point($exec,$v);
@@ -245,10 +268,12 @@ sub _build {
          }
          elsif ($type==TYPE_STRING) {
             my @pairs;
-            _charge($exec,4*length($v));
+            $exec->_tick(4*length($v)+1) if $exec;
             if ($exec) {
                require JGraft::_String;
-               my $view=JGraft::_String->_new($exec,$v,'character class');
+               $workspace->[1]+=144*length($v)+JGraft::_String->_workspace($v);
+               $exec->_scratch_set(@$workspace);
+               my $view=JGraft::_String->_new($exec,$v,'character class',undef,1);
                for my $at (0..$view->{size}-1) { my $cp=$view->_at($at); push @pairs,[$cp,$cp] }
             }
             else {
@@ -257,11 +282,12 @@ sub _build {
                   push @pairs,[$cp,$cp];
                }
             }
-            $part=_ranges(\@pairs,$exec);
+            $part=_ranges(\@pairs,$exec,$workspace);
          }
          else { _bad($exec,'Invalid CHARS entry') }
       }
-      $inv=_combine($inv,$part,!$include,$exec);
+      $retained=$i==$last && $static;
+      $inv=_combine($inv,$part,!$include,$exec,$retained?undef:$workspace);
    }
    return ($inv,$static);
 }
@@ -269,7 +295,7 @@ sub _contains {
    my ($inv,$cp,$exec)=@_;
    my ($lo,$hi)=(0,scalar @$inv);
    while ($lo<$hi) {
-      $exec->_step(1) if $exec;
+      $exec->_tick(1) if $exec;
       my $mid=int(($lo+$hi)/2);
       if ($inv->[$mid]<=$cp) { $lo=$mid+1 } else { $hi=$mid }
    }
@@ -277,7 +303,11 @@ sub _contains {
 }
 sub _test {
    my ($self,$exec,$cursor,$depth)=@_;
-   my $inv=$self->_compile($exec,$depth);
+   my $scratch_base=$exec->{scratch_mem};
+   local $exec->{scratch_mem}=$scratch_base;
+   # Alias-dependent lists cannot enter the cache. Their returned workspace
+   # remains covered here, including recursive inclusions, through membership.
+   my $inv=$self->_compile($exec,$depth,[$scratch_base,0]);
    return 0 unless $cursor->{exists};
    my $type=type_mask($cursor->{value});
    return 0 unless $type==TYPE_STRING || ($type==TYPE_NUMBER && is_integer($cursor->{value}) && $cursor->{value}>=0 && $cursor->{value}<=0x10ffff);

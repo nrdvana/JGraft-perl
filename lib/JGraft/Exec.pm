@@ -5,8 +5,9 @@ use strict;
 use warnings;
 no warnings 'recursion';
 use Carp 'croak';
-use Scalar::Util qw(blessed refaddr weaken);
+use Scalar::Util qw(blessed refaddr);
 use JSON::PP ();
+use JGraft::_ExecStore;
 use JGraft::Util qw(:types type_mask is_finite is_integer is_expr is_action);
 use overload '""' => 'as_string', 'bool' => sub { 1 }, fallback => 1;
 
@@ -50,6 +51,8 @@ sub undo {
    @_ == 0 or croak 'undo takes no arguments';
    return $self->{undo} if exists $self->{undo};
    my $state=$self->{undo_state} or return;
+   local $JGraft::JSON::Object::EXEC;
+   local $JGraft::JSON::Number::EXEC;
    my $graft=$state->_build;
    $self->{undo}=$graft;
    delete $self->{undo_state};
@@ -63,39 +66,24 @@ sub apply {
    @_ <= 1 or croak 'Expected at most one input value';
    @_ || exists $self->{options}{input} or croak 'No input provided';
    my $input= @_? $_[0] : $self->{options}{input};
-   delete @{$self}{qw(error message diagnostic success undo output)};
-   $self->{count}= {ops=>0,mem=>0,new_obj=>0,depth=>0};
-   $self->{logs}= [];
-   $self->{owned}= {};
-   $self->{lineage}= {};
-   delete $self->{undo_state};
-   $self->{pending}= {};
-   $self->{regex_literals}= {};
-   $self->{char_classes}= {};
-   $self->{split_meta}= {};
-   $self->{split_origin}= 0;
-   $self->{dates}= {};
-   $self->{date_containers}= {};
-   $self->{date_output}= {};
-   $self->{epoch}= 1;
-   $self->{root}= [$input,1];
-   $self->{current}= [$self->{root},[]];
+   $self->_init_application($input);
    my $ok= eval {
       local $JGraft::JSON::Object::EXEC=$self;
+      local $JGraft::JSON::Number::EXEC=$self;
       local ($Math::BigRat::accuracy,$Math::BigRat::precision);
       if ($self->{options}{undo}) {
          require JGraft::_Undo;
          $self->{undo_state}= JGraft::_Undo->_new($self,$input);
-         $self->_charge('mem',192);
+         $self->_reserve(0,192,0);
       }
-      $self->_inspect($input,1,{},0,0);
-      $self->{temp}= [$self->_new_hash(0),1];
-      $self->{stash}= [$self->_new_hash(0),1];
-      $self->{const}= [$self->_new_hash(0),1];
-      $self->{expr}= [$self->_new_hash(0),1];
-      $self->{cap}= [$self->_new_hash(0),1];
+      $self->_inspect_tree($input,0,0);
+      $self->{temp}= [$self->_alloc_hash(0),1];
+      $self->{stash}= [$self->_alloc_hash(0),1];
+      $self->{const}= [$self->_alloc_hash(0),1];
+      $self->{expr}= [$self->_alloc_hash(0),1];
+      $self->{cap}= [$self->_alloc_hash(0),1];
       my $graft= $self->{options}{jgraft};
-      $self->_inspect($graft,1,{},1,!is_action($graft));
+      $self->_inspect_tree($graft,1,!is_action($graft));
       unless (is_action($graft)) {
          require JGraft;
          my $parsed= eval { JGraft::jgparse($graft) };
@@ -113,12 +101,47 @@ sub apply {
    my $err=$@;
    $self->{undo_state}{output}= $ok? $self->{output}
       : $self->{root}[1]? $self->{root}[0] : undef if $self->{undo_state};
+   my $expected=$ok || blessed($err) && refaddr($err)==refaddr($self);
+   $self->{output}=$self->{root}[0] if !$ok && $expected && $self->{root}[1];
+   $self->_release_application;
    unless ($ok) {
-      die $err unless blessed($err) && refaddr($err) == refaddr($self);
-      $self->{output}= $self->{root}[0] if $self->{root}[1];
+      die $err unless $expected;
       return;
    }
    return $self->{output};
+}
+
+sub _init_application {
+   my ($self,$input)=@_;
+   delete @{$self}{qw(error message diagnostic success undo output)};
+   delete $self->{path_remap};
+   $self->{count}= {ops=>0,mem=>0,new_obj=>0,depth=>0};
+   $self->{scratch_mem}=0;
+   $self->{logs}= [];
+   $self->{containers}= {};
+   $self->{next_container_id}=0;
+   delete $self->{undo_state};
+   $self->{move_batch}= [];
+   $self->{regex_literals}= {};
+   $self->{char_classes}= {};
+   $self->{has_split}=0;
+   $self->{split_origin}= 0;
+   $self->{dates}= {};
+   $self->{date_output}= {};
+   $self->{epoch}= 1;
+   $self->{revision}=0;
+   $self->{root}= [$input,1];
+   $self->{current}= [$self->{root},[]];
+}
+
+sub _release_application {
+   my $self=shift;
+   delete @{$self}{qw(temp stash const expr cap containers dates date_output
+      regex_literals char_classes move_batch has_split split_origin path_remap)};
+   # Keep the stable root cell usable by diagnostics/private budget helpers,
+   # without retaining the pre-clone result or a discarded original tree.
+   @{$self->{root}}=exists($self->{output})?($self->{output},1):(undef,0);
+   $self->{current}=[$self->{root},[]];
 }
 
 sub _fail {
@@ -130,178 +153,12 @@ sub _fail {
    $self->{diagnostic}{cause}=$cause if defined $cause;
    die $self;
 }
-sub _charge {
-   my ($self,$key,$amount)= @_;
-   if (ref $amount) { $amount=JGraft::Util::to_native_number($amount) }
-   $self->{count}{$key} += $amount;
-   my $limit= $self->{limits}{$key};
-   !defined $limit || $self->{count}{$key} <= $limit
-      or $self->_fail('RESOURCE_LIMIT',"$key limit exceeded");
-}
-sub _step { $_[0]->_charge('ops',$_[1]) }
-sub _depth {
-   my ($self,$depth)= @_;
-   if ($depth > $self->{count}{depth}) {
-      $self->_charge('depth',$depth-$self->{count}{depth});
-   }
-}
-sub _allocation {
-   my ($self,$bytes)= @_;
-   $self->_charge('new_obj',1);
-   $self->_charge('mem',$bytes+64);
-}
-sub _own {
-   my ($s,$v)=@_;
-   my $id=refaddr($v);
-   $s->{owned}{$id}=$s->{epoch};
-   if ($s->{undo_state}) {
-      $s->_charge('mem',32);
-      $s->{lineage}{$id}=$id;
-   }
-   $v;
-}
-sub _new_hash { my ($s,$n)=@_;$s->_allocation(128+64*$n);$s->_own({}) }
-sub _new_array { my ($s,$n)=@_;$s->_allocation(80+16*$n);$s->_own([]) }
-
-sub _inspect {
-   my ($self,$v,$depth,$active,$ast,$alloc)= @_;
-   $self->_depth($depth);
-   $self->_step(1);
-   if ($ast && (is_action($v) || is_expr($v))) {
-      my $id= refaddr($v);
-      $active->{$id} and $self->_fail('INVALID_GRAFT','Cyclic graft');
-      local $active->{$id}=1;
-      my @keys= grep $_ ne '_form', keys %$v;
-      $self->_step(scalar @keys);
-      $self->_inspect($v->{$_},$depth+1,$active,1,$alloc) for @keys;
-      return;
-   }
-   my $type= type_mask($v);
-   if ($type==TYPE_DATE) { $self->_date($v); return }
-   if (!ref $v || JSON::PP::is_bool($v) || $type==TYPE_NUMBER || $type==TYPE_STRING) {
-      $self->_step(length($v)*.001) if $type == TYPE_STRING;
-      $self->_check_string($v,$ast?'graft':'input') if $type == TYPE_STRING;
-      $type != TYPE_NUMBER || is_finite($v) or $self->_fail('UNSUPPORTED_GRAFT','Non-finite input number');
-      if ($type==TYPE_NUMBER && ref $v) {
-         $self->_step(length($v->isa('JGraft::JSON::Number')?$v->token:$v->isa('Math::BigFloat')?$v->bsstr:$v->bstr));
-      }
-      return;
-   }
-   ref($v) eq 'ARRAY' || ref($v) eq 'HASH' or $self->_fail('UNSUPPORTED_GRAFT','Unsupported data reference '.ref($v));
-   my $id=refaddr($v);
-   $active->{$id} and $self->_fail($ast?'INVALID_GRAFT':'INVALID_TARGET','Cyclic data');
-   local $active->{$id}=1;
-   my $n= $type==TYPE_ARRAY? scalar @$v : scalar keys %$v;
-   if (!$ast && $self->{undo_state} && !$self->{undo_state}{original_ids}{$id}) {
-      $self->_charge('mem',32);
-      $self->{undo_state}{original_ids}{$id}=1;
-   }
-   $self->_step($n);
-   $self->_allocation(($type==TYPE_ARRAY?80:128)+($type==TYPE_ARRAY?16:64)*$n) if $alloc;
-   if ($type==TYPE_ARRAY) {
-      for my $i (0..$#$v) {
-         exists $v->[$i] or $self->_fail('UNSUPPORTED_GRAFT','Sparse input arrays are not JSON data');
-         $self->_inspect($v->[$i],$depth+1,$active,$ast,$alloc);
-         $self->_mark_date_container($v) if $self->_contains_date($v->[$i]);
-      }
-   }
-   else {
-      my $tie=tied %$v;
-      if ($tie && $tie->isa('JGraft::JSON::Object')) {
-         for my $i ($tie->_members) {
-            $self->_check_string($tie->{tokens}[$i],$ast?'graft key':'input key');
-            $self->_inspect($tie->{tokens}[$i+1],$depth+1,$active,$ast,$alloc);
-            $self->_mark_date_container($v) if $self->_contains_date($tie->{tokens}[$i+1]);
-         }
-         return;
-      }
-      for my $key (keys %$v) {
-         $self->_step(length($key)*.001);
-         $self->_check_string($key,$ast?'graft key':'input key');
-         $self->_inspect($v->{$key},$depth+1,$active,$ast,$alloc);
-         $self->_mark_date_container($v) if $self->_contains_date($v->{$key});
-      }
-   }
-}
-
-sub _check_string {
-   my ($self,$value,$kind)=@_;
-   require JGraft::_String;
-   JGraft::_String->_check($self,$value,$kind);
-}
-
-sub _cow {
-   my ($self,$v)= @_;
-   return $v if ($self->{owned}{refaddr($v)} || 0) == $self->{epoch};
-   if (ref $v eq 'ARRAY') {
-      my $copy=$self->_new_array(scalar @$v);
-      $self->_step(scalar @$v);
-      @$copy=@$v;
-      $self->_mark_date_container($copy) if $self->{date_containers}{refaddr($v)};
-      JGraft::_Split->_copy_meta($self,$v,$copy,0,scalar @$v) if $self->{split_meta}{refaddr($v)};
-      $self->{lineage}{refaddr($copy)}=$self->{lineage}{refaddr($v)} || refaddr($v) if $self->{undo_state};
-      return $copy;
-   }
-   my $tie=tied %$v;
-   my $copy;
-   if ($tie && $tie->isa('JGraft::JSON::Object')) { $copy=$self->_own($tie->_clone) }
-   else {
-      $copy=$self->_new_hash(scalar keys %$v);
-      $self->_step(scalar keys %$v);
-      %$copy=%$v;
-   }
-   $self->_mark_date_container($copy) if $self->{date_containers}{refaddr($v)};
-   $self->{lineage}{refaddr($copy)}=$self->{lineage}{refaddr($v)} || refaddr($v) if $self->{undo_state};
-   return $copy;
-}
-sub _snapshot {
-   my ($self,$v)= @_;
-   # Existing owned descendants can occur anywhere in a logical copy. Freezing
-   # the generation avoids traversing that subtree to invalidate ownership.
-   ++$self->{epoch} if ref($v) eq 'ARRAY' || ref($v) eq 'HASH';
-   return $v;
-}
-sub _clone_tree {
-   my ($self,$v,$depth)= @_;
-   $self->_depth($depth);
-   $self->_step(1);
-   if (blessed($v) && $v->isa('DateTime')) { $self->_allocation(256); return $v->clone }
-   if (blessed($v) && type_mask($v)==TYPE_NUMBER && !$v->isa('JGraft::JSON::Number')) {
-      $self->_allocation(128+4*length($v->isa('Math::BigFloat')?$v->bsstr:$v->bstr));
-      return $v->copy;
-   }
-   return $v unless ref $v eq 'ARRAY' || ref $v eq 'HASH';
-   if (ref $v eq 'ARRAY') {
-      my $out=$self->_new_array(scalar @$v);
-      $self->{lineage}{refaddr($out)}=$self->{lineage}{refaddr($v)} || refaddr($v) if $self->{undo_state};
-      $self->_step(scalar @$v);
-      for my $i (0..$#$v) { $out->[$i]=$self->_clone_tree($v->[$i],$depth+1) }
-      $self->_mark_date_container($out) if $self->{date_containers}{refaddr($v)};
-      JGraft::_Split->_copy_meta($self,$v,$out,0,scalar @$v) if $self->{split_meta}{refaddr($v)};
-      return $out;
-   }
-   my $tie=tied %$v;
-   my $out;
-   if ($tie && $tie->isa('JGraft::JSON::Object')) {
-      $out=$self->_own($tie->_clone(sub { $self->_clone_tree($_[0],$depth+1) }));
-   }
-   else {
-      $out=$self->_new_hash(scalar keys %$v);
-      $self->_step(scalar keys %$v);
-      $out->{$_}=$self->_clone_tree($v->{$_},$depth+1) for keys %$v;
-   }
-   $self->{lineage}{refaddr($out)}=$self->{lineage}{refaddr($v)} || refaddr($v) if $self->{undo_state};
-   $self->_mark_date_container($out) if $self->{date_containers}{refaddr($v)};
-   return $out;
-}
-
 sub _run {
    my ($self,$action,$depth)= @_;
-   $self->_depth($depth);
-   $self->_step(1);
+   $self->_enter($depth);
    is_action($action) or $self->_fail('INVALID_GRAFT','Expected an action object');
    local $self->{action}=$action;
-   local $self->{temp}=[$self->_new_hash(0),1];
+   local $self->{temp}=[$self->_alloc_hash(0),1];
    return $action->_execute($self,$depth);
 }
 
@@ -309,504 +166,173 @@ sub _run {
 # module, with per-action context and TEMP lifetime managed by _run above.
 sub JGraft::Action::_execute {
    my ($action,$self)= @_;
-   $self->_fail('UNSUPPORTED_GRAFT','Action '.$action->_name.' is not implemented');
+   $self->_fail('UNSUPPORTED_GRAFT','Action '.$action->name.' is not implemented');
 }
 sub JGraft::Action::JGRAFT::_execute {
    my ($action,$self,$depth)= @_;
-   my $meta=$action->metadata;
+   my $meta=$action->{metadata};
    if (exists $meta->{v} && $meta->{v}>1) { $self->_fail('UNSUPPORTED_GRAFT','Unsupported JGraft version') }
    local $self->{const}= $self->{const};
    local $self->{expr}= $self->{expr};
    for my $ns ('const','expr') {
       next unless exists $meta->{$ns};
-      my $copy=$self->_new_hash(scalar keys %{$self->{$ns}[0]});
-      $self->_step(scalar keys %{$self->{$ns}[0]});
-      %$copy=%{$self->{$ns}[0]};
+      my $copy=$self->_copy_hash($self->{$ns}[0]);
       $self->{$ns}=[$copy,1];
       my $defs=$meta->{$ns};
-      $self->_step(scalar @$defs);
+      $self->_tick(scalar @$defs);
       for (my $i=0;$i<@$defs;$i+=2) {
          my $key=$defs->[$i];
          $key="$key";
          my $v=$ns eq 'const'? $self->_eval($defs->[$i+1],$depth+1) : $defs->[$i+1];
-         $self->_snapshot($v) if $ns eq 'const';
-         $self->_write([$self->{$ns},[$key]],$v);
+         $self->_publish($v) if $ns eq 'const';
+         $self->_assign([$self->{$ns},[$key]],$v);
       }
    }
-   local $self->{stash}=[$self->_new_hash(0),1];
-   $self->_step(scalar @{$action->actions});
-   $self->_run($_,$depth+1) for @{$action->actions};
+   local $self->{stash}=[$self->_alloc_hash(0),1];
+   $self->_tick(scalar @{$action->{actions}});
+   $self->_run($_,$depth+1) for @{$action->{actions}};
 }
 sub JGraft::Action::MATCH::_execute {
    my ($action,$self,$depth)= @_;
-   my $match=$self->_match($action->match_spec,$depth+1,1);
-   $match or $self->_fail('NO_MATCH','Current node does not match');
-   local $self->{cap}=[$match->{captures},1];
-   $self->_step(scalar @{$action->actions});
-   $self->_run($_,$depth+1) for @{$action->actions};
+   my $captures=$self->_match($action->{match_spec},$depth+1,1);
+   $captures or $self->_fail('NO_MATCH','Current node does not match');
+   local $self->{cap}=[$captures,1];
+   $self->_tick(scalar @{$action->{actions}});
+   $self->_run($_,$depth+1) for @{$action->{actions}};
 }
 sub JGraft::Action::IF::_execute {
    my ($action,$self,$depth)= @_;
-   $self->_step(scalar @{$action->branches});
-   for my $branch (@{$action->branches}) {
-      my $match=$self->_match($branch->[0],$depth+1,1);
-      next unless $match;
-      local $self->{cap}=[$match->{captures},1];
+   $self->_tick(scalar @{$action->{branches}});
+   for my $branch (@{$action->{branches}}) {
+      my $captures=$self->_match($branch->[0],$depth+1,1);
+      next unless $captures;
+      local $self->{cap}=[$captures,1];
       $self->_run($branch->[1],$depth+1);
       return;
    }
-   $self->_run($action->else_action,$depth+1) if exists $action->{else_action};
+   $self->_run($action->{else_action},$depth+1) if exists $action->{else_action};
 }
 sub JGraft::Action::AT::_execute {
    my ($action,$self,$depth)= @_;
-   my $loc=$self->_path($action->path,'at',$depth+1);
-   my ($v,$canonical)=$self->_read($loc);
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   local $self->{path_workspace}=[$scratch_base,0];
+   my $loc=$self->_expand_path($action->{path},'at',$depth+1);
+   my $canonical=$self->_resolve($loc,'read')->{location};
    local $self->{current}=$canonical;
-   $self->_step(scalar @{$action->actions});
-   $self->_run($_,$depth+1) for @{$action->actions};
+   $self->_tick(scalar @{$action->{actions}});
+   $self->_run($_,$depth+1) for @{$action->{actions}};
 }
 sub JGraft::Action::COPY::_execute {
    my ($action,$self,$depth)= @_;
-   my $pairs=$action->assignments;
-   $self->_step(scalar @$pairs);
+   my $pairs=$action->{assignments};
+   $self->_tick(scalar @$pairs);
    for my $pair (@$pairs) {
-      my ($v,$metadata)=$self->_value_source($pair->[0],$depth+1);
+      my $scratch_base=$self->{scratch_mem};
+      local $self->{scratch_mem}=$scratch_base;
+      local $self->{path_workspace}=[$scratch_base,0];
+      $self->_path_scratch(128); # Element provenance survives source evaluation.
+      my $metadata;
+      my $v=$self->_eval($pair->[0],$depth+1,\$metadata);
       # Keep the value stable even if destination expressions read from it.
-      $self->_snapshot($v);
-      my $loc=$self->_path($pair->[1],'write',$depth+1);
-      my $dest=$self->_probe($loc,undef,0);
-      $self->_write($dest,$v,$metadata);
+      $self->_publish($v);
+      my $loc=$self->_expand_path($pair->[1],'write',$depth+1);
+      my $dest=$self->_resolve($loc,'write');
+      $self->_assign($dest,$v,$metadata);
    }
 }
 sub JGraft::Action::MOVE::_execute {
    my ($action,$self,$depth)= @_;
-   return $self->_move($action->moves,$depth+1);
+   return $self->_move($action->{moves},$depth+1);
 }
 sub JGraft::Action::RAISE::_execute {
    no warnings 'utf8';
    my ($action,$self,$depth)=@_;
-   my $message=$self->_eval($action->message,$depth+1);
+   my $message=$self->_eval($action->{message},$depth+1);
    type_mask($message)==TYPE_STRING or $self->_fail('INVALID_TARGET','RAISE message must be a string');
-   $self->_step(length($message));
+   $self->_tick(length($message));
    while ($message =~ /(.)/gs) {
       my $cp=ord($1);
       ($cp<32 || ($cp>=127 && $cp<=159) || ($cp>=0xd800 && $cp<=0xdfff)
          || ($cp>=0xfdd0 && $cp<=0xfdef) || ($cp & 0xffff)>=0xfffe)
          and $self->_fail('INVALID_TARGET','RAISE message contains a forbidden character');
    }
-   my $level=$action->level;
+   my $level=$action->{level};
    $level={info=>0,warn=>1,fail=>2}->{$level} if type_mask($level)==TYPE_STRING;
-   my $entry=$self->_new_hash(exists($action->{data})?3:2);
+   my $entry=$self->_alloc_hash(exists($action->{data})?3:2);
    @$entry{qw(level message)}=($level,$message);
    if (exists $action->{data}) {
-      my $data=$self->_export_dates($self->_eval($action->data,$depth+1),$depth+1,{});
-      $entry->{data}=$self->_snapshot($data);
+      $entry->{data}=$self->_publish($self->_eval($action->{data},$depth+1),1,$depth+1);
    }
-   $self->_charge('mem',16+4*length($message));
+   $self->_reserve(0,16+4*length($message),0);
    push @{$self->{logs}},$entry;
    $self->_fail('NO_MATCH',$message) if $level==2;
 }
 sub JGraft::Action::SPLICE::_execute {
    my ($action,$self,$depth)=@_;
-   my $loc=$self->_path($action->array_elem_path,'write',$depth+1);
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   local $self->{path_workspace}=[$scratch_base,0];
+   my $loc=$self->_expand_path($action->{array_elem_path},'write',$depth+1);
    @{$loc->[1]} or $self->_fail('INVALID_TARGET','SPLICE requires an array element path');
-   my @parts=@{$loc->[1]};
-   my $last=pop @parts;
-   my ($array,$parent_loc)=$self->_read([$loc->[0],\@parts,$loc->[2]]);
-   type_mask($array)==TYPE_ARRAY or $self->_fail('INVALID_TARGET','SPLICE requires an array element path');
-   my $offset=$self->_selector($last,$array,0);
-   my $count=$self->_eval($action->count_expr,$depth+1);
+   my $trace=$self->_resolve($loc,'write');
+   my $frame=$trace->{frames}[-1];
+   $frame->[_F_KIND]==TYPE_ARRAY && defined($frame->[_F_CONTAINER])
+      or $self->_fail('INVALID_TARGET','SPLICE requires an array element path');
+   my ($array,$offset)=@$frame[_F_CONTAINER,_F_KEY];
+   my $count=$self->_eval($action->{count_expr},$depth+1);
    !defined($count) || is_integer($count) or $self->_fail('INVALID_OPERAND','SPLICE count must be an integer or null');
    my $size=@$array;
    $count=$size-$offset unless defined $count;
    $count+=$size-$offset if $count<0;
    $count>=0 && $count<=$size-$offset or $self->_fail('INVALID_TARGET','SPLICE count is out of range');
    my (@values,@sources);
-   $self->_step(scalar @{$action->replacements});
-   $self->_charge('mem',32*@{$action->replacements});
-   for my $arg (@{$action->replacements}) {
-      my ($value,$source)=$self->_value_source($arg,$depth+1);
-      $value=$self->_export_dates($value,$depth+1,{})
-         if ($loc->[2] || '') eq 'node' || refaddr($loc->[0])==refaddr($self->{root});
-      push @values,$self->_snapshot($value);
+   $self->_tick(scalar @{$action->{replacements}});
+   my $workspace=160*@{$action->{replacements}}; # Values, sources, and provenance.
+   $self->_path_scratch($workspace);
+   for my $arg (@{$action->{replacements}}) {
+      my $source;
+      my $value=$self->_eval($arg,$depth+1,\$source);
+      push @values,$self->_publish($value,($loc->[2] || '') eq 'node' || refaddr($loc->[0])==refaddr($self->{root}),$depth+1);
       push @sources,$source;
    }
    return unless $count || @values;
-   # Reserve array shifting and metadata repair before touching the tree.
-   $self->_step($size+@values);
-   $self->_charge('mem',16*($size+@values));
-   $self->{undo_state}->_record($self,$parent_loc) if $self->{undo_state};
-   my $dest=[$parent_loc->[0],[@{$parent_loc->[1]},$offset],$loc->[2]];
-   ($array)=$self->_parent($dest);
-   require JGraft::_Split;
-   my $meta=JGraft::_Split->_splice_meta($self,$array,$offset,$count,\@sources);
-   splice @$array,$offset,$count,@values;
-   if ($meta) {
-      $self->{split_meta}{refaddr($array)}=$meta;
-      JGraft::_Split->_fill_meta($self,$array,1);
-   }
-   else { delete $self->{split_meta}{refaddr($array)} }
-   for my $value (@values) {
-      next unless $self->_contains_date($value);
-      # Mark ancestors too: the array may be inside a TEMP/STASH container.
-      my $container=$parent_loc->[0][0];
-      $self->_step(1+@{$parent_loc->[1]});
-      $self->_mark_date_container($container);
-      for my $part (@{$parent_loc->[1]}) {
-         $container=$self->_child($container,$part);
-         $self->_mark_date_container($container);
-      }
-      last;
-   }
+   $self->_splice($trace,$offset,$count,\@values,\@sources);
 }
 sub JGraft::Action::ATSPLIT::_execute {
    my ($action,$self,$depth)=@_;
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   local $self->{path_workspace}=[$scratch_base,0];
    require JGraft::_Split;
-   my ($text,$target)=$self->_read($self->_path($action->path,'at',$depth+1));
+   my $target_trace=$self->_resolve($self->_expand_path($action->{path},'at',$depth+1),'read');
+   my ($text,$target)=@$target_trace{qw(value location)};
+   $self->_path_scratch(512); # Resolved config and optional raw-spec wrapper.
    my ($config,$result);
    {
       local $self->{current}=$target;
-      $config=JGraft::_Split->_config($self,$action->split_spec,$depth+1,'both');
+      $config=JGraft::_Split->_config($self,$action->{split_spec},$depth+1,'both');
       my $array=JGraft::_Split->_split($self,$config,$text,$depth+1);
       local $self->{current}=[[$array,1],[]];
       local $self->{match_cursor};
-      $self->_step(scalar @{$action->actions});
-      $self->_run($_,$depth+1) for @{$action->actions};
-      $result=JGraft::_Split->_join($self,$config,($self->_read($self->{current}))[0],$depth+1);
+      $self->_tick(scalar @{$action->{actions}});
+      $self->_run($_,$depth+1) for @{$action->{actions}};
+      $result=JGraft::_Split->_join($self,$config,$self->_read_value($self->{current}),$depth+1);
    }
-   $self->_write($target,$result);
-}
-
-sub _path {
-   my ($self,$expr,$mode,$depth)= @_;
-   $self->_depth($depth);
-   $self->_step(1);
-   is_expr($expr) or $self->_fail('INVALID_OPERAND','Path must be a reference expression');
-   local $self->{expression}=$expr;
-   if ($expr->_name eq 'EXPR') {
-      return $self->_path($self->_macro($expr,$depth+1),$mode,$depth+1);
-   }
-   $expr->is_ref && exists $expr->{path} or $self->_fail('INVALID_OPERAND','Path must be a reference');
-   my $ns=lc($expr->_name);
-   if ($mode eq 'at') { $ns eq 'node' or $self->_fail('INVALID_OPERAND','AT must use NODE') }
-   if ($mode eq 'write' || $mode eq 'move_src' || $mode eq 'move_dst') {
-      $ns =~ /\A(?:node|temp|stash)\z/ or $self->_fail('INVALID_OPERAND','Read-only namespace');
-   }
-   my $base=$ns eq 'node'? $self->{current} : [$self->{$ns},[]];
-   defined $base->[0] or $self->_fail('INVALID_OPERAND','Unknown namespace');
-   my (@parts,@literal);
-   $self->_step(scalar @{$expr->path});
-   for my $part (@{$expr->path}) {
-      my $value=$self->_eval($part,$depth+1);
-      if (ref $value eq 'ARRAY') {
-         $self->_step(scalar @$value);
-         for my $i (0..$#$value) {
-            $self->_present($value,$i) or $self->_fail('INVALID_TARGET','Path expands a deleted element');
-            push @parts,$value->[$i];
-            push @literal,!is_expr($part) && !is_expr($part->[$i]);
-         }
-      }
-      else { push @parts,$value; push @literal,!is_expr($part) }
-   }
-   $self->_step(scalar @parts);
-   for my $i (0..$#parts) {
-      my $v=$parts[$i];
-      my $t=type_mask($v);
-      next if $t==TYPE_STRING || ($t==TYPE_BOOLEAN && !$v);
-      if ($t==TYPE_NUMBER && is_finite($v)) {
-         next if is_integer($v) || ($mode eq 'move_dst' && $i==$#parts && $v*2==int($v*2));
-      }
-      $self->_fail($literal[$i]?'INVALID_GRAFT':'INVALID_OPERAND','Invalid path selector');
-   }
-   $ns eq 'temp' && !@parts and $self->_fail(
-      (grep is_expr($_), @{$expr->path})?'INVALID_OPERAND':'INVALID_GRAFT','TEMP root is inaccessible');
-   if ($ns ne 'node' && ($mode eq 'write' || $mode =~ /^move_/) && !@parts) {
-      $self->_fail((grep is_expr($_), @{$expr->path})?'INVALID_OPERAND':'INVALID_GRAFT','Namespace root cannot be overwritten or moved');
-   }
-   if ($ns ne 'node' && @parts && type_mask($parts[0])==TYPE_NUMBER) {
-      is_integer($parts[0]) or $self->_fail($literal[0]?'INVALID_GRAFT':'INVALID_OPERAND',
-         'Namespace property must be an integer or string');
-      my $key=$parts[0];
-      $parts[0]="$key";
-   }
-   $self->_charge('mem',32+16*(@parts+@{$base->[1]}));
-   return [$base->[0],[@{$base->[1]},@parts],$ns];
-}
-
-sub _selector {
-   my ($self,$value,$container,$half)= @_;
-   my $type=type_mask($value);
-   my $kind=type_mask($container);
-   if ($kind==TYPE_DATE) {
-      $type==TYPE_STRING or $self->_fail('INVALID_TARGET','Date selectors must be field names');
-      return $value;
-   }
-   if ($kind==TYPE_OBJECT) {
-      $type==TYPE_STRING or $self->_fail('INVALID_TARGET','Object selectors must be strings');
-      return $value;
-   }
-   $kind==TYPE_ARRAY or $self->_fail('INVALID_TARGET','Path descends through a scalar');
-   my $len=@$container;
-   return $len if $type==TYPE_BOOLEAN && !$value;
-   $type==TYPE_NUMBER && is_finite($value) or $self->_fail('INVALID_TARGET','Array selectors must be numbers');
-   $value=$self->_number($value) if ref $value;
-   if (is_integer($value)) {
-      my $index=$value<0? $len+$value : 0+$value;
-      $index>=0 && $index<=$len or $self->_fail('INVALID_TARGET','Array index out of range');
-      return ref($index)?JGraft::Util::to_native_number($index):$index;
-   }
-   $half && $value*2==int($value*2) or $self->_fail('INVALID_OPERAND','Invalid fractional selector');
-   my $index=$value<-.5? $len+$value : 0+$value;
-   $index>=-.5 && $index<=$len-.5 or $self->_fail('INVALID_TARGET','Array insertion out of range');
-   return ref($index)?JGraft::Util::to_native_number($index):$index;
-}
-sub _present {
-   my ($self,$v,$key)= @_;
-   return $self->_date($v)->_has($key) if type_mask($v)==TYPE_DATE;
-   return exists $v->{$key} if ref $v eq 'HASH';
-   return 0 unless is_integer($key) && $key>=0 && $key<@$v && exists $v->[$key];
-   my $record=$self->{pending}{refaddr($v)};
-   return !$record || !$record->{deleted}{0+$key};
-}
-sub _child {
-   if (type_mask($_[1])==TYPE_DATE) {
-      my $date=$_[0]->_date($_[1]);
-      if ($_[2] eq 'second') {
-         my $n=length($date->fraction);
-         $_[0]->_step($n*.01+1); $_[0]->_charge('mem',2*$n);
-      }
-      my $value=eval { $date->_get($_[2]) };
-      my $error=$@;
-      if ($error) {
-         die $error if ref($error) || $error !~ /\AUNSUPPORTED_GRAFT:/;
-         $_[0]->_fail('UNSUPPORTED_GRAFT',"$error");
-      }
-      return $value;
-   }
-   return ref($_[1]) eq 'ARRAY'? $_[1][$_[2]] : $_[1]{$_[2]};
-}
-sub _read {
-   my ($self,$loc)= @_;
-   my ($cell,$parts)=@$loc;
-   $self->_step(1+@$parts);
-   $self->_depth(1+@$parts);
-   $cell->[1] or $self->_fail('INVALID_TARGET','Current node does not exist');
-   my $v=$cell->[0];
-   my @canonical;
-   for my $part (@$parts) {
-      my $key=$self->_selector($part,$v,0);
-      $self->_present($v,$key) or $self->_fail('INVALID_TARGET','Path does not exist');
-      push @canonical,$key;
-      $v=$self->_child($v,$key);
-   }
-   return ($v,[$cell,\@canonical,$loc->[2]]);
-}
-sub _same_key {
-   my ($self,$a,$b)= @_;
-   return 0 unless type_mask($a)==type_mask($b);
-   $self->_step(1+(length($a)+length($b))*.001) if type_mask($a)==TYPE_STRING;
-   return $a eq $b;
-}
-sub _probe {
-   my ($self,$loc,$removed,$half)= @_;
-   my ($cell,$parts)=@$loc;
-   $self->_step(1+@$parts);
-   $self->_depth(1+@$parts);
-   my $match=$removed && refaddr($removed->[0])==refaddr($cell);
-   my $exists=$cell->[1] && !($match && !@{$removed->[1]});
-   my $v=$cell->[0];
-   my @canonical;
-   for my $i (0..$#$parts) {
-      unless ($exists) {
-         # These empty virtual containers are for validation, not output.
-         my $kind=type_mask($parts->[$i]);
-         $v=$kind==TYPE_STRING? {} : [];
-      }
-      type_mask($v)!=TYPE_DATE or $self->_fail('INVALID_TARGET','Date fields are immutable');
-      my $key=$self->_selector($parts->[$i],$v,$half && $i==$#$parts);
-      if (ref $v eq 'ARRAY' && !is_integer($key)) {
-         push @canonical,$key;
-         last;
-      }
-      my $present=$exists && $self->_present($v,$key);
-      if ($match) {
-         $match= $i<@{$removed->[1]} && $self->_same_key($key,$removed->[1][$i]);
-         $present=0 if $match && $i==$#{$removed->[1]};
-      }
-      push @canonical,$key;
-      $v=$present? $self->_child($v,$key) : undef;
-      $exists=$present;
-   }
-   return [$cell,\@canonical,$loc->[2]];
-}
-
-sub _parent {
-   my ($self,$loc)= @_;
-   my ($cell,$parts)=@$loc;
-   if (!$cell->[1]) {
-      $cell->[0]=type_mask($parts->[0])==TYPE_STRING? $self->_new_hash(0):$self->_new_array(0);
-      $cell->[1]=1;
-   }
-   type_mask($cell->[0])!=TYPE_DATE or $self->_fail('INVALID_TARGET','Date fields are immutable');
-   my $v=$self->_cow($cell->[0]);
-   $cell->[0]=$v;
-   for my $i (0..$#$parts-1) {
-      my $key=$parts->[$i];
-      my $child;
-      if ($self->_present($v,$key)) { $child=$self->_child($v,$key) }
-      else { $child=type_mask($parts->[$i+1])==TYPE_STRING? $self->_new_hash(0):$self->_new_array(0) }
-      type_mask($child)!=TYPE_DATE or $self->_fail('INVALID_TARGET','Date fields are immutable');
-      $child=$self->_cow($child);
-      $self->_put($v,$key,$child);
-      $v=$child;
-   }
-   return ($v,$parts->[-1]);
-}
-sub _put {
-   my ($self,$parent,$key,$value,$source)= @_;
-   if (ref $parent eq 'HASH') {
-      $self->_charge('mem',64+length($key)) unless exists $parent->{$key};
-      $parent->{$key}=$value;
-   }
-   else {
-      my $rec=$self->{pending}{refaddr($parent)};
-      my $inserting=$key==@$parent || ($rec && $rec->{deleted}{0+$key});
-      my $existing_meta=$self->{split_meta}{refaddr($parent)};
-      my $metadata=$inserting && ($source || $existing_meta);
-      $rec=$self->_pending($parent) if $metadata && $self->{moving};
-      if ($key==@$parent) {
-         $self->_charge('mem',16);
-         if ($rec) {
-            $self->_step($rec->{metadata} || $metadata?4:2);
-            $self->_charge('mem',$rec->{metadata} || $metadata?112:16);
-         }
-      }
-      if ($metadata) {
-         $self->_charge('mem',96);
-         $self->_step($existing_meta?2:2*(@$parent+1)) unless $self->{moving};
-         my $row=JGraft::_Split->_insert_meta($self,$parent,$source);
-         if (!$row && !$self->{moving} && $existing_meta) {
-            my $previous=$key? $existing_meta->{rows}[$key-1] : undef;
-            $row=[$previous? $previous->[0] : '',$previous? $previous->[1] : '',''];
-         }
-         $self->{split_meta}{refaddr($parent)}{rows}[$key]=$row;
-      }
-      delete $rec->{deleted}{0+$key} if $rec;
-      $parent->[$key]=$value;
-      JGraft::_Split->_fill_meta($self,$parent,1) if $metadata && !$self->{moving} && !$existing_meta;
-   }
-   $self->_mark_date_container($parent) if $self->_contains_date($value);
-}
-sub _write {
-   my ($self,$loc,$value,$source)= @_;
-   $self->_step(1+@{$loc->[1]});
-   if (($loc->[2] || '') eq 'node' || refaddr($loc->[0])==refaddr($self->{root})) {
-      $value=$self->_export_dates($value,1,{});
-   }
-   $self->{undo_state}->_record($self,$loc) if $self->{undo_state};
-   unless (@{$loc->[1]}) { @{$loc->[0]}=($value,1); return }
-   my ($parent,$key)=$self->_parent($loc);
-   if (ref $parent eq 'ARRAY' && !is_integer($key)) {
-      my $rec=$self->_pending($parent);
-      $self->_step(4);
-      $self->_charge('mem',168);
-      my $row;
-      $row=JGraft::_Split->_insert_meta($self,$parent,$source) if $source || $self->{split_meta}{refaddr($parent)};
-      push @{$rec->{insert}{0+$key}},$value;
-      push @{$rec->{insert_meta}{0+$key}},$row;
-   }
-   else { $self->_put($parent,$key,$value,$source) }
-   if ($self->_contains_date($value)) {
-      my $container=$loc->[0][0];
-      $self->_step(scalar @{$loc->[1]});
-      for my $part (@{$loc->[1]}) {
-         last unless ref($container) eq 'ARRAY' || ref($container) eq 'HASH';
-         $self->_mark_date_container($container);
-         last unless $self->_present($container,$part);
-         $container=$self->_child($container,$part);
-      }
-   }
-}
-sub _pending {
-   my ($self,$array)= @_;
-   my $id=refaddr($array);
-   return $self->{pending}{$id} if $self->{pending}{$id};
-   # Reserve the final compaction's work and scratch space before editing.
-   my $metadata=$self->{split_meta}{$id}?1:0;
-   $self->_step(($metadata?4:2)*@$array+1);
-   $self->_charge('mem',192+($metadata?112:16)*@$array);
-   return $self->{pending}{$id}={array=>$array,deleted=>{},insert=>{},insert_meta=>{},metadata=>$metadata};
-}
-sub _delete {
-   my ($self,$loc)= @_;
-   $self->{undo_state}->_record($self,$loc,1) if $self->{undo_state};
-   unless (@{$loc->[1]}) { $loc->[0][1]=0; return }
-   my ($parent,$key)=$self->_parent($loc);
-   if (ref $parent eq 'HASH') { delete $parent->{$key} }
-   else {
-      my $rec=$self->_pending($parent);
-      $self->_charge('mem',24);
-      $rec->{deleted}{0+$key}=1;
-   }
-}
-sub _finish_moves {
-   my $self=shift;
-   # Work was charged on first deletion/insertion (and subsequent appends).
-   for my $rec (values %{$self->{pending}}) {
-      my $array=$rec->{array};
-      my (@out,@rows);
-      my $meta=$self->{split_meta}{refaddr($array)};
-      for my $i (0..$#$array) {
-         push @out,@{$rec->{insert}{$i-.5} || []};
-         push @rows,@{$rec->{insert_meta}{$i-.5} || []} if $meta;
-         push @out,$array->[$i] unless $rec->{deleted}{0+$i};
-         push @rows,$meta->{rows}[$i] if $meta && !$rec->{deleted}{0+$i};
-      }
-      push @out,@{$rec->{insert}{@$array-.5} || []};
-      push @rows,@{$rec->{insert_meta}{@$array-.5} || []} if $meta;
-      @$array=@out;
-      if ($meta) { $meta->{rows}=\@rows; JGraft::_Split->_fill_meta($self,$array,1) }
-   }
-   $self->{pending}={};
-}
-sub _move {
-   my ($self,$pairs,$depth)= @_;
-   local $self->{moving}=1;
-   $self->_step(scalar @$pairs);
-   my $ok=eval {
-      for my $pair (@$pairs) {
-         my $src=defined $pair->[0]? $self->_path($pair->[0],'move_src',$depth+1):undef;
-         my $dst=defined $pair->[1]? $self->_path($pair->[1],'move_dst',$depth+1):undef;
-         my ($value,$canonical)= $src? $self->_read($src) : (undef,undef);
-         my $metadata=$canonical && keys %{$self->{split_meta}}? JGraft::_Split->_source($self,$canonical) : undef;
-         my $dest=$dst? $self->_probe($dst,$canonical,1) : undef;
-         if ($canonical && $dest && refaddr($canonical->[0])==refaddr($dest->[0])
-            && @{$canonical->[1]}==@{$dest->[1]}) {
-            my $same=1;
-            $self->_step(scalar @{$dest->[1]});
-            for my $i (0..$#{$dest->[1]}) { $same=0 unless $self->_same_key($canonical->[1][$i],$dest->[1][$i]) }
-            next if $same;
-         }
-         $self->_delete($canonical) if $canonical;
-         $self->_write($dest,$value,$metadata) if $dest;
-      }
-      $self->{current}[0][1] or $self->_fail('INVALID_TARGET','MOVE did not replace the current node');
-      $self->_read($self->{current});
-      1;
-   };
-   my $err=$@;
-   $self->_finish_moves;
-   die $err unless $ok;
+   $self->_assign($target_trace,$result);
 }
 
 sub _match {
    my ($self,$spec,$depth,$observable)=@_;
    require JGraft::_Match;
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   $self->_scratch_set($scratch_base,288); # Private match state and root cursor.
    my $state=JGraft::_Match->_new($self,$observable);
    my ($cell,$parts)=@{$self->{current}};
    my ($value,$exists)=@$cell;
    my $parent;
-   $self->_step(scalar @$parts);
+   $self->_tick(scalar @$parts);
    for my $key (@$parts) {
       unless ($exists && (ref($value) eq 'ARRAY' || ref($value) eq 'HASH' || type_mask($value)==TYPE_DATE) && $self->_present($value,$key)) {
          $exists=0; $value=undef; last;
@@ -819,12 +345,12 @@ sub _match {
    $cursor->{array}=$parent if ref($parent) eq 'ARRAY';
    $cursor->{array}=$self->{match_cursor}{array} if !@$parts && $self->{match_cursor} && $self->{match_cursor}{array};
    $cursor->{string}=$self->{match_cursor}{string} if !@$parts && $self->{match_cursor} && $self->{match_cursor}{string};
-   return $state->_test($spec,$cursor,$depth,0)? $state : undef;
+   return $state->_test($spec,$cursor,$depth,0)? $state->{captures} : undef;
 }
 
 sub _macro {
    my ($self,$expr,$depth)= @_;
-   my $name=$self->_eval($expr->name,$depth+1);
+   my $name=$self->_eval($expr->{name},$depth+1);
    my $t=type_mask($name);
    $t==TYPE_STRING || ($t==TYPE_NUMBER && is_integer($name)) or $self->_fail('INVALID_OPERAND','Invalid EXPR name');
    my $key="$name";
@@ -832,23 +358,42 @@ sub _macro {
    return $self->{expr}[0]{$key};
 }
 sub _eval {
-   my ($self,$v,$depth)= @_;
-   $self->_depth($depth);
-   $self->_step(1);
-   if (is_expr($v)) {
+   my ($self,$v,$depth,$source)= @_;
+   my $expression=is_expr($v);
+   if ($source) {
+      $$source=undef;
+      $self->_enter($depth);
+      if ($expression) {
+         local $self->{expression}=$v;
+         return $self->_eval($self->_macro($v,$depth+1),$depth+1,$source) if $v->name eq 'EXPR';
+         if ($v->is_ref && exists $v->{path}) {
+            my $base=$self->{scratch_mem};
+            local $self->{scratch_mem}=$base;
+            local $self->{path_workspace}=[$base,0];
+            return $self->_read_value($self->_expand_path($v,'read',$depth+1),$source);
+         }
+      }
+      ++$depth;
+   }
+   $self->_enter($depth);
+   if ($expression) {
       local $self->{expression}=$v;
-      my $result=$self->_expression($v,$depth);
+      my $result=$v->_execute($self,$depth);
       $self->_check_string($result,'expression') if type_mask($result)==TYPE_STRING;
       return $result;
    }
    my $t=type_mask($v);
    return $self->_date($v) if $t==TYPE_DATE;
    if ($t==TYPE_ARRAY) {
-      my $out=$self->_new_array(scalar @$v);
-      $self->_step(scalar @$v);
+      my $out=$self->_alloc_array(scalar @$v);
+      $self->_tick(scalar @$v);
+      my $scratch_base=$self->{scratch_mem};
+      local $self->{scratch_mem}=$scratch_base;
+      $self->_scratch_set($scratch_base,128); # One live element provenance record.
       for my $i (0..$#$v) {
-         my ($value,$metadata)=$self->_value_source($v->[$i],$depth+1);
-         $self->_put($out,$i,$value,$metadata);
+         my $metadata;
+         my $value=$self->_eval($v->[$i],$depth+1,\$metadata);
+         $self->_append_value($out,$value,$metadata);
       }
       return $out;
    }
@@ -856,136 +401,45 @@ sub _eval {
       my $tie=tied %$v;
       if ($tie && $tie->isa('JGraft::JSON::Object')) {
          my $out=$self->_own($tie->_clone(sub { $self->_eval($_[0],$depth+1) }));
-         $self->_mark_date_container($out) if $self->{date_containers}{refaddr($v)};
+         $self->_mark_date_container($out) if $self->_contains_date($v);
          return $out;
       }
-      my $out=$self->_new_hash(scalar keys %$v);
-      $self->_step(scalar keys %$v);
+      my $scratch_base=$self->{scratch_mem};
+      local $self->{scratch_mem}=$scratch_base;
+      $self->_scratch_set($scratch_base,80+16*keys %$v);
+      my $out=$self->_alloc_hash(scalar keys %$v);
+      $self->_tick(scalar keys %$v);
       for my $key (keys %$v) {
          $self->_check_string($key,'expression key');
-         $out->{$key}=$self->_eval($v->{$key},$depth+1);
-         $self->_mark_date_container($out) if $self->_contains_date($out->{$key});
+         $self->_set_member($out,$key,$self->_eval($v->{$key},$depth+1));
       }
       return $out;
    }
-   $self->_step(length($v)*.001) if $t==TYPE_STRING;
+   $self->_tick(length($v)*.001) if $t==TYPE_STRING;
    $self->_check_string($v,'literal') if $t==TYPE_STRING;
    $t==TYPE_NULL || $t==TYPE_BOOLEAN || $t==TYPE_NUMBER || $t==TYPE_STRING or $self->_fail('UNSUPPORTED_GRAFT','Unsupported literal value');
    return $v;
 }
-sub _value_source {
-   my ($self,$value,$depth)=@_;
-   $self->_depth($depth); $self->_step(1);
-   if (is_expr($value)) {
-      local $self->{expression}=$value;
-      return $self->_value_source($self->_macro($value,$depth+1),$depth+1) if $value->_name eq 'EXPR';
-      if ($value->is_ref && exists $value->{path}) {
-         my ($result,$loc)=$self->_read($self->_path($value,'read',$depth+1));
-         return ($result,keys %{$self->{split_meta}}? JGraft::_Split->_source($self,$loc):undef);
-      }
-   }
-   return ($self->_eval($value,$depth+1),undef);
-}
 sub _input_value {
    my ($self,$expr,$field,$depth)= @_;
    return $self->_eval($expr->{$field},$depth+1) if exists $expr->{$field};
-   return ($self->_read($self->{current}))[0];
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   local $self->{path_workspace}=[$scratch_base,0];
+   return $self->_read_value($self->{current});
 }
-sub _date {
-   my ($self,$value)=@_;
-   require JGraft::Date;
-   return $value if blessed($value) && $value->isa('JGraft::Date');
-   my $id=ref($value)?refaddr($value):undef;
-   return $self->{dates}{$id}[1] if defined($id) && $self->{dates}{$id};
-   my $size=ref($value) eq 'HASH'? scalar keys %$value : 0;
-   $self->_step(16+$size+(type_mask($value)==TYPE_STRING?length($value)*.01:0));
-   $self->_allocation(256+128*$size+(type_mask($value)==TYPE_STRING?8*length($value):0));
-   my $date=eval { JGraft::Date->new($value) };
-   unless ($date) {
-      my $error=$@;
-      die $error if ref $error;
-      $self->_fail($error =~ /UNSUPPORTED_GRAFT:/?'UNSUPPORTED_GRAFT':'INVALID_TARGET',"Invalid date: $error");
-   }
-   $self->{dates}{$id}=[$value,$date] if defined $id;
-   return $date;
-}
-sub _contains_date {
-   my ($self,$value)=@_;
-   return 0 unless ref $value;
-   return type_mask($value)==TYPE_DATE || $self->{date_containers}{refaddr($value)};
-}
-sub _mark_date_container {
-   my ($self,$value)=@_;
-   my $id=refaddr($value);
-   return if $self->{date_containers}{$id};
-   $self->_charge('mem',64);
-   $self->{date_containers}{$id}=$value;
-   weaken($self->{date_containers}{$id});
-}
-sub _export_dates {
-   my ($self,$value,$depth,$memo)=@_;
-   return $value unless $self->_contains_date($value);
-   $self->_depth($depth); $self->_step(1);
-   my $id=refaddr($value);
-   if (type_mask($value)==TYPE_DATE) {
-      return $self->{date_output}{$id}[1] if exists $self->{date_output}{$id};
-      my $date=$self->_date($value);
-      my $canonical=refaddr($date);
-      return $self->{date_output}{$canonical}[1] if exists $self->{date_output}{$canonical};
-      $self->_allocation(256+length($date->fraction));
-      my $format=$self->{options}{date_format} || 'iso8601';
-      my $out;
-      if (ref($format) eq 'CODE') { $out=$format->($date) }
-      else {
-         my $ok=eval { $out=$date->format($format); 1 };
-         $self->_fail('UNSUPPORTED_GRAFT',"Cannot export date: $@") unless $ok;
-      }
-      if (type_mask($out)==TYPE_STRING) {
-         $self->_step(length($out)*.001); $self->_charge('mem',4*length($out));
-         $self->_check_string($out,'date output');
-      }
-      $self->{date_output}{$canonical}=[$date,$out];
-      $self->{date_output}{$id}=[$value,$out];
-      $self->{date_output}{refaddr($out)}=[$out,$out] if type_mask($out)==TYPE_DATE;
-      return $out;
-   }
-   return $memo->{$id} if exists $memo->{$id};
-   my $out=ref($value) eq 'ARRAY'? $self->_new_array(scalar @$value) : $self->_new_hash(scalar keys %$value);
-   $memo->{$id}=$out;
-   if (ref($value) eq 'ARRAY') {
-      $self->_step(scalar @$value);
-      for my $i (0..$#$value) {
-         $self->_present($value,$i) or $self->_fail('INVALID_TARGET','Cannot export a deleted array element');
-         $self->_put($out,$i,$self->_export_dates($value->[$i],$depth+1,$memo));
-      }
-      JGraft::_Split->_copy_meta($self,$value,$out,0,scalar @$value) if $self->{split_meta}{$id};
-   }
-   else {
-      my $tie=tied %$value;
-      if ($tie && $tie->isa('JGraft::JSON::Object')) {
-         $out=$self->_own($tie->_clone(sub { $self->_export_dates($_[0],$depth+1,$memo) }));
-         $memo->{$id}=$out;
-         return $out;
-      }
-      $self->_step(scalar keys %$value);
-      for my $key (keys %$value) { $self->_put($out,$key,$self->_export_dates($value->{$key},$depth+1,$memo)) }
-   }
-   return $out;
-}
-sub _expression {
-   my ($self,$expr,$depth)= @_;
-   return $expr->_execute($self,$depth);
-}
-
 # Install execution methods here so parsing-only users need not load them.
 # References and match expressions inherit their category's common handler.
 sub JGraft::Expr::_execute {
    my ($expr,$self)= @_;
-   $self->_fail('UNSUPPORTED_GRAFT','Expression '.$expr->_name.' is not implemented');
+   $self->_fail('UNSUPPORTED_GRAFT','Expression '.$expr->name.' is not implemented');
 }
 sub JGraft::Expr::Ref::_execute {
    my ($expr,$self,$depth)= @_;
-   return ($self->_read($self->_path($expr,'read',$depth+1)))[0];
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   local $self->{path_workspace}=[$scratch_base,0];
+   return $self->_read_value($self->_expand_path($expr,'read',$depth+1));
 }
 sub JGraft::Expr::EXPR::_execute {
    my ($expr,$self,$depth)= @_;
@@ -997,8 +451,8 @@ sub JGraft::Expr::Match::_execute {
 }
 sub JGraft::Expr::CAPTURE::_execute {
    my ($expr,$self,$depth)= @_;
-   my $match=$self->_match($expr->match_expr,$depth+1,1);
-   return $match? $match->{captures} : JSON::PP::false;
+   my $captures=$self->_match($expr->{match_expr},$depth+1,1);
+   return $captures? $captures : JSON::PP::false;
 }
 sub JGraft::Expr::CURPROP::_execute {
    my ($expr,$self)= @_;
@@ -1014,7 +468,7 @@ sub JGraft::Expr::LENGTH::_execute {
    my $v=$self->_input_value($expr,'value_expr',$depth);
    my $t=type_mask($v);
    return scalar @$v if $t==TYPE_ARRAY;
-   if ($t==TYPE_STRING) { $self->_step(length($v)*.001); return length($v) }
+   if ($t==TYPE_STRING) { $self->_tick(length($v)*.001); return length($v) }
    $self->_fail('INVALID_TARGET','LENGTH expects an array or string');
 }
 sub JGraft::Expr::SLICE::_execute {
@@ -1024,42 +478,48 @@ sub JGraft::Expr::SLICE::_execute {
 sub JGraft::Expr::SPLIT::_execute {
    my ($expr,$self,$depth)=@_;
    require JGraft::_Split;
-   my $config=JGraft::_Split->_config($self,$expr->split_spec,$depth+1,'split');
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   $self->_scratch_set($scratch_base,512);
+   my $config=JGraft::_Split->_config($self,$expr->{split_spec},$depth+1,'split');
    return JGraft::_Split->_split($self,$config,$self->_input_value($expr,'string_expr',$depth),$depth+1);
 }
 sub JGraft::Expr::JOIN::_execute {
    my ($expr,$self,$depth)=@_;
    require JGraft::_Split;
-   my $config=JGraft::_Split->_config($self,$expr->split_spec,$depth+1,'join');
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   $self->_scratch_set($scratch_base,512);
+   my $config=JGraft::_Split->_config($self,$expr->{split_spec},$depth+1,'join');
    return JGraft::_Split->_join($self,$config,$self->_input_value($expr,'array_expr',$depth),$depth+1);
 }
 sub JGraft::Expr::LOCAL::_execute {
    my ($expr,$self,$depth)= @_;
-   my $copy=$self->_new_hash(scalar keys %{$self->{temp}[0]});
-   $self->_step(scalar keys %{$self->{temp}[0]});
-   %$copy=%{$self->{temp}[0]};
+   my $copy=$self->_copy_hash($self->{temp}[0]);
    local $self->{temp}=[$copy,1];
    local $self->{current}=$self->{current};
    local $self->{match_cursor}=$self->{match_cursor};
-   $self->_step(scalar @{$expr->bindings});
-   for my $pair (@{$expr->bindings}) {
+   $self->_tick(scalar @{$expr->{bindings}});
+   for my $pair (@{$expr->{bindings}}) {
       my $key=$self->_eval($pair->[0],$depth+1);
       my $t=type_mask($key);
       $t==TYPE_NULL || $t==TYPE_STRING || ($t==TYPE_NUMBER && is_finite($key)) or $self->_fail('INVALID_OPERAND','Invalid LOCAL property');
       my $value=$self->_eval($pair->[1],$depth+1);
       if (!defined $key) { $self->{current}=[[$value,1],[]]; $self->{match_cursor}=undef }
-      else { $self->{temp}[0]{"$key"}=$value }
+      else { $self->_set_member($self->{temp}[0],"$key",$value) }
    }
-   return $self->_eval($expr->return_value_expr,$depth+1);
+   return $self->_eval($expr->{return_value_expr},$depth+1);
 }
 
 sub JGraft::Expr::CONCAT::_execute {
    my ($expr,$self,$depth)=@_;
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
    my ($type,$size,@values);
    $size=0;
-   $self->_step(scalar @{$expr->value_exprs});
-   $self->_charge('mem',16*@{$expr->value_exprs});
-   for my $arg (@{$expr->value_exprs}) {
+   $self->_tick(scalar @{$expr->{value_exprs}});
+   $self->_scratch_set($scratch_base,16*@{$expr->{value_exprs}});
+   for my $arg (@{$expr->{value_exprs}}) {
       my $value=$self->_eval($arg,$depth+1);
       my $t=type_mask($value);
       ($t==TYPE_STRING || $t==TYPE_ARRAY) && (!defined($type) || $type==$t)
@@ -1069,22 +529,13 @@ sub JGraft::Expr::CONCAT::_execute {
       push @values,$value;
    }
    if ($type==TYPE_STRING) {
-      $self->_step($size*.001); $self->_charge('mem',4*$size);
+      $self->_tick($size*.001); $self->_reserve(0,4*$size,0);
       return join('',@values);
    }
-   my $out=$self->_new_array($size);
-   $self->_step($size);
-   for my $array (@values) {
-      my $offset=@$out;
-      for my $i (0..$#$array) {
-         $self->_present($array,$i) or $self->_fail('INVALID_TARGET','CONCAT encounters a deleted element');
-         push @$out,$array->[$i];
-      }
-      JGraft::_Split->_append_meta($self,$array,$out,$offset) if $self->{split_meta}{refaddr($array)};
-      $self->_mark_date_container($out) if $self->{date_containers}{refaddr($array)};
-   }
-   if ($self->{split_meta}{refaddr($out)}) {
-      $self->_charge('mem',96*$size);
+   my $out=$self->_alloc_array($size);
+   $self->_append_range($out,$_,0,scalar @$_) for @values;
+   if ($self->_split_meta($out)) {
+      $self->_reserve(0,96*$size,0);
       JGraft::_Split->_fill_meta($self,$out);
    }
    return $out;
@@ -1094,24 +545,24 @@ sub JGraft::Expr::CONCAT::_execute {
 # both fields also isolates callbacks from an enclosing match cursor.
 sub _iterate_array {
    my ($self,$expr,$depth,$mode)=@_;
-   my $acc=$self->_eval($expr->initial_value,$depth+1) if $mode eq 'reduce';
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   my $acc=$self->_eval($expr->{initial_value},$depth+1) if $mode eq 'reduce';
    my $array=$self->_input_value($expr,'array_expr',$depth);
    type_mask($array)==TYPE_ARRAY or $self->_fail('INVALID_TARGET','Array iteration expects an array');
-   $self->_step(scalar @$array);
-   $self->_charge('mem',80*@$array);
-   my $out=$self->_new_array(scalar @$array) unless $mode eq 'reduce';
-   my $meta=$self->{split_meta}{refaddr($array)};
+   $self->_tick(scalar @$array);
+   $self->_scratch_set($scratch_base,80);
+   my $out=$self->_alloc_array(scalar @$array) unless $mode eq 'reduce';
+   my $meta=$self->_split_meta($array);
    my @selected;
-   $self->_charge('mem',16*@$array) if $meta && $mode eq 'filter';
+   $self->_scratch_set($scratch_base,80+16*@$array) if $meta && $mode eq 'filter';
    if ($mode eq 'map') {
       @$out=(undef)x scalar @$array;
       JGraft::_Split->_copy_meta($self,$array,$out,0,scalar @$array) if $meta;
    }
    local $self->{temp}=$self->{temp};
    if ($mode eq 'reduce') {
-      my $temp=$self->_new_hash(scalar keys %{$self->{temp}[0]});
-      $self->_step(scalar keys %{$self->{temp}[0]});
-      %$temp=%{$self->{temp}[0]};
+      my $temp=$self->_copy_hash($self->{temp}[0]);
       $self->{temp}=[$temp,1];
    }
    local $self->{current}=$self->{current};
@@ -1120,20 +571,20 @@ sub _iterate_array {
       $self->_present($array,$i) or $self->_fail('INVALID_TARGET','Array iteration encounters a deleted element');
       $self->{current}=[[$array,1],[$i]];
       if ($mode eq 'reduce') {
-         $self->_put($self->{temp}[0],$expr->temp_prop,$acc);
-         $acc=$self->_eval($expr->reduce_expr,$depth+1);
+         $self->_set_member($self->{temp}[0],$expr->{temp_prop},$acc);
+         $acc=$self->_eval($expr->{reduce_expr},$depth+1);
       }
       elsif ($mode eq 'filter') {
-         if ($self->_match($expr->match_expr,$depth+1)) {
+         if ($self->_match($expr->{match_expr},$depth+1)) {
             push @$out,$array->[$i];
             push @selected,$i if $meta;
          }
       }
-      else { $self->_put($out,$i,$self->_eval($expr->transform_expr,$depth+1)) }
+      else { $self->_set_member($out,$i,$self->_eval($expr->{transform_expr},$depth+1)) }
    }
    return $acc if $mode eq 'reduce';
-   JGraft::_Split->_select_meta($self,$array,$out,\@selected) if $mode eq 'filter' && $meta;
-   $self->_mark_date_container($out) if $mode eq 'filter' && @$out && $self->{date_containers}{refaddr($array)};
+   JGraft::_Split->_copy_meta($self,$array,$out,0,scalar(@selected),\@selected) if $mode eq 'filter' && $meta;
+   $self->_mark_date_container($out) if $mode eq 'filter' && @$out && $self->_contains_date($array);
    return $out;
 }
 sub JGraft::Expr::REDUCE::_execute { $_[1]->_iterate_array($_[0],$_[2],'reduce') }
@@ -1142,37 +593,42 @@ sub JGraft::Expr::MAP::_execute { $_[1]->_iterate_array($_[0],$_[2],'map') }
 
 sub JGraft::Expr::PROPS::_execute {
    my ($expr,$self,$depth)=@_;
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
    my $object=$self->_input_value($expr,'object_expr',$depth);
    type_mask($object)==TYPE_OBJECT or $self->_fail('INVALID_TARGET','PROPS expects an object');
    my $n=keys %$object;
    my $levels=1; $levels++ while 2**$levels<$n;
-   $self->_step($n*$levels);
-   $self->_charge('mem',16*$n);
+   $self->_tick($n*$levels);
+   $self->_scratch_set($scratch_base,16*$n);
    my @keys=sort { $self->_compare_values($a,$b,$depth+1) } keys %$object;
    my $options=$expr->{options} || 0;
-   my $out=$self->_new_array($options==2?2:$n);
+   my $out=$self->_alloc_array($options==2?2:$n);
    my ($names,$values);
-   if ($options==2) { $names=$self->_new_array($n); $values=$self->_new_array($n); @$out=($names,$values) }
+   if ($options==2) { $names=$self->_alloc_array($n); $values=$self->_alloc_array($n); @$out=($names,$values) }
    for my $key (@keys) {
       $self->_check_string($key,'expression key');
       if (!$options) { push @$out,$key }
       elsif ($options==1) {
-         my $pair=$self->_new_array(2);
-         $self->_put($pair,0,$key); $self->_put($pair,1,$object->{$key});
-         $self->_put($out,scalar @$out,$pair);
+         my $pair=$self->_alloc_array(2);
+         $self->_set_member($pair,0,$key); $self->_set_member($pair,1,$object->{$key});
+         $self->_set_member($out,scalar @$out,$pair);
       }
-      else { push @$names,$key; $self->_put($values,scalar @$values,$object->{$key}) }
+      else { push @$names,$key; $self->_set_member($values,scalar @$values,$object->{$key}) }
    }
    $self->_mark_date_container($out) if $options==2 && $self->_contains_date($values);
    return $out;
 }
 sub JGraft::Expr::MKOBJ::_execute {
    my ($expr,$self,$depth)=@_;
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   my $workspace=0;
    my @pairs;
    if (exists $expr->{prop_array_expr}) {
-      my $pairs=$self->_eval($expr->prop_array_expr,$depth+1);
+      my $pairs=$self->_eval($expr->{prop_array_expr},$depth+1);
       type_mask($pairs)==TYPE_ARRAY or $self->_fail('INVALID_TARGET','MKOBJ expects property pairs');
-      $self->_step(scalar @$pairs); $self->_charge('mem',16*@$pairs);
+      $self->_tick(scalar @$pairs); $self->_scratch_set($scratch_base,16*@$pairs);
       for my $i (0..$#$pairs) {
          $self->_present($pairs,$i) or $self->_fail('INVALID_TARGET','Deleted MKOBJ pair');
          my $pair=$pairs->[$i];
@@ -1183,14 +639,15 @@ sub JGraft::Expr::MKOBJ::_execute {
    }
    else {
       my @args;
-      $self->_step(scalar @{$expr->value_exprs});
-      $self->_charge('mem',32*@{$expr->value_exprs});
-      push @args,$self->_eval($_,$depth+1) for @{$expr->value_exprs};
+      $self->_tick(scalar @{$expr->{value_exprs}});
+      $workspace=32*@{$expr->{value_exprs}};
+      $self->_scratch_set($scratch_base,$workspace);
+      push @args,$self->_eval($_,$depth+1) for @{$expr->{value_exprs}};
       @args && @args%2==0 or $self->_fail('INVALID_TARGET','MKOBJ expects property pairs');
       if (@args==2 && type_mask($args[0])==TYPE_ARRAY && type_mask($args[1])==TYPE_ARRAY) {
          my ($names,$values)=@args;
          @$names==@$values or $self->_fail('INVALID_TARGET','MKOBJ array lengths differ');
-         $self->_step(scalar @$names); $self->_charge('mem',48*@$names);
+         $self->_tick(scalar @$names); $self->_scratch_set($scratch_base,$workspace+48*@$names);
          for my $i (0..$#$names) {
             $self->_present($names,$i) && $self->_present($values,$i) or $self->_fail('INVALID_TARGET','Deleted MKOBJ element');
             push @pairs,[$names->[$i],$values->[$i]];
@@ -1198,25 +655,25 @@ sub JGraft::Expr::MKOBJ::_execute {
       }
       else { for (my $i=0;$i<@args;$i+=2) { push @pairs,[@args[$i,$i+1]] } }
    }
-   my $out=$self->_new_hash(scalar @pairs);
-   $self->_step(scalar @pairs);
+   my $out=$self->_alloc_hash(scalar @pairs);
+   $self->_tick(scalar @pairs);
    for my $pair (@pairs) {
       my ($key,$value)=@$pair;
       type_mask($key)==TYPE_STRING or $self->_fail('INVALID_TARGET','MKOBJ names must be strings');
       $self->_check_string($key,'expression key');
-      $self->_step(length($key)*.001);
+      $self->_tick(length($key)*.001);
       exists $out->{$key} and $self->_fail('INVALID_TARGET','Duplicate MKOBJ property');
-      $self->_put($out,$key,$value);
+      $self->_set_member($out,$key,$value);
    }
    return $out;
 }
 sub JGraft::Expr::CASE::_execute {
    my ($expr,$self,$depth)=@_;
-   $self->_step(scalar @{$expr->branches});
-   for my $pair (@{$expr->branches}) {
+   $self->_tick(scalar @{$expr->{branches}});
+   for my $pair (@{$expr->{branches}}) {
       return $self->_eval($pair->[1],$depth+1) if $self->_match($pair->[0],$depth+1);
    }
-   return $self->_eval($expr->else_value_expr,$depth+1) if exists $expr->{else_value_expr};
+   return $self->_eval($expr->{else_value_expr},$depth+1) if exists $expr->{else_value_expr};
    $self->_fail('INVALID_TARGET','CASE has no matching branch');
 }
 
@@ -1228,24 +685,24 @@ sub _boolean_value {
 }
 sub JGraft::Expr::AND::_execute {
    my ($expr,$self,$depth)= @_;
-   $self->_step(scalar @{$expr->value_exprs});
-   for my $arg (@{$expr->value_exprs}) {
+   $self->_tick(scalar @{$expr->{value_exprs}});
+   for my $arg (@{$expr->{value_exprs}}) {
       return JSON::PP::false unless $self->_boolean_value($arg,$depth+1);
    }
    return JSON::PP::true;
 }
 sub JGraft::Expr::OR::_execute {
    my ($expr,$self,$depth)= @_;
-   $self->_step(scalar @{$expr->value_exprs});
-   for my $arg (@{$expr->value_exprs}) {
+   $self->_tick(scalar @{$expr->{value_exprs}});
+   for my $arg (@{$expr->{value_exprs}}) {
       return JSON::PP::true if $self->_boolean_value($arg,$depth+1);
    }
    return JSON::PP::false;
 }
 sub JGraft::Expr::NOT::_execute {
    my ($expr,$self,$depth)= @_;
-   $self->_step(scalar @{$expr->value_exprs});
-   for my $arg (@{$expr->value_exprs}) {
+   $self->_tick(scalar @{$expr->{value_exprs}});
+   for my $arg (@{$expr->{value_exprs}}) {
       return JSON::PP::false if $self->_boolean_value($arg,$depth+1);
    }
    return JSON::PP::true;
@@ -1264,8 +721,10 @@ sub JGraft::Expr::CASTNUM::_execute {
    my $v=$self->_input_value($expr,'value_expr',$depth);
    my $t=type_mask($v);
    return $v if $t==TYPE_NUMBER;
-   if ($t==TYPE_STRING && $v =~ /\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z/) {
-      $self->_step(length($v)*.001);
+   if ($t==TYPE_STRING) {
+      $self->_tick(length($v)*.001);
+      $v =~ /\A[+-]?(?:0|[1-9][0-9]*)(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?\z/
+         or $self->_fail('INVALID_TARGET','Invalid CASTNUM input');
       my $num=0+$v;
       is_finite($num) or $self->_fail('UNSUPPORTED_GRAFT','Number outside supported range');
       if ($num==0) {
@@ -1284,33 +743,43 @@ sub JGraft::Expr::CASTSTR::_execute {
    return $v? 'true':'false' if $t==TYPE_BOOLEAN;
    if ($t==TYPE_DATE) {
       my $date=$self->_date($v);
-      $self->_step(length($date->fraction)*.01+1);
+      $self->_tick(length($date->fraction)*.01+1);
       my $out=$date->to_iso8601;
-      $self->_charge('mem',length($out));
+      $self->_reserve(0,length($out),0);
       return $out;
    }
    if ($t==TYPE_NUMBER) {
-      my $integer=is_integer($v);
       my $out;
       if (ref $v) {
-         my $number=$self->_number($v);
+         my $scratch_base=$self->{scratch_mem};
+         local $self->{scratch_mem}=$scratch_base;
+         my $size=JGraft::Util::estimate_number_digits($v);
+         # A finite decimal needs at most log2(10) places per denominator
+         # digit. Cover factoring/scaling copies and reserve the escaping text
+         # before conversion; the rational itself is private to this call.
+         my $characters=4*$size+4;
+         my $workspace=[$scratch_base,128+64*$characters];
+         $self->_scratch_set(@$workspace);
+         $self->_reserve(1+$characters*$characters*.01,$characters,0);
+         my $number=$self->_number($v,$workspace,$size);
          $out=eval { JGraft::Util::to_decimal_string($number) };
          $@ and $self->_fail('UNSUPPORTED_GRAFT',"$@");
+         return $out;
       }
-      else {
-         # Support negative zero via sprintf
-         $out= $v? "$v" : sprintf('%g', $v);
-      }
+      my $integer=is_integer($v);
+      # Support negative zero via sprintf. Check integer typing before older
+      # Perls can add string flags while producing the native spelling.
+      $out= $v? "$v" : sprintf('%g', $v);
       # If scientific notation was used for an integer, expand the digits.
       if ($integer && $out =~ /\A(-?)([0-9]+)(?:\.([0-9]+))?[eE]([+-]?[0-9]+)\z/) {
          my ($sign,$whole,$fraction,$exponent)=($1,$2,defined($3)?$3:'',0+$4);
          my $length=length($sign)+length($whole)+$exponent;
-         $self->_step($length*.001); $self->_charge('mem',$length);
+         $self->_tick($length*.001); $self->_reserve(0,$length,0);
          my $digits=$whole.$fraction;
          my $zeros=$exponent-length($fraction);
          $out=$sign.($zeros>=0? $digits.('0'x$zeros) : substr($digits,0,length($digits)+$zeros));
       }
-      else { $self->_step(length($out)*.001); $self->_charge('mem',length($out)) }
+      else { $self->_tick(length($out)*.001); $self->_reserve(0,length($out),0) }
       return $out;
    }
    $self->_fail('INVALID_TARGET','Invalid CASTSTR input');
@@ -1321,38 +790,47 @@ sub JGraft::Expr::CASTDATE::_execute {
 }
 sub _compare_values {
    my ($self,$a,$b,$depth)=@_;
-   $self->_depth($depth); $self->_step(1);
+   $self->_enter($depth);
    my $type=type_mask($a);
    $type==type_mask($b) or $self->_fail('INVALID_TARGET','Comparison requires matching types');
    if ($type==TYPE_DATE) {
       ($a,$b)=($self->_date($a),$self->_date($b));
       $a->type eq $b->type or $self->_fail('INVALID_TARGET','Comparison requires matching date precisions');
-      $self->_step(16+length($a->fraction)+length($b->fraction));
+      $self->_tick(16+length($a->fraction)+length($b->fraction));
       return $a->_compare($b);
    }
    if ($type==TYPE_NUMBER) {
       is_finite($a) && is_finite($b) or $self->_fail('INVALID_TARGET','Comparison requires finite numbers');
-      ($a,$b)=($self->_number($a),$self->_number($b)) if ref($a) || ref($b);
+      if (ref($a) || ref($b)) {
+         my $scratch_base=$self->{scratch_mem};
+         local $self->{scratch_mem}=$scratch_base;
+         my $workspace=[$scratch_base,0];
+         ($a,$b)=($self->_number($a,$workspace),$self->_number($b,$workspace));
+         return $a<=>$b;
+      }
       return $a<=>$b;
    }
    return $a<=>$b if $type==TYPE_BOOLEAN;
    if ($type==TYPE_STRING) {
       my $policy=$self->{options}{codepoint_policy} || 'preserve';
       if (!ref($policy) && $policy eq 'preserve') {
-         $self->_step((length($a)+length($b))*.001);
+         $self->_tick((length($a)+length($b))*.001);
          return $a cmp $b;
       }
       require JGraft::_String;
-      my $av=JGraft::_String->_new($self,$a,'comparison');
-      my $bv=JGraft::_String->_new($self,$b,'comparison');
+      my $scratch_base=$self->{scratch_mem};
+      local $self->{scratch_mem}=$scratch_base;
+      $self->_scratch_set($scratch_base,JGraft::_String->_workspace($a)+JGraft::_String->_workspace($b));
+      my $av=JGraft::_String->_new($self,$a,'comparison',undef,1);
+      my $bv=JGraft::_String->_new($self,$b,'comparison',undef,1);
       my $size=$av->{size}<$bv->{size}?$av->{size}:$bv->{size};
-      $self->_step($size);
+      $self->_tick($size);
       for my $i (0..$size-1) { my $c=$av->_at($i)<=>$bv->_at($i); return $c if $c }
       return $av->{size}<=>$bv->{size};
    }
    if ($type==TYPE_ARRAY) {
       my $size=@$a<@$b?scalar @$a:scalar @$b;
-      $self->_step($size);
+      $self->_tick($size);
       for my $i (0..$size-1) {
          $self->_present($a,$i) && $self->_present($b,$i) or $self->_fail('INVALID_TARGET','Comparison encounters a deleted element');
          my $c=$self->_compare_values($a->[$i],$b->[$i],$depth+1); return $c if $c;
@@ -1364,80 +842,195 @@ sub _compare_values {
 sub JGraft::Expr::LESS::_execute {
    my ($expr,$self,$depth)=@_;
    my $a=$self->_input_value($expr,'expr_a',$depth);
-   my $b=$self->_eval($expr->expr_b,$depth+1);
+   my $b=$self->_eval($expr->{expr_b},$depth+1);
    return $self->_compare_values($a,$b,$depth+1)<0? JSON::PP::true : JSON::PP::false;
 }
 sub JGraft::Expr::LESSEQ::_execute {
    my ($expr,$self,$depth)=@_;
    my $a=$self->_input_value($expr,'expr_a',$depth);
-   my $b=$self->_eval($expr->expr_b,$depth+1);
+   my $b=$self->_eval($expr->{expr_b},$depth+1);
    return $self->_compare_values($a,$b,$depth+1)<=0? JSON::PP::true : JSON::PP::false;
 }
 
 sub _numeric_values {
-   my ($self,$expr,$depth)= @_;
+   my ($self,$expr,$depth,$workspace)= @_;
    my @values;
+   $workspace->[1]+=80+32*(exists($expr->{value_exprs})? scalar @{$expr->{value_exprs}} : 2);
+   $self->_scratch_set(@$workspace);
    if (exists $expr->{value_exprs}) {
-      $self->_step(scalar @{$expr->value_exprs});
-      @values=map $self->_eval($_,$depth+1), @{$expr->value_exprs};
+      $self->_tick(scalar @{$expr->{value_exprs}});
+      @values=map $self->_eval($_,$depth+1), @{$expr->{value_exprs}};
       if (@values==1 && ref $values[0] eq 'ARRAY') {
          my $array=$values[0];
-         $self->_step(scalar @$array);
+         $self->_tick(scalar @$array);
+         $workspace->[1]+=32*@$array;
+         $self->_scratch_set(@$workspace);
          for my $i (0..$#$array) { $self->_present($array,$i) or $self->_fail('INVALID_TARGET','Deleted array element') }
          @values=@$array;
       }
    }
    else { @values=map $self->_eval($expr->{$_},$depth+1), qw(value_expr1 value_expr2) }
-   $self->_step(scalar @values);
+   $self->_tick(scalar @values);
    for my $v (@values) { type_mask($v)==TYPE_NUMBER && is_finite($v) or $self->_fail('INVALID_TARGET','Arithmetic expects finite numbers') }
-   @values=map $self->_number($_),@values if grep ref($_),@values;
-   return @values;
+   if (grep ref($_),@values) {
+      for my $i (0..$#values) { $values[$i]=$self->_number($values[$i],$workspace) }
+   }
+   return \@values;
 }
 sub _number {
-   my ($self,$value)=@_;
-   my $size=ref($value)?JGraft::Util::estimate_number_digits($value):32;
-   $self->_step(1+$size*$size*.01);
-   $self->_allocation(128+16*$size);
+   my ($self,$value,$workspace,$size)=@_;
+   unless (defined $size) {
+      $size=JGraft::Util::estimate_number_digits($value);
+      $size=32 if !ref($value) && $size<32;
+   }
+   $self->_tick(1+$size*$size*.01);
+   # All callers consume the copy within their own reservation. Result values
+   # have separate retained charges; copying still counts as an allocation.
+   $self->_reserve(0,0,1);
+   $workspace->[1]+=192+16*$size;
+   $self->_scratch_set(@$workspace);
    my $out=eval { JGraft::Util::to_rational($value) };
-   $@ and $self->_fail('UNSUPPORTED_GRAFT',"Numeric conversion: $@");
+   my $error=$@;
+   die $error if ref $error;
+   $self->_fail('UNSUPPORTED_GRAFT',"Numeric conversion: $error") if $error;
    return $out;
 }
 sub _finite_result {
    my ($self,$result)= @_;
    is_finite($result) or $self->_fail('INVALID_TARGET','Non-finite arithmetic result');
-   if (ref $result) {
-      my $size=length($result->bstr);
-      $self->_step($size); $self->_allocation(128+8*$size);
+   return $result;
+}
+# The arithmetic call owns operand copies plus a reusable accumulator/workspace.
+# An escaping final result is paid before the operation, using a digit bound;
+# intermediate results remain covered until the next step consumes them.
+# workspace = [outer scratch, fixed operand bytes, current accumulator bytes].
+sub _exact_step {
+   my ($self,$op,$a,$b,$workspace,$final)=@_;
+   my ($base,$floor)=@$workspace;
+   my $accumulator=$workspace->[2] || 0;
+   $self->_scratch_set($base,$floor+512+$accumulator);
+   is_finite($a) && is_finite($b) or $self->_fail('INVALID_TARGET','Non-finite arithmetic result');
+   my $class=ref($b) || ref($a);
+   my $lib=$class->config('lib');
+   my ($an,$ad,$ai,$as,$az,$ao,$alen)=JGraft::Util::_rational_shape($a,$lib);
+   my ($bn,$bd,$bi,$bs,$bz,$bo,$blen)=JGraft::Util::_rational_shape($b,$lib);
+   $self->_tick(1+($alen+$blen)*($alen+$blen)*.01);
+   my ($n,$d,$integer,$negative);
+   if ($op eq 'add' || $op eq 'sub') {
+      $n=($an+$bd>$bn+$ad?$an+$bd:$bn+$ad)+1;
+      $d=$ad+$bd;
+      $integer=$ai && $bi;
+      $negative=1; # Either sign is possible before adding/subtracting.
    }
+   elsif ($op eq 'mul' || $op eq 'div') {
+      ($n,$d)=$op eq 'mul'?($an+$bn,$ad+$bd):($an+$bd,$ad+$bn);
+      $integer=$op eq 'mul' && $ai && $bi;
+      $negative=$as!=$bs?1:0;
+   }
+   else { # Floor modulus: the remainder has the divisor's sign and magnitude.
+      $n=$ai && $bi?$bn:$bn+$ad+1;
+      $d=$ad+$bd;
+      $integer=$ai && $bi;
+      $negative=$bs;
+   }
+   my $size=$n+$negative+($integer?0:1+$d);
+   my $digits=$an+$bd+$bn+$ad+$n+$d;
+   $digits+=2*($an+$bd+$ad+$bn) if $op eq 'mod'; # Quotient/floor/product buffers.
+   $self->_scratch_set($base,$floor+512+$accumulator+8*$digits);
+   my $same=$an==$bn && $ad==$bd && JGraft::Util::_rational_same_magnitude($a,$b,$lib);
+   if ($op eq 'add') {
+      $size=$az?$blen:$bz?$alen:$same && $as!=$bs?1:$size;
+   }
+   elsif ($op eq 'sub') {
+      $size=$bz?$alen:$az?$blen-$bs+($bs?0:1):$same && $as==$bs?1:$size;
+   }
+   elsif ($op eq 'mul') {
+      $size=$az || $bz?1:$ao?$blen-$bs+$negative:$bo?$alen-$as+$negative:$size;
+   }
+   elsif ($op eq 'div') {
+      $size=$az?1:$bo?$alen-$as+$negative:$same?1+$negative:$size;
+   }
+   else { $size=1 if $az || $same || ($ai && $bo) }
+   # Padding covers small representation/header differences across Math versions.
+   my $bytes=192+8*($size+8);
+   if ($final) { $self->_reserve($size,$bytes,1) }
+   else { $self->_scratch_set($base,$floor+512+$accumulator+8*$digits+$bytes) }
+   my $result;
+   if ($op eq 'add') { $result=$a+$b }
+   elsif ($op eq 'sub') { $result=$a-$b }
+   elsif ($op eq 'mul') { $result=$a*$b }
+   elsif ($op eq 'div') { $result=$a/$b }
+   else {
+      my $quotient=$a/$b;
+      require POSIX unless ref $quotient;
+      my $floor=ref($quotient)?$quotient->bfloor:POSIX::floor($quotient);
+      $result=$a-$floor*$b;
+   }
+   $workspace->[2]=$final?0:$bytes;
    return $result;
 }
 sub JGraft::Expr::ADD::_execute {
    my ($expr,$self,$depth)= @_;
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   my $workspace=[$scratch_base,0];
+   my $values=$self->_numeric_values($expr,$depth,$workspace);
    my $result=0;
-   $result+=$_ for $self->_numeric_values($expr,$depth);
+   if (@$values && ref $values->[0]) {
+      for my $i (0..$#$values) { $result=$self->_exact_step('add',$result,$values->[$i],$workspace,$i==$#$values) }
+      $self->{scratch_mem}=$scratch_base+$workspace->[1];
+      return $self->_finite_result($result);
+   }
+   $self->_tick(scalar @$values);
+   $result+=$_ for @$values;
    return $self->_finite_result($result);
 }
 sub JGraft::Expr::MUL::_execute {
    my ($expr,$self,$depth)= @_;
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   my $workspace=[$scratch_base,0];
+   my $values=$self->_numeric_values($expr,$depth,$workspace);
    my $result=1;
-   $result*=$_ for $self->_numeric_values($expr,$depth);
+   if (@$values && ref $values->[0]) {
+      for my $i (0..$#$values) { $result=$self->_exact_step('mul',$result,$values->[$i],$workspace,$i==$#$values) }
+      $self->{scratch_mem}=$scratch_base+$workspace->[1];
+      return $self->_finite_result($result);
+   }
+   $self->_tick(scalar @$values);
+   $result*=$_ for @$values;
    return $self->_finite_result($result);
 }
 sub JGraft::Expr::SUB::_execute {
    my ($expr,$self,$depth)= @_;
-   my ($a,$b)=$self->_numeric_values($expr,$depth);
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   my $workspace=[$scratch_base,0];
+   my ($a,$b)=@{$self->_numeric_values($expr,$depth,$workspace)};
+   if (ref $a) { return $self->_finite_result($self->_exact_step('sub',$a,$b,$workspace,1)) }
+   $self->_tick(1);
    return $self->_finite_result($a-$b);
 }
 sub JGraft::Expr::DIV::_execute {
    my ($expr,$self,$depth)= @_;
-   my ($a,$b)=$self->_numeric_values($expr,$depth);
-   $b!=0 or $self->_fail('INVALID_TARGET','Division by zero');
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   my $workspace=[$scratch_base,0];
+   my ($a,$b)=@{$self->_numeric_values($expr,$depth,$workspace)};
+   (ref($b)?!$b->is_zero:$b!=0) or $self->_fail('INVALID_TARGET','Division by zero');
+   if (ref $a) { return $self->_finite_result($self->_exact_step('div',$a,$b,$workspace,1)) }
+   $self->_tick(1);
    return $self->_finite_result($a/$b);
 }
 sub JGraft::Expr::MOD::_execute {
    my ($expr,$self,$depth)= @_;
-   my ($a,$b)=$self->_numeric_values($expr,$depth);
-   $b!=0 or $self->_fail('INVALID_TARGET','Division by zero');
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   my $workspace=[$scratch_base,0];
+   my ($a,$b)=@{$self->_numeric_values($expr,$depth,$workspace)};
+   (ref($b)?!$b->is_zero:$b!=0) or $self->_fail('INVALID_TARGET','Division by zero');
+   if (ref $a) { return $self->_finite_result($self->_exact_step('mod',$a,$b,$workspace,1)) }
+   $self->_tick(1);
    require POSIX;
    my $quotient=$a/$b;
    my $floor=ref($quotient)?$quotient->bfloor:POSIX::floor($quotient);
@@ -1446,9 +1039,12 @@ sub JGraft::Expr::MOD::_execute {
 
 sub _slice {
    my ($self,$expr,$depth)= @_;
+   my $scratch_base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$scratch_base;
+   local $self->{path_workspace}=[$scratch_base,0];
    my ($value,$ofs,$len,$lim);
    if (exists $expr->{config_obj}) {
-      my $config=$self->_eval($expr->config_obj,$depth+1);
+      my $config=$self->_eval($expr->{config_obj},$depth+1);
       ref $config eq 'HASH' or $self->_fail('INVALID_OPERAND','SLICE config must be an object');
       for my $key (qw(ofs len lim)) {
          next unless exists $config->{$key};
@@ -1457,22 +1053,22 @@ sub _slice {
       if (exists $config->{path}) {
          ref $config->{path} eq 'ARRAY' or $self->_fail('INVALID_OPERAND','SLICE path must be an array');
          require JGraft;
-         $value=($self->_read($self->_path(JGraft::NODE($config->{path}),'read',$depth+1)))[0];
+         $value=$self->_read_value($self->_expand_path(JGraft::NODE($config->{path}),'read',$depth+1));
       }
-      else { $value=($self->_read($self->{current}))[0] }
+      else { $value=$self->_read_value($self->{current}) }
       ($ofs,$len,$lim)=@{$config}{qw(ofs len lim)};
       if (grep ref($_),($ofs,$len,$lim)) {
-         ($ofs,$len,$lim)=map ref($_)?$self->_number($_):$_,($ofs,$len,$lim);
+         ($ofs,$len,$lim)=map ref($_)?$self->_number($_,$self->{path_workspace}):$_,($ofs,$len,$lim);
       }
       if (defined $ofs && defined $len && defined $lim && $ofs+$len!=$lim) { $self->_fail('INVALID_OPERAND','Inconsistent SLICE bounds') }
       $ofs=defined $len && defined $lim? $lim-$len : 0 unless defined $ofs;
    }
    else {
-      $value=$self->_eval($expr->value_expr,$depth+1);
-      $ofs=$self->_eval($expr->ofs,$depth+1);
-      $len=$self->_eval($expr->len,$depth+1) if exists $expr->{len};
+      $value=$self->_eval($expr->{value_expr},$depth+1);
+      $ofs=$self->_eval($expr->{ofs},$depth+1);
+      $len=$self->_eval($expr->{len},$depth+1) if exists $expr->{len};
       is_integer($ofs) && (!exists $expr->{len} || is_integer($len)) or $self->_fail('INVALID_OPERAND','SLICE bounds must be integers');
-      ($ofs,$len)=map ref($_)?$self->_number($_):$_,($ofs,$len) if ref($ofs) || ref($len);
+      ($ofs,$len)=map ref($_)?$self->_number($_,$self->{path_workspace}):$_,($ofs,$len) if ref($ofs) || ref($len);
    }
    my $type=type_mask($value);
    $type==TYPE_ARRAY || $type==TYPE_STRING or $self->_fail('INVALID_TARGET','SLICE expects an array or string');
@@ -1483,15 +1079,9 @@ sub _slice {
    if (ref($ofs) || ref($lim)) {
       ($ofs,$lim)=map JGraft::Util::to_native_number($_),($ofs,$lim);
    }
-   if ($type==TYPE_STRING) { $self->_step(($lim-$ofs)*.001); $self->_charge('mem',4*($lim-$ofs)); return substr($value,$ofs,$lim-$ofs) }
-   my $out=$self->_new_array($lim-$ofs);
-   $self->_step($lim-$ofs);
-   for (my $i=$ofs;$i<$lim;++$i) {
-      $self->_present($value,$i) or $self->_fail('INVALID_TARGET','SLICE contains a deleted element');
-      push @$out,$value->[$i];
-   }
-   JGraft::_Split->_copy_meta($self,$value,$out,$ofs,$lim-$ofs) if $self->{split_meta}{refaddr($value)};
-   $self->_mark_date_container($out) if $self->{date_containers}{refaddr($value)} && $lim>$ofs;
+   if ($type==TYPE_STRING) { $self->_tick(($lim-$ofs)*.001); $self->_reserve(0,4*($lim-$ofs),0); return substr($value,$ofs,$lim-$ofs) }
+   my $out=$self->_alloc_array($lim-$ofs);
+   $self->_append_range($out,$value,$ofs,$lim-$ofs);
    return $out;
 }
 
@@ -1580,6 +1170,12 @@ execution generation. Copying a container freezes that generation; subsequent
 writes shallow-clone the affected path. This also separates logical copies of
 containers created earlier in the same execution. MOVE transfers ownership and
 keeps deferred deletions/insertions attached to array identity until its end.
+Ownership, paid capacity, date summaries, split metadata, and pending edits share
+guarded container records with weak owners and per-application serial identities.
+Lazy undo retains separate weak serial/origin identities. Split metadata does not
+retain its array, and only an active MOVE batch retains deferred arrays strongly.
+Application namespaces and caches are released on success, failure, and callback
+exceptions, while public results and lazy undo state remain available.
 
 =constructor new
 
@@ -1588,8 +1184,48 @@ C<codepoint_policy>, and C<date_format>. Limits
 are estimated cumulative C<ops>, C<mem>, C<new_obj>, and maximum C<depth>. Defaults
 are 1,000,000 operations, 64 MiB, 100,000 data containers, and depth 256. An explicit
 undef disables an individual limit. Memory accounting is a conservative cumulative
-allocation estimate including path and deferred-array scratch space; it does not
-subtract reclaimed storage. Input and pre-existing graft containers are excluded
+allocation estimate; it does not subtract reclaimed retained storage. Unicode
+validation, path and inspection vectors, temporary packed views, sequence workspaces,
+character-class construction,
+JOIN/collection work vectors, SPLICE buffers, and deferred MOVE queues use scoped
+scratch reservations instead of accumulating in C<mem>. Explicit reservations,
+including small buffers held across tracked calls, must fit in full alongside
+cumulative memory and other active reservations; a scratch failure can leave
+C<mem> below its limit.
+Returned captures, completed caches, and execution metadata remain cumulative.
+Private match state is scoped scratch; matching returns only its completed
+capture table. Direct-element SPLIT provenance stays reserved through its
+consuming COPY, MOVE, literal-array insertion, or SPLICE. SPLICE covers all
+replacement provenance records together. Metadata copy/slice/filter/append
+vectors are scratch, while installed row vectors and formatting rows remain
+retained. Exact-JSON encoding and formatting walk live member links without
+allocating offset lists; their traversal work remains charged.
+Codepoint-policy callback context values are retained allocations because the
+callback can keep them. Temporary rational operands and numeric bound copies are
+scoped scratch but still contribute to C<new_obj>. Arithmetic operand vectors and
+decimal-formatting workspaces stay reserved through their consuming operation.
+Escaping arithmetic results remain retained; numeric CASTSTR reserves a
+conservative output-size bound before expanding an exact decimal string.
+Object transformation key lists, date-export memo/key tables, and resolved
+SPLIT/JOIN configurations are scoped scratch. Date normalization and formatter
+cache entries remain cumulative metadata. Date export chooses exact-object
+storage directly, preserving hidden duplicate members without a discarded hash.
+Creating an exact-number lazy cache is a retained allocation; an existing cache
+is pre-existing input storage. Numeric and exact-object accounting contexts are
+localized per application and suspended during lazy undo construction.
+Numeric inspection, clone sizing, and arithmetic bounds use representation digit
+counts instead of allocating decimal spellings. Exact arithmetic reserves work
+and simultaneous temporary growth before each operation; its final result is
+charged as retained memory before calculation using a conservative digit bound.
+Intermediate accumulators remain scoped scratch. Native arithmetic charges its
+fold work before execution. Numeric clones charge their
+digit-copy work. Plain hash construction can initialize from an existing table,
+reserving its temporary key/value list through allocation and copying; namespaces
+and capture-table copies share this path. LOCAL bindings use paid property growth.
+Constructed containers reserve logical capacity; filling paid slots or reusing
+them after a shrink does not charge the slots again. Ownership records use weak
+references and contribute to retained memory estimates.
+Input and pre-existing graft containers are excluded
 from new allocations. JSON-data graft compilation is conservatively precharged.
 
 Strings contain Perl characters, not encoded UTF-8 octets. Unflagged bytes denote

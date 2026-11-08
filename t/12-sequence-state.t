@@ -67,11 +67,15 @@ my $graft=JGRAFT(COPY(1,'changed'),MATCH({items=>IS([SEQ(REP())])}));
 my $input={items=>[1..60]};
 my $baseline=JGraft::Exec->new(jgraft=>$graft,undo=>1);
 $baseline->apply($input);
-my $exec=JGraft::Exec->new(jgraft=>$graft,undo=>1,limits=>{mem=>$baseline->counters->{mem}*.8});
+my $exec=JGraft::Exec->new(jgraft=>$graft,undo=>1,limits=>{mem=>$baseline->counters->{mem}});
 $exec->apply($input);
-is($exec->error,'RESOURCE_LIMIT','successor/cursor allocations respect memory limits');
+is($exec->error,'RESOURCE_LIMIT','live successor workspace respects memory limits');
 is($exec->output->{changed},1,'resource exhaustion preserves preceding actions');
 is(jgexec($exec->undo,$exec->output),$input,'undo restores partial progress after sequence resource exhaustion');
+like($exec->message,qr/scratch/,'frontier failure identifies live workspace');
+is($exec->{scratch_mem},0,'frontier failure unwinds its reservation');
+test_conformance({name=>'frontier workspace partial failure',input=>$input,
+   jgraft=>$graft->to_json_data,limits=>{mem=>$baseline->counters->{mem}},errors=>{RESOURCE_LIMIT=>1}});
 $exec=JGraft::Exec->new(jgraft=>JGRAFT({expr=>['cycle',EXPR('cycle')]},MATCH([SEQ(EXPR('cycle'))])),limits=>{depth=>40});
 $exec->apply([]);
 is($exec->error,'RESOURCE_LIMIT','recursive macros inside sequences remain bounded');
@@ -87,4 +91,104 @@ is($decoded->{tests}[0]{input},$normal_input,'outline preserves arbitrary keys a
 is(ord($decoded->{tests}[1]{input}),0xd800,'fixture decoding retains lone surrogates');
 like(dies { Test2AndUtils::_conformance_json(substr($outline,0,-1)) },qr/conformance JSON/,'truncated outline is rejected');
 like(dies { Test2AndUtils::_conformance_json('{"name":false,}') },qr/(?:unexpected|expected|malformed)/i,'ordinary invalid JSON is rejected by decoder');
+{
+   my $graft=JGRAFT(COPY(1,'changed'),MATCH({items=>[SEQMAX('g'x2000,REP())]}));
+   my $input={items=>[]};
+   my $baseline=JGraft::Exec->new(jgraft=>$graft,undo=>1);
+   $baseline->apply($input);
+   ok($baseline->success,'long capture-name preparation baseline succeeds');
+   my $limits={mem=>$baseline->counters->{mem}};
+   my $limited=JGraft::Exec->new(jgraft=>$graft,undo=>1,limits=>$limits);
+   $limited->apply($input);
+   is($limited->error,'RESOURCE_LIMIT','sequence preparation workspace must fit while live');
+   like($limited->message,qr/scratch/,'sequence preparation reports scratch exhaustion');
+   cmp_ok($limited->counters->{mem},'<',$limits->{mem},'preparation scratch does not inflate retained mem');
+   is($limited->output,{items=>[],changed=>1},'preparation failure preserves earlier edit');
+   is($limited->{scratch_mem},0,'sequence preparation failure unwinds reservation');
+   test_conformance({name=>'sequence preparation scratch failure',input=>$input,
+      jgraft=>$graft->to_json_data,limits=>$limits,errors=>{RESOURCE_LIMIT=>1}});
+   $limited->apply({items=>[1]});
+   is($limited->{scratch_mem},0,'reused matching context has no stale scratch');
+}
+for my $pattern (
+   [SEQ(REP())],
+   [SEQ(ANY(SEQ(REP()),SEQ(REP())))],
+   [SEQ(ALL(SEQ(REP()),SEQ(REP())))],
+) {
+   my @mem;
+   for my $size (2,60) {
+      my $exec=JGraft::Exec->new(jgraft=>COPY(IS($pattern),NODE()));
+      $exec->apply([(1)x$size]);
+      ok($exec->success,'endpoint exploration succeeds');
+      is($exec->output,$true,'endpoint preferences preserve whole-array matching');
+      is($exec->{scratch_mem},0,'completed candidate/frontier buffers unwind');
+      push @mem,$exec->counters->{mem};
+   }
+   is($mem[1],$mem[0],'larger private frontiers do not accumulate retained mem');
+}
+{
+   no warnings 'utf8';
+   my ($weak,$active);
+   my $throw=1;
+   my $sentinel="frontier callback exception\n";
+   my $exec=JGraft::Exec->new(
+      jgraft=>COPY(IS([SEQ(REP(1,0,CHARS('ab'.chr(0xfdd0))))]),NODE()),
+      codepoint_policy=>sub {
+         if ($throw && $_[1]{kind} eq 'character class') {
+            $active=$weak->{scratch_mem};
+            $throw=0;
+            die $sentinel;
+         }
+         return 'preserve';
+      });
+   $weak=$exec;
+   Scalar::Util::weaken($weak);
+   is(dies {$exec->apply([97])},$sentinel,'predicate callback exception escapes candidate probing');
+   ok($active>1024,'candidate workspace remains covered during callback');
+   is($exec->{scratch_mem},0,'predicate callback unwinds the complete frontier');
+   $exec->apply([97]);
+   ok($exec->success,'candidate context reusable after callback exception');
+   is($exec->output,$true,'reused candidate context matches normally');
+}
+{
+   # Successor probes share an arena, but each probe frame has its own scope.
+   # Instrument dispatch to grow returned workspace inside two nested probes.
+   my $exec=JGraft::Exec->new(jgraft=>JGRAFT());
+   $exec->apply([]);
+   require JGraft::_Match;
+   require JGraft::_Sequence;
+   my $scope={level=>0};
+   my $trap=0;
+   {
+      local $exec->{scratch_mem}=512;
+      my $match=JGraft::_Match->_new($exec,0);
+      my $cursor=$match->_cursor([1],1,undef,undef);
+      my $workspace=[512,0];
+      my $sequence=JGraft::_Sequence->_new($match,[1],$cursor,0,0,undef,$workspace);
+      my $state={pos=>0,caps=>$match->{captures}};
+      {
+         no warnings 'redefine';
+         local *JGraft::_Sequence::_dispatch=sub {
+            my $self=shift;
+            local $scope->{level}=$scope->{level}+1;
+            my $before=$exec->{scratch_mem};
+            $self->_scratch(2048);
+            is($exec->{scratch_mem},$before+2048,'arena growth preserves every active probe frame');
+            return $self->_successors(SEQ(),$state,1,0,undef) if $scope->{level}<2;
+            $exec->_fail('INVALID_OPERAND','trapped arena test') if $trap;
+            return [$state];
+         };
+         is($sequence->_successors(SEQ(),$state,1,0,undef),[$state],
+            'nested successor probes return their frontier');
+         is($exec->{scratch_mem},512+$workspace->[1],
+            'returned arena growth remains reserved after probe frames unwind');
+         $trap=1;
+         is($sequence->_successors(SEQ(),$state,1,0,undef),[],
+            'nested probes retain expected operand-error trapping');
+         is($exec->{scratch_mem},512+$workspace->[1],
+            'trapped failures preserve the owning arena reservation');
+      }
+   }
+   is($exec->{scratch_mem},0,'owning call releases the shared arena');
+}
 done_testing;

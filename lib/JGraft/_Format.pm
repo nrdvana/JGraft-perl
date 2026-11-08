@@ -47,7 +47,7 @@ sub _format {
 # In particular, metadata definition arrays and escaped literals are not nodes.
 sub _node {
    my ($self,$node,$arguments)=@_;
-   my $data=ref($node)? $node->to_json_data(sub {$self->_node(@_)}) : [$node->_name,@$arguments];
+   my $data=ref($node)? $node->to_json_data(sub {$self->_node(@_)}) : [$node->name,@$arguments];
    $self->_tag($data,$node);
    return $data;
 }
@@ -55,9 +55,9 @@ sub _tag {
    my ($self,$data,$node)=@_;
    # Registry lookups can add string flags to cached IDs on old interpreters.
 #__p5.28__
-   $data->[0]=$self->{options}{ids}? $node->id : $node->_name;
+   $data->[0]=$self->{options}{ids}? $node->id : $node->name;
 #__p5.8__
-#   $data->[0]=$self->{options}{ids}? 0+$node->id : $node->_name;
+#   $data->[0]=$self->{options}{ids}? 0+$node->id : $node->name;
 #__end__
    my $form=ref($node)? $node->{_form} : $node->forms->[0];
    my @groups;
@@ -79,7 +79,7 @@ sub _tag {
    my $end=$#$data-($tail?1:0);
    if (my $repeat=$form->{repeat}) {
       my $width=@$repeat-1;
-      $width=2 if $node->_name eq 'MKOBJ';
+      $width=2 if $node->name eq 'MKOBJ';
       while ($i<=$end) {
          my $last=$i+$width-1;
          $last=$end if $last>$end;
@@ -210,8 +210,14 @@ sub _shape {
    my ($self,$value)=@_;
    if (ref($value) eq 'HASH') {
       my $tie=tied %$value;
-      return ('{','}',[map +{values=>[@{$tie->{tokens}}[$_,$_+1]],pair=>1,separator=>': '},$tie->_members])
-         if $tie && $tie->isa('JGraft::JSON::Object');
+      if ($tie && $tie->isa('JGraft::JSON::Object')) {
+         my @groups;
+         for (my $i=$tie->{head};defined $i;$i=$tie->{seq}[$i+1]) {
+            $JGraft::JSON::Object::EXEC->_tick(1) if $JGraft::JSON::Object::EXEC;
+            push @groups,{values=>[@{$tie->{tokens}}[$i,$i+1]],pair=>1,separator=>': '};
+         }
+         return ('{','}',\@groups);
+      }
       return ('{','}',[map +{values=>[$_,$value->{$_}],pair=>1,separator=>': '},sort keys %$value]);
    }
    my $info=$self->{directives}{refaddr($value)};
@@ -345,7 +351,8 @@ sub _compact_value {
       my $tie=$object?tied(%$value):undef;
       if ($tie && $tie->isa('JGraft::JSON::Object')) {
          my $written=0;
-         for my $i ($tie->_members) {
+         for (my $i=$tie->{head};defined $i;$i=$tie->{seq}[$i+1]) {
+            $JGraft::JSON::Object::EXEC->_tick(1) if $JGraft::JSON::Object::EXEC;
             $self->_emit($state,',') if $written++;
             $self->_emit($state,$self->_scalar($tie->{tokens}[$i]));
             $self->_emit($state,':');

@@ -84,11 +84,11 @@ for my $name ('',0,-1,'1.5','__proto__','constructor','a.b',"\x{96ea}") {
       JGRAFT({const=>[$name,7],expr=>[$name,CONST($name)]},COPY(EXPR($name),'out')),{out=>7});
 }
 for my $body (CONST('x'),CAP(),CAP('x')) {
-   failure('path macro cannot write '.$body->_name,{},
+   failure('path macro cannot write '.$body->name,{},
       JGRAFT({const=>['x',1],expr=>['target',$body]},COPY(2,EXPR('target'))),'INVALID_OPERAND');
 }
 for my $body (STASH('x'),TEMP(0),CONST('x'),CAP()) {
-   failure('AT alias must resolve to NODE: '.$body->_name,{},
+   failure('AT alias must resolve to NODE: '.$body->name,{},
       JGRAFT({expr=>['target',$body]},AT(EXPR('target'))),'INVALID_OPERAND');
 }
 for my $body (LENGTH(),{},[],undef) {
@@ -96,7 +96,7 @@ for my $body (LENGTH(),{},[],undef) {
       JGRAFT({expr=>['target',$body]},COPY(1,EXPR('target'))),'INVALID_OPERAND');
 }
 for my $body (STASH(),TEMP([])) {
-   failure('macro cannot overwrite namespace root: '.$body->_name,{},
+   failure('macro cannot overwrite namespace root: '.$body->name,{},
       JGRAFT({expr=>['target',$body]},COPY(1,EXPR('target'))),'INVALID_GRAFT');
 }
 failure('TEMP resets between sibling actions',{},
@@ -147,4 +147,55 @@ isa_ok($exec->diagnostic->{expression},['JGraft::Expr::EXPR']);
 $exec=JGraft::Exec->new(jgraft=>JGRAFT({const=>['saved',NODE()]},COPY(CONST('saved'),NODE())));
 is([$exec->apply({n=>1})],[{n=>1}],'first application initializes its constants');
 is([$exec->apply({n=>2})],[{n=>2}],'second application initializes fresh constants');
+{
+   my @bindings=map {('k'.$_=>$_)} 1..300;
+   my $scope=LOCAL(@bindings,LOCAL('k300',999,TEMP('k300')));
+   my $graft=JGRAFT(COPY(1,'changed'),COPY($scope,'result'));
+   my $baseline=JGraft::Exec->new(jgraft=>$graft,undo=>1);
+   $baseline->apply({});
+   ok($baseline->success,'large LOCAL namespace copies preserve nested bindings');
+   is($baseline->output->{result},999,'inner LOCAL reads its overridden binding');
+   is($baseline->{scratch_mem},0,'LOCAL copy workspace unwinds after success');
+   my $limits={mem=>$baseline->counters->{mem}};
+   my $limited=JGraft::Exec->new(jgraft=>$graft,undo=>1,limits=>$limits);
+   $limited->apply({});
+   is($limited->error,'RESOURCE_LIMIT','namespace copies check live copy workspace with retained tables');
+   is($limited->output->{changed},1,'namespace copy exhaustion keeps preceding edits');
+   ok(!exists($limited->output->{result}),'namespace copy exhaustion publishes no expression result');
+   is($limited->{scratch_mem},0,'namespace copy failure unwinds its scratch');
+   test_conformance({name=>'namespace copy scratch exhaustion',input=>{},
+      jgraft=>$graft->to_json_data,limits=>$limits,errors=>{RESOURCE_LIMIT=>1}});
+   $limited->{limits}{mem}=undef;
+   $limited->apply({reused=>1});
+   ok($limited->success,'namespace context rebuilds its bindings after resource failure');
+   is($limited->{scratch_mem},0,'namespace context reuse has no stale reservation');
+
+   my @mem;
+   for my $size (2,100) {
+      my $exec=JGraft::Exec->new(jgraft=>COPY(LOCAL(map({('k'.$_=>$_)} 1..$size),0),'result'));
+      $exec->apply({});
+      ok($exec->success,'LOCAL constructs a retained binding table');
+      push @mem,$exec->counters->{mem};
+   }
+   cmp_ok($mem[1]-$mem[0],'>=',64*(100-2),'LOCAL bindings pay for retained property slots');
+}
+{
+   my $source={map {('k'.$_=>$_)} 1..300};
+   my $exec=JGraft::Exec->new(jgraft=>JGRAFT());
+   $exec->apply(undef);
+   my $before=$exec->counters;
+   my $bytes=80+32*keys %$source;
+   $exec->{limits}{mem}=$before->{mem}+$bytes-1;
+   my $error=dies {$exec->_copy_hash($source,scalar(keys %$source)+1)};
+   is(Scalar::Util::refaddr($error),Scalar::Util::refaddr($exec),'copy allocator preflights full key/value workspace');
+   is($exec->counters->{new_obj},$before->{new_obj},'copy workspace failure precedes retained allocation');
+   is($exec->{scratch_mem},0,'copy allocator restores its caller reservation');
+   $exec->{limits}{mem}=undef;
+   my $copy=$exec->_copy_hash($source,scalar(keys %$source)+1);
+   is($copy,$source,'copy allocator fills the new table without modifying its source');
+   my $mem=$exec->counters->{mem};
+   $exec->_set_member($copy,'x',1);
+   cmp_ok($exec->counters->{mem}-$mem,'<',64,'filling paid extra capacity does not buy the slot again');
+   ok(!exists($source->{x}),'copied namespace edits remain isolated from the source');
+}
 done_testing;

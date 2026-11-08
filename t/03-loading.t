@@ -48,6 +48,8 @@ for my $entry (@classes) {
 }
 
 my $graft= JGraft::JGRAFT(JGraft::COPY(JGraft::ADD(1,JGraft::NODE('x')),'y'));
+ok(!exists($INC{'JGraft/Exec.pm'}) && !exists($INC{'JGraft/_ExecStore.pm'}),
+   'static node descriptors do not load execution or its store');
 is(thaw(nfreeze($graft))->to_json_data, $graft->to_json_data, 'Storable round trip retains node behavior');
 my $dir= tempdir(CLEANUP=>1);
 my $file= "$dir/graft.storable";
@@ -63,4 +65,14 @@ PERL
 my ($status, $output)= run_perl('-e', $restore, $file);
 is($status, 0, 'cold process can load a restored object through its class shim');
 is($output, JSON::PP->new->canonical->encode($graft->to_json_data), 'restored nested nodes retain accessors and serialization');
+my $execute= <<'PERL';
+use Storable 'retrieve';
+use JGraft 'jgexec';
+use JSON::PP ();
+my $graft=retrieve(shift @ARGV);
+print JSON::PP->new->canonical->encode(jgexec($graft,{x=>2}));
+PERL
+($status,$output)=run_perl('-e',$execute,$file);
+is($status,0,'cold Storable restoration executes with static descriptors and no saved runtime state');
+is($output,'{"x":2,"y":3}','restored execution preserves the input and computed value');
 done_testing;

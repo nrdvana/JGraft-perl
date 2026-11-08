@@ -79,21 +79,87 @@ sub is_number_object {
    blessed($_[0]) && ($_[0]->isa('JGraft::JSON::Number') || $_[0]->isa('Math::BigRat')
       || $_[0]->isa('Math::BigInt') || $_[0]->isa('Math::BigFloat'));
 }
-sub estimate_number_digits {
+# Math's backends expose digit counts without decimal strings. Keep knowledge
+# of its stable _n/_d and _m/_e representation here, including old core Math
+# versions; no callers need to copy numerator/mantissa objects just to size them.
+# Return compact spelling length and the conservative expanded conversion size.
+sub _number_sizes {
    my $v=shift;
-   my $text=!ref($v)?"$v":$v->isa('JGraft::JSON::Number')?$v->token
-      :$v->isa('Math::BigFloat')?$v->bsstr:$v->bstr;
+   if (ref($v) && !$v->isa('JGraft::JSON::Number')) {
+      if ($v->{sign} ne '+' && $v->{sign} ne '-') {
+         my $size=length($v->{sign})-($v->{sign} eq '+inf'?1:0);
+         return ($size,$size);
+      }
+      my $sign=$v->{sign} eq '-'?1:0;
+      # BigRat deliberately reports false for isa(BigFloat/BigInt), despite
+      # its implementation inheritance. Classify it before either other type.
+      if ($v->isa('Math::BigRat')) {
+         my $class=ref($v);
+         my $lib=$class->config('lib');
+         my $size=$sign+$lib->_len($v->{_n});
+         $size+=1+$lib->_len($v->{_d}) unless $lib->_is_one($v->{_d});
+         return ($size,$size);
+      }
+      if ($v->isa('Math::BigFloat')) {
+         my $class=ref($v);
+         my $lib=$class->config('lib');
+         my $digits=$lib->_len($v->{_e});
+         my $size=$sign+$lib->_len($v->{_m})+2+$digits;
+         my $exponent=$digits>9?1e100:$lib->_num($v->{_e});
+         return ($size,$size+$exponent);
+      }
+      my $size=$sign+scalar $v->length;
+      return ($size,$size);
+   }
+   my $text=ref($v)?$v->token:"$v";
    my $size=length($text);
-   if ($text =~ /[eE]([+-]?[0-9]+)\z/) {
-      my $exp=$1;
-      $exp =~ s/^[+-]?0*//;
-      $size+=length($exp)>9?1e100:($exp||0);
+   my $expanded=$size;
+   if ($text =~ /[eE][+-]?[0-9]+\z/) {
+      pos($text)=$-[0]+1;
+      $text =~ /\G[+-]?0*/gc;
+      my $digits=$size-pos($text);
+      $expanded+=$digits>9?1e100:$digits?0+substr($text,-$digits):0;
    }
    if (ref($v) && $v->isa('JGraft::JSON::Number') && $v->{number_overflow} eq 'native'
-      && $v->{max_number_digits} && $size>$v->{max_number_digits}) {
-      return length($text);
+      && $v->{max_number_digits} && $expanded>$v->{max_number_digits}) {
+      # Native approximation avoids the original exponent expansion, but a
+      # finite native value may still expand to hundreds of rational digits.
+      my $native=0+$text;
+      my $native_size=estimate_number_digits($native);
+      $expanded=$native_size>$size?$native_size:$size;
    }
-   return $size;
+   return ($size,$expanded);
+}
+sub estimate_number_digits { (_number_sizes($_[0]))[1] }
+# Execution promotes exact arithmetic operands to private BigRat copies. Read
+# their normalized representation without allocating numerator/denominator copies.
+# Native operands here are the fold's initial zero/one (or a library downgrade).
+# Return numerator/denominator digits, integer/negative/zero/absolute-one flags,
+# and spelling length. The bounded bookkeeping is leaf-call scratch.
+sub _rational_shape {
+   my ($v,$lib)=@_;
+   unless (ref $v) {
+      return (1,1,1,$v<0?1:0,$v==0?1:0,$v==1 || $v==-1?1:0,$v<0?2:1) if $v==0 || $v==1 || $v==-1;
+      my $size=estimate_number_digits($v);
+      $size=32 if $size<32;
+      return ($size,$size,is_integer($v)?1:0,$v<0?1:0,0,0,2*$size+2);
+   }
+   unless ($v->isa('Math::BigRat')) {
+      my $size=estimate_number_digits($v);
+      my $negative=$v->is_neg?1:0;
+      return ($size,$size,$v->is_int?1:0,$negative,$v->is_zero?1:0,0,2*$size+2);
+   }
+   my $n=$lib->_len($v->{_n});
+   my $d=$lib->_len($v->{_d});
+   my $integer=$lib->_is_one($v->{_d})?1:0;
+   my $negative=$v->{sign} eq '-'?1:0;
+   return ($n,$d,$integer,$negative,$lib->_is_zero($v->{_n})?1:0,
+      $integer && $lib->_is_one($v->{_n})?1:0,$n+$negative+($integer?0:1+$d));
+}
+sub _rational_same_magnitude {
+   my ($a,$b,$lib)=@_;
+   return ref($a) && ref($b) && $a->isa('Math::BigRat') && $b->isa('Math::BigRat')
+      && !$lib->_acmp($a->{_n},$b->{_n}) && !$lib->_acmp($a->{_d},$b->{_d});
 }
 sub to_native_number {
    my $v=shift;
@@ -249,11 +315,14 @@ they do not require expansion. Input objects are never modified.
 =function estimate_number_digits
 
 Estimate numeric conversion work from a number's spelling length plus decimal
-exponent magnitude, without expanding compact Math::BigFloat or JSON::Number
-values. This is a conservative resource-accounting estimate, not an exact count
+exponent magnitude. Math values use digit counts from their existing representation,
+without constructing decimal spellings or copying numerator/mantissa values.
+Compact Math::BigFloat and JSON::Number exponents are not expanded. This is a
+conservative resource-accounting estimate, not an exact count
 of significant digits. Exponents longer than nine digits use a sentinel of
 C<1e100>. JSON::Number values configured to fall back to native conversion use
-their token length when their conversion bound is exceeded.
+the larger of their token length and their native approximation's estimate when
+their conversion bound is exceeded.
 
 =function is_expr
 

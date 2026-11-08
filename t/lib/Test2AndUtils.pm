@@ -69,7 +69,7 @@ sub _conformance_supported {
    my ($value,$supported)=@_;
    my $node=Scalar::Util::blessed($value) && $value->isa('JGraft::_Node');
    if ($node) {
-      my $support=$supported->{$value->_name};
+      my $support=$supported->{$value->name};
       return 0 unless $support;
       return 0 if ref($support) eq 'CODE' && !$support->($value);
    }

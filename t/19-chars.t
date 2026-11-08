@@ -117,4 +117,40 @@ is($exec->output,JSON::PP::true,'large class matches every repeated character');
 $exec=JGraft::Exec->new(jgraft=>COPY($large,NODE()),limits=>{mem=>1000});
 $exec->apply(0x1000);
 is($exec->error,'RESOURCE_LIMIT','inversion-list execution respects memory limits');
+{
+   my @mem;
+   for my $repeat (2,600) {
+      my $exec=JGraft::Exec->new(jgraft=>COPY(CHARS('abc'x$repeat),NODE()));
+      $exec->apply('b');
+      ok($exec->success,'character-pair normalization succeeds');
+      is($exec->output,JSON::PP::true,'normalization preserves duplicate character membership');
+      is($exec->{scratch_mem},0,'character construction workspace unwinds');
+      push @mem,$exec->counters->{mem};
+   }
+   is($mem[1],$mem[0],'only completed class and cache storage are retained');
+   my $graft=JGRAFT(COPY(1,'changed'),MATCH({letter=>CHARS('abc'x600)}));
+   my $input={letter=>'b'};
+   my $limits={mem=>100000};
+   my $limited=JGraft::Exec->new(jgraft=>$graft,undo=>1,limits=>$limits);
+   $limited->apply($input);
+   is($limited->error,'RESOURCE_LIMIT','character pair workspace is reserved before materialization');
+   like($limited->message,qr/scratch/,'character normalization reports live scratch exhaustion');
+   is($limited->output,{letter=>'b',changed=>1},'character resource failure retains earlier edit');
+   is($limited->{scratch_mem},0,'character normalization failure unwinds workspace');
+   test_conformance({name=>'character construction scratch failure',input=>$input,
+      jgraft=>$graft->to_json_data,limits=>$limits,errors=>{RESOURCE_LIMIT=>1}});
+}
+{
+   my @mem;
+   my $graft=JGRAFT({expr=>['letters',CHARS('abc')]},
+      COPY(STR(SEQ(REP(0,-1,CHARS(EXPR('letters'))),END())),NODE()));
+   for my $size (2,100) {
+      my $exec=JGraft::Exec->new(jgraft=>$graft);
+      $exec->apply('a'x$size);
+      ok($exec->success,'uncached alias-dependent classes match');
+      is($exec->output,JSON::PP::true,'alias class preserves membership at each candidate');
+      push @mem,$exec->counters->{mem};
+   }
+   is($mem[1],$mem[0],'uncached class results remain scoped through membership');
+}
 done_testing;

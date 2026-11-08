@@ -24,7 +24,7 @@ our $EXEC;
 sub TIEHASH { bless {tokens=>[],index=>{},seq=>[]},shift }
 sub _lookup {
    my ($s,$key)=@_;
-   $EXEC->_step(1+length($key)*.001) if $EXEC;
+   $EXEC->_tick(1+length($key)*.001) if $EXEC;
    return $s->{index}{$key};
 }
 sub _add {
@@ -32,7 +32,7 @@ sub _add {
    my $i=$s->{free};
    if (defined $i) { $s->{free}=$s->{seq}[$i+1] }
    else {
-      $EXEC->_charge('mem',64) if $EXEC;
+      $EXEC->_reserve(0,64,0) if $EXEC;
       $i=@{$s->{tokens}};
    }
    @{$s->{tokens}}[$i,$i+1]=($token,$value);
@@ -60,8 +60,8 @@ sub _append {
    my ($s,$key,$token,$value)=@_;
    my $offsets=$s->_lookup($key);
    if ($EXEC) {
-      if (!defined $offsets) { $EXEC->_charge('mem',64+4*length($key)) }
-      elsif (ref $offsets) { $EXEC->_charge('mem',16) }
+      if (!defined $offsets) { $EXEC->_reserve(0,64+4*length($key),0) }
+      elsif (ref $offsets) { $EXEC->_reserve(0,16,0) }
       else { $EXEC->_allocation(112) }
    }
    my $i=$s->_add($token,$value);
@@ -76,19 +76,34 @@ sub FETCH {
    $i=$i->[-1] if ref $i;
    return $s->{tokens}[$i+1];
 }
+# Resolver lookup: presence, selected value, and stable selected-member offset.
+sub _get {
+   my ($s,$key)=@_;
+   my $i=$s->_lookup($key);
+   return (0,undef,undef) unless defined $i;
+   $i=$i->[-1] if ref $i;
+   return (1,$s->{tokens}[$i+1],$i);
+}
+# Installing a cloned ancestor changes only the selected member's value. A user
+# assignment still goes through STORE, which collapses that key's duplicates.
+sub _replace_slot {
+   my ($s,$slot,$value)=@_;
+   $EXEC->_tick(1) if $EXEC;
+   $s->{tokens}[$slot+1]=$value;
+}
 sub EXISTS { defined $_[0]->_lookup($_[1]) }
 sub STORE {
    my ($s,$key,$value)=@_;
    my $i=$s->_lookup($key);
    unless (defined $i) {
-      $EXEC->_charge('mem',64+4*length($key)) if $EXEC;
+      $EXEC->_reserve(0,64+4*length($key),0) if $EXEC;
       $s->{index}{$key}=$s->_add($key,$value);
       return $value;
    }
    if (ref $i) {
       my $offsets=$i;
       $i=$offsets->[-1];
-      $EXEC->_step(4*(@$offsets-1)) if $EXEC;
+      $EXEC->_tick(4*(@$offsets-1)) if $EXEC;
       for my $j (0..$#$offsets-1) { $s->_unlink($offsets->[$j]) }
       $s->{index}{$key}=$i;
    }
@@ -101,7 +116,7 @@ sub DELETE {
    return unless defined $offsets;
    my $last=ref($offsets)?$offsets->[-1]:$offsets;
    my $value=$s->{tokens}[$last+1];
-   $EXEC->_step(4*(ref($offsets)?scalar @$offsets:1)) if $EXEC;
+   $EXEC->_tick(4*(ref($offsets)?scalar @$offsets:1)) if $EXEC;
    delete $s->{index}{$key};
    if (ref $offsets) { $s->_unlink($_) for @$offsets }
    else { $s->_unlink($offsets) }
@@ -121,40 +136,38 @@ sub NEXTKEY {
    }
    return;
 }
-# Return live key offsets, including duplicates, in serialization order.
-sub _members {
-   my $s=shift;
-   my @offsets;
-   for (my $i=$s->{head}; defined $i; $i=$s->{seq}[$i+1]) {
-      if ($EXEC) { $EXEC->_step(1); $EXEC->_charge('mem',16) }
-      push @offsets,$i;
-   }
-   return @offsets;
-}
 sub _clone {
    my ($s,$map)=@_;
    my $n=@{$s->{tokens}};
    my $keys=keys %{$s->{index}};
    if ($EXEC) {
-      $EXEC->_step(2*$n+$keys);
+      $EXEC->_tick(2*$n+$keys);
       $EXEC->_allocation(128+32*$n+64*$keys);
-      $EXEC->_charge('new_obj',4);
+      $EXEC->_reserve(0,0,4);
    }
    my %out;
    my $copy=tie %out,ref($s);
    $copy->{$_}=$s->{$_} for qw(head tail free);
    $copy->{tokens}=[@{$s->{tokens}}];
    $copy->{seq}=[@{$s->{seq}}];
-   for my $key (keys %{$s->{index}}) {
-      my $offsets=$s->{index}{$key};
-      if (ref $offsets) {
-         if ($EXEC) { $EXEC->_step(scalar @$offsets); $EXEC->_allocation(80+16*@$offsets) }
-         $offsets=[@$offsets];
+   {
+      my $scratch_base=$EXEC?$EXEC->{scratch_mem}:0;
+      local $EXEC->{scratch_mem}=$scratch_base if $EXEC;
+      $EXEC->_scratch_set($scratch_base,80+16*$keys) if $EXEC;
+      for my $key (keys %{$s->{index}}) {
+         my $offsets=$s->{index}{$key};
+         if (ref $offsets) {
+            if ($EXEC) { $EXEC->_tick(scalar @$offsets); $EXEC->_allocation(80+16*@$offsets) }
+            $offsets=[@$offsets];
+         }
+         $copy->{index}{$key}=$offsets;
       }
-      $copy->{index}{$key}=$offsets;
    }
    if ($map) {
-      for my $i ($copy->_members) { $copy->{tokens}[$i+1]=$map->($copy->{tokens}[$i+1]) }
+      for (my $i=$copy->{head};defined $i;$i=$copy->{seq}[$i+1]) {
+         $EXEC->_tick(1) if $EXEC;
+         $copy->{tokens}[$i+1]=$map->($copy->{tokens}[$i+1]);
+      }
    }
    return \%out;
 }
