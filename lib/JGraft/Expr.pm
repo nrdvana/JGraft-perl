@@ -273,8 +273,8 @@ use experimental 'signatures';
 #__end__
 use Carp;
 use JGraft::Util qw(:types is_expr type_mask invalid_graft);
-require JGraft::_Node;
-our @ISA= ('JGraft::_Node');
+require JGraft::Op;
+our @ISA= ('JGraft::Op');
 
 @JGraft::Expr::Ref::ISA  = (__PACKAGE__);
 @JGraft::Expr::Match::ISA= (__PACKAGE__);
@@ -302,7 +302,7 @@ sub get_class {
 
 =attribute name
 
-The directive's symbolic operation name, such as C<EXPR> or C<ADD>, available
+The operation's symbolic name, such as C<EXPR> or C<ADD>, available
 on both classes and instances. Names are installed when the concrete classes
 are declared; subclasses inherit that name unless they override the method.
 The common-expression reference's operand is accessed through
@@ -403,7 +403,7 @@ back to L</new_from_json_data> to re-create it.
 
 =cut
 
-# to_json_data and TO_JSON are inherited from _Node
+# to_json_data and TO_JSON are inherited from Op
 
 =method format
 
@@ -420,7 +420,7 @@ rules as L<JGraft::Action/format>. Defaults are two-space indentation, width 79,
 names, and closing brackets on separate lines for wrapped containers.
 
 Logical pairs (LOCAL bindings and CASE branches, for example) stay together when
-they fit; a wrapped LOCAL's final expression gets its own line. Nested directives
+they fit; a wrapped LOCAL's final expression gets its own line. Nested operations
 with multiple arguments start new lines. Deep indentation doubles the local width
 when wrapping would otherwise leave fewer than 40 columns for arguments.
 C<< indent => 0 >> emits compact JSON with only width-driven token-boundary
@@ -431,6 +431,18 @@ newlines; adding C<< wrap => 0 >> disables those too.
 sub format {
    require JGraft::_Format;
    return JGraft::_Format->format(@_);
+}
+
+sub _chars_value {
+   my $v= shift;
+   if (is_expr($v)) {
+      $v->isa('JGraft::Expr::EXPR') or invalid_graft('CHARS only permits EXPR references');
+      return;
+   }
+   my $type= type_mask($v);
+   return if $type == TYPE_NULL || $type == TYPE_BOOLEAN || $type == TYPE_STRING;
+   return if $type == TYPE_NUMBER && JGraft::Util::is_integer($v) && $v >= 0 && $v <= 0x10ffff;
+   invalid_graft('Invalid CHARS operand');
 }
 
 sub _define_expr {
@@ -450,7 +462,7 @@ sub _define_expr {
    my @operands=sort keys %attrs;
    *{$class.'::_operand_fields'}= sub { (ref($_[0]) || $_[0]) eq $class?\@operands:undef };
    # TODO: use Class::XSAccessor if available
-   *{$class.'::new'}= \&JGraft::_Node::_new;
+   *{$class.'::new'}= \&JGraft::Op::_new;
    *{$class.'::name'}= sub { $name };
    *{$class.'::id'}= sub { $id };
    *{$class.'::returns'}= sub { $returns } unless defined &{$class.'::returns'};
@@ -800,27 +812,27 @@ sub JGraft::Expr::LOCAL::returns {
 
 sub JGraft::Expr::Ref::_validate {
    my $self=shift;
-   JGraft::_Node::_path_elements($self->{path},1) if exists $self->{path};
+   JGraft::Op::_path_elements($self->{path},1) if exists $self->{path};
 }
 
 sub JGraft::Expr::TEMP::_validate {
    my $self=shift;
    JGraft::Expr::Ref::_validate($self);
-   @{$self->{path}} or JGraft::_Node::_bad('TEMP requires a path');
+   @{$self->{path}} or JGraft::Op::_bad('TEMP requires a path');
 }
 
 sub JGraft::Expr::NUM::_validate {
    my $self=shift;
    return unless defined $self->{min} && defined $self->{max}
       && !is_expr($self->{min}) && !is_expr($self->{max});
-   $self->{min} <= $self->{max} or JGraft::_Node::_bad('NUM bounds are reversed');
+   $self->{min} <= $self->{max} or JGraft::Op::_bad('NUM bounds are reversed');
 }
 
 sub JGraft::Expr::SLICE::_validate {
    my $self=shift;
    return unless exists $self->{config_obj};
    my $types=type_mask($self->{config_obj});
-   !$types || ($types & TYPE_OBJECT) or JGraft::_Node::_bad('SLICE configuration must be an object');
+   !$types || ($types & TYPE_OBJECT) or JGraft::Op::_bad('SLICE configuration must be an object');
 }
 
 sub JGraft::Expr::REP::_validate {
@@ -828,19 +840,19 @@ sub JGraft::Expr::REP::_validate {
    return unless exists $self->{min} && exists $self->{max}
       && !is_expr($self->{min}) && !is_expr($self->{max});
    $self->{max} <= 0 || $self->{max} >= $self->{min}
-      or JGraft::_Node::_bad('REP bounds are reversed');
+      or JGraft::Op::_bad('REP bounds are reversed');
 }
 
 sub JGraft::Expr::JOIN::_validate {
    my $self=shift;
    my $split=$self->{split_spec};
    if (is_expr($split) && $split->is_match) {
-      JGraft::_Node::_bad('Regex joining requires a default separator');
+      JGraft::Op::_bad('Regex joining requires a default separator');
    }
    if (ref($split) eq 'HASH' && is_expr($split->{sep}) && $split->{sep}->is_match) {
       exists $split->{keep} || exists $split->{default}
-         or JGraft::_Node::_bad('Regex joining requires a default separator');
-      JGraft::_Node::_expect($split->{default},TYPE_STRING,'string separator') unless exists $split->{keep};
+         or JGraft::Op::_bad('Regex joining requires a default separator');
+      JGraft::Op::_expect($split->{default},TYPE_STRING,'string separator') unless exists $split->{keep};
    }
 }
 

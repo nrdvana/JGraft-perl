@@ -82,7 +82,7 @@ sub _conformance_native {
 
 sub _conformance_supported {
    my ($value,$supported)=@_;
-   my $node=Scalar::Util::blessed($value) && $value->isa('JGraft::_Node');
+   my $node=Scalar::Util::blessed($value) && $value->isa('JGraft::Op');
    if ($node) {
       my $support=$supported->{$value->name};
       return 0 unless $support;

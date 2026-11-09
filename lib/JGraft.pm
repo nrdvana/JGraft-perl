@@ -146,7 +146,7 @@ require JGraft::Action;
   my $text= jgformat($json_data, indent => 2, wrap => 79);
 
 Format decoded JSON data, or an action/expression object. Embedded C<["JGRAFT", ...]>
-arrays are parsed and use directive formatting when valid; invalid grafts remain
+arrays are parsed and use operation formatting when valid; invalid grafts remain
 ordinary JSON. Other containers stay inline unless a child has multiple members
 or requires multiple lines, in which case each member gets its own line. Long
 flat containers wrap at member boundaries. Options match L<JGraft::Action/format>.

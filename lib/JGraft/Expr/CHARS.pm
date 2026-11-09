@@ -113,12 +113,12 @@ sub _is_regexp {
       my $class=shift;
       my $re=@_==1 && _is_regexp($_[0])? $_[0]
          : @_==1 && ref($_[0]) eq 'ARRAY' && @{$_[0]}==1 && _is_regexp($_[0][0])? $_[0][0] : undef;
-      return JGraft::_Node::_new($class,@_) unless defined $re;
+      return JGraft::Op::_new($class,@_) unless defined $re;
       $class=ref($class) || $class;
       local $JGraft::Util::_construction_context={class=>$class,method=>'new',parent=>$JGraft::Util::_construction_context};
       my $inv=eval { _regexp_invlist($re) };
       my $error=$@;
-      JGraft::_Node::_bad("Invalid CHARS regexp: $error") if $error;
+      JGraft::Op::_bad("Invalid CHARS regexp: $error") if $error;
       _freeze($inv);
       return bless {_form=>$class->forms->[0],entries=>_entries($inv),_invlist=>$inv},$class;
    }
@@ -129,7 +129,7 @@ sub _validate {
    for (my $i=0;$i+1<@$values;++$i) {
       my ($a,$b)=map _point(undef,$_),@$values[$i,$i+1];
       if (defined($a) && defined($b)) {
-         $a<=$b or JGraft::_Node::_bad('CHARS range is reversed');
+         $a<=$b or JGraft::Op::_bad('CHARS range is reversed');
          ++$i;
       }
    }
@@ -158,7 +158,7 @@ sub _point {
 sub _bad {
    my ($exec,$message)=@_;
    $exec->_fail('INVALID_OPERAND',$message) if $exec;
-   JGraft::_Node::_bad($message);
+   JGraft::Op::_bad($message);
 }
 sub _charge {
    my ($exec,$n,$workspace)=@_;
@@ -341,7 +341,7 @@ sub _entries {
 }
 sub to_json_data {
    my $self=shift;
-   return $self->JGraft::_Node::to_json_data(@_) unless exists $self->{_invlist};
+   return $self->JGraft::Op::to_json_data(@_) unless exists $self->{_invlist};
    return ['CHARS',@{_entries($self->invlist)}];
 }
 

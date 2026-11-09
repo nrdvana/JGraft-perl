@@ -69,7 +69,7 @@ for my $registry ('JGraft::Action', 'JGraft::Expr') {
       for my $args (@{$examples{$name}}) {
          my $obj= $class->new($args);
          is($obj->name,$name,"$name public instance name");
-         isa_ok($obj, [$class, $registry]);
+         isa_ok($obj, [$class, $registry, 'JGraft::Op']);
          is($obj->id, $names->{$name}, "$name ID");
          my $data= $obj->to_json_data;
          my $encoded= $json->encode($data);

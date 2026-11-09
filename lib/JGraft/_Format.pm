@@ -1,6 +1,6 @@
 package JGraft::_Format;
 # VERSION
-# ABSTRACT: Lay out JGraft directives as readable JSON
+# ABSTRACT: Lay out JGraft operations as readable JSON
 use strict;
 use warnings;
 use Carp 'croak';
@@ -15,7 +15,7 @@ my $escape_chars=qr/([\x{d800}-\x{dfff}\x{fdd0}-\x{fdef}$terminal])/;
 
 sub format {
    my ($class,$node,@options)=@_;
-   blessed($node) && $node->isa('JGraft::_Node') or croak 'format requires an action or expression object';
+   blessed($node) && $node->isa('JGraft::Op') or croak 'format requires an action or expression object';
    return $class->_format($node,1,@options);
 }
 sub format_json {
@@ -23,7 +23,7 @@ sub format_json {
    return $class->_format($value,0,@options);
 }
 sub _format {
-   my ($class,$value,$directive,@options)=@_;
+   my ($class,$value,$operation,@options)=@_;
    @options%2==0 or croak 'Expected formatting options as name/value pairs';
    my %options=(indent=>2,wrap=>79,prefix=>'',ids=>0,close=>'newline',@options);
    my %allowed=map {$_=>1} qw(indent wrap prefix ids close);
@@ -37,8 +37,8 @@ sub _format {
    defined($options{close}) && ($options{close} eq 'newline' || $options{close} eq 'inline')
       or croak 'close must be newline or inline';
    my $self=bless {options=>\%options,json=>JSON::PP->new->canonical->allow_nonref,
-      directives=>{},generic=>{},flat=>{}},$class;
-   my $data=$directive? $self->_node($value) : $self->_scan($value,{});
+      operations=>{},generic=>{},flat=>{}},$class;
+   my $data=$operation? $self->_node($value) : $self->_scan($value,{});
    return $self->_compact($data) unless $options{indent};
    return $options{prefix}.$self->_render($data,length($options{prefix}),$options{wrap},0);
 }
@@ -70,7 +70,7 @@ sub _tag {
             next unless ref($defs) eq 'ARRAY';
             my @pairs;
             for (my $j=0;$j<@$defs;$j+=2) { push @pairs,{values=>[@$defs[$j,$j+1]],pair=>1} }
-            $self->{directives}{refaddr($defs)}={groups=>\@pairs};
+            $self->{operations}{refaddr($defs)}={groups=>\@pairs};
          }
       }
       push @groups,{values=>[$data->[$i++]]};
@@ -88,7 +88,7 @@ sub _tag {
       }
    }
    push @groups,{values=>[$data->[-1]],tail=>1} if $tail;
-   $self->{directives}{refaddr($data)}={name=>$data->[0],arity=>$#$data,groups=>\@groups};
+   $self->{operations}{refaddr($data)}={name=>$data->[0],arity=>$#$data,groups=>\@groups};
    return $data;
 }
 
@@ -96,7 +96,7 @@ sub _tag {
 # exact numeric tokens. Parsing supplies annotations, not replacement values.
 sub _scan {
    my ($self,$value,$active)=@_;
-   return $self->_node($value) if blessed($value) && $value->isa('JGraft::_Node');
+   return $self->_node($value) if blessed($value) && $value->isa('JGraft::Op');
    return $value unless ref($value) eq 'ARRAY' || ref($value) eq 'HASH';
    my $id=refaddr($value);
    $active->{$id} and croak 'Cannot format cyclic JSON data';
@@ -136,8 +136,8 @@ sub _copy {
 }
 sub _notation {
    my ($self,$raw,$node,$context)=@_;
-   if (blessed($node) && $node->isa('JGraft::_Node')) {
-      # Implicit path selectors are scalars, not directive arrays.
+   if (blessed($node) && $node->isa('JGraft::Op')) {
+      # Implicit path selectors are scalars, not operation arrays.
       return unless ref($raw) eq 'ARRAY';
       my $form=$node->{_form};
       my $i=1;
@@ -209,7 +209,7 @@ sub _shape {
       }
       return ('{','}',[map +{values=>[$_,$value->{$_}],pair=>1,separator=>': '},sort keys %$value]);
    }
-   my $info=$self->{directives}{refaddr($value)};
+   my $info=$self->{operations}{refaddr($value)};
    return ('['.$self->_scalar($info->{name}),']',$info->{groups}) if $info && exists $info->{name};
    return ('[',']',$info? $info->{groups} : [map +{values=>[$_]},@$value]);
 }
@@ -224,7 +224,7 @@ sub _inline {
    for my $group (@$groups) {
       my @items;
       for my $item (@{$group->{values}}) {
-         my $info=ref($item) eq 'ARRAY'? $self->{directives}{refaddr($item)} : undef;
+         my $info=ref($item) eq 'ARRAY'? $self->{operations}{refaddr($item)} : undef;
          return $self->{flat}{$id}=undef if $info && ($info->{arity} || 0)>1;
          my $text=$self->_inline($item);
          return $self->{flat}{$id}=undef unless defined $text;
@@ -299,7 +299,7 @@ sub _render {
       for my $item (@{$group->{values}}) {
          my $text=$self->_inline($item);
          push @items,$text if defined $text;
-         my $info=ref($item) eq 'ARRAY'? $self->{directives}{refaddr($item)} : undef;
+         my $info=ref($item) eq 'ARRAY'? $self->{operations}{refaddr($item)} : undef;
          $force=1 if !defined($text) || ($info && ($info->{arity} || 0)>1);
       }
       my $text=@items==@{$group->{values}}? join($group->{separator} || ', ',@items) : undef;
@@ -365,7 +365,7 @@ sub _compact_value {
 
 Shared formatter loaded only when an action or expression is formatted. It uses
 the existing notation serializer and operand schemas to preserve literal arrays,
-identify directives, and keep argument pairs together.
+identify operations, and keep argument pairs together.
 
 =method format
 

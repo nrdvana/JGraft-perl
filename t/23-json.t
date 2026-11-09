@@ -177,9 +177,9 @@ is(JGraft::jgformat($json->decode('{"x":1,"x":2}'),wrap=>0),'{"x": 1, "x": 2}','
    my $value=$json->decode($text);
    is(JGraft::jgformat($value,indent=>0,wrap=>0),
       '["JGRAFT",{},["COPY",{"number":-0.00e+99,"number":1e999999,"text":"\\u0061"},["NODE"]]]',
-      'formatter uses public exact numbers for directive IDs and untouched literal tokens');
+      'formatter uses public exact numbers for operation IDs and untouched literal tokens');
    is(JGraft::jgformat($value,ids=>1,indent=>0,wrap=>0),$text,
-      'numeric directive formatting preserves the exact public number representation');
+      'numeric operation formatting preserves the exact public number representation');
    is($json->encode($value),$text,'formatting leaves the original exact notation unchanged');
    my $invalid='["JGRAFT",{},["COPY",1e999999]]';
    is(JGraft::jgformat($json->decode($invalid),indent=>0,wrap=>0),$invalid,

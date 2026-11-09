@@ -21,7 +21,7 @@ use Pod::Usage;
 
   jg-format [OPTIONS] [FILE|-]
   
-Read UTF-8 JSON from FILE or standard input, convert JGraft directive IDs to
+Read UTF-8 JSON from FILE or standard input, convert JGraft operation IDs to
 names (or vice versa) then write formatted UTF-8 JSON.
 
   Common Options:
@@ -35,9 +35,9 @@ names (or vice versa) then write formatted UTF-8 JSON.
 
 This tool parses the tokens of a JSON file and re-formats the whitespace
 between them.  Any sub-structure that parses as a valid JGRAFT tree uses
-special rules for formatting, and gets directive IDs converted to names, or
+special rules for formatting, and gets operation IDs converted to names, or
 the reverse with option C<--ids>.  Invalid grafts get formatted the same as
-ordinary JSON.  JSON tokens (other than directive IDs) are preserved exactly;
+ordinary JSON.  JSON tokens (other than operation IDs) are preserved exactly;
 numeric spelling, string escapes, property order, duplicate keys, and lone
 Unicode surrogates are preserved.
 
@@ -59,7 +59,7 @@ optional spaces or structural breaks and wraps only between complete JSON tokens
 
 Initial line width. Defaults to 79. Set to zero to disable width wrapping. With both
 indentation and wrapping disabled, output is fully minified without a final newline.
-Deep indentation expands the local width when a directive needs to wrap.
+Deep indentation expands the local width when a operation needs to wrap.
 
 =item --close=STYLE
 
@@ -68,7 +68,7 @@ Ignored with zero indentation.
 
 =item --ids, --names
 
-Use numeric directive IDs or names. Defaults to names. Logical argument pairs stay
+Use numeric operation IDs or names. Defaults to names. Logical argument pairs stay
 together when they fit.
 
 =item --prefix=STRING

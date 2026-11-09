@@ -15,8 +15,8 @@ my $json=JSON::PP->new->canonical->allow_nonref;
 }
 {
    my $expr=bless {%{LENGTH('abc')}},'Test::DispatchLength';
-   is($expr->name,'LENGTH','subclasses inherit the declared directive name');
-   is(Test::DispatchLength->name,'LENGTH','subclass class calls inherit the declared directive name');
+   is($expr->name,'LENGTH','subclasses inherit the declared operation name');
+   is(Test::DispatchLength->name,'LENGTH','subclass class calls inherit the declared operation name');
    is(jgexec(COPY($expr,NODE()),undef),42,'execution still dispatches overridden node methods');
 }
 

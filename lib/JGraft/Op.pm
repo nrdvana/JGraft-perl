@@ -1,6 +1,6 @@
-package JGraft::_Node;
+package JGraft::Op;
 # VERSION
-# ABSTRACT: Shared constructor and notation handling for JGraft nodes
+# ABSTRACT: Base class for JGraft actions and expressions
 use strict;
 use warnings;
 use Scalar::Util qw(blessed refaddr);
@@ -156,7 +156,7 @@ sub _argument {
       ref $value eq 'ARRAY' or _bad('Actions must be operation arrays');
       return JGraft::Action->get_class($value->[0])->_parse($value, $seen);
    }
-   return _metadata($value, $parse, $seen) if $context eq 'metadata';
+   return JGraft::Action::_metadata($value, $parse, $seen) if $context eq 'metadata';
    return _split_spec($value, $parse, $seen) if $context eq 'split';
    if ($context =~ /^(?:path|node_path|write_path|move_src|move_dst)$/) {
       return undef if !defined $value && $context =~ /^move_/;
@@ -226,7 +226,7 @@ sub _argument {
       _type($value) == TYPE_NUMBER && ($value == 1 || $value == 2) or _bad('PROPS options must be numeric 1 or 2');
    }
    elsif ($context eq 'regex') { _regex_value($value) }
-   elsif ($context eq 'chars') { _chars_value($value) }
+   elsif ($context eq 'chars') { JGraft::Expr::_chars_value($value) }
    return $value;
 }
 
@@ -311,46 +311,7 @@ sub _regex_value {
    _bad('Regex operands must be strings, codepoints, or expressions');
 }
 
-sub _chars_value {
-   my $v= shift;
-   if (_is_expr($v)) {
-      $v->isa('JGraft::Expr::EXPR') or _bad('CHARS only permits EXPR references');
-      return;
-   }
-   my $type= _type($v);
-   return if $type == TYPE_NULL || $type == TYPE_BOOLEAN || $type == TYPE_STRING;
-   return if $type == TYPE_NUMBER && _integer($v) && $v >= 0 && $v <= 0x10ffff;
-   _bad('Invalid CHARS operand');
-}
 
-sub _metadata {
-   my ($value, $parse, $seen)= @_;
-   ref $value eq 'HASH' or _bad('JGRAFT metadata must be a literal object');
-   my $addr= refaddr($value);
-   $seen->{$addr} and _bad('Cyclic metadata');
-   local $seen->{$addr}= 1;
-   my %copy;
-   for my $key (keys %$value) {
-      if ($key eq 'const' || $key eq 'expr') {
-         my $list= $value->{$key};
-         ref $list eq 'ARRAY' && @$list % 2 == 0 or _bad("Metadata $key must contain name/value pairs");
-         my @defs;
-         for (my $i= 0; $i < @$list; $i += 2) {
-            my $name= _argument($list->[$i], 'prop', 0, $seen);
-            push @defs, $name, _tree($list->[$i+1], $parse, $seen);
-         }
-         $copy{$key}= \@defs;
-      }
-      else { $copy{$key}= _tree($value->{$key}, 0, $seen, 1) }
-   }
-   if (exists $copy{v}) {
-      _integer($copy{v}) && $copy{v} >= 1 or _bad('Metadata v must be a positive integer');
-   }
-   for my $key ('writer', 'comment') {
-      !exists $copy{$key} || _type($copy{$key}) == TYPE_STRING or _bad("Metadata $key must be a string");
-   }
-   return \%copy;
-}
 
 sub _split_spec {
    my ($value, $parse, $seen)= @_;
@@ -431,7 +392,7 @@ sub _encode_argument {
 }
 
 sub to_json_data {
-   # The optional private callback lets the formatter identify actual directives
+   # The optional private callback lets the formatter identify actual operations
    # without guessing whether a literal array's first item is an operation name.
    my ($self,$encode_node)= @_;
    my $form= $self->{_form};
@@ -456,16 +417,25 @@ sub to_json_data {
 
 sub TO_JSON { shift->to_json_data(@_) }
 
+=head1 SYNOPSIS
+
+  use JGraft::Op;
+  $operation->isa('JGraft::Op');
+
 =head1 DESCRIPTION
 
-Internal shared support for action and expression classes. The C<forms> and
-C<returns> class attributes describe operand names, arity, argument contexts,
-and possible result types.
-The public contracts are documented in L<JGraft::Action> and L<JGraft::Expr>.
+The abstract base class for all JGraft operations: actions, reference expressions,
+matching expressions, and functions. Construct operations through concrete
+L<JGraft::Action> and L<JGraft::Expr> classes rather than this base class.
+
+Concrete classes provide C<name>, C<id>, and C<forms>; expressions also provide
+C<returns> to describe possible result types. This base supplies shared
+construction, notation parsing, and serialization. Loading it does not load Exec.
+Completed operations and their operand trees are immutable by contract.
 
 =constructor new
 
-Construct a concrete node from an operand arrayref or name/value attributes.
+Construct a concrete operation from an operand arrayref or name/value attributes.
 Constructor arrays are literal; notation decoding is performed by C<_parse>.
 
 =method to_json_data

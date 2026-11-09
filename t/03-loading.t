@@ -7,6 +7,12 @@ use Storable qw(nfreeze thaw nstore);
 use File::Temp 'tempdir';
 use JSON::PP ();
 
+{
+   my ($status,$output)=run_perl('-MJGraft::Op','-e',
+      'die "Exec loaded" if $INC{"JGraft/Exec.pm"}; die "Concrete classes loaded" if $INC{"JGraft/Action.pm"} || $INC{"JGraft/Expr.pm"};');
+   is($status,0,'public operation base loads independently without Exec or concrete classes');
+}
+
 my @classes;
 for my $registry ('JGraft::Action', 'JGraft::Expr') {
    no strict 'refs';
@@ -67,6 +73,7 @@ use JSON::PP ();
 my $graft= retrieve(shift @ARGV);
 (my $module= ref($graft).'.pm') =~ s{::}{/}g;
 require $module;
+$graft->isa('JGraft::Op') or die "Restored operation lost its base class\n";
 print JSON::PP->new->canonical->encode($graft->to_json_data);
 PERL
 my ($status, $output)= run_perl('-e', $restore, $file);

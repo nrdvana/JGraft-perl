@@ -67,8 +67,8 @@ use experimental 'signatures';
 #__end__
 use Carp;
 use JGraft::Util 'invalid_graft';
-require JGraft::_Node;
-our @ISA= ('JGraft::_Node');
+require JGraft::Op;
+our @ISA= ('JGraft::Op');
 
 =method exec
 
@@ -110,7 +110,7 @@ sub get_class {
 
 =attribute name
 
-The directive's symbolic operation name, such as C<COPY>, available on both
+The operation's symbolic name, such as C<COPY>, available on both
 classes and instances. Names are installed when the concrete classes are declared;
 subclasses inherit that name unless they override the method.
 
@@ -157,7 +157,7 @@ L</new_from_json_data> to re-create it.
 
 =cut
 
-# to_json_data and TO_JSON are inherited from _Node
+# to_json_data and TO_JSON are inherited from Op
 
 =method format
 
@@ -170,11 +170,11 @@ L</new_from_json_data> to re-create it.
   #   close   => 'inline', # or 'newline' (default)
 
 Returns JSON text without a trailing newline. Defaults are C<< indent => 2 >>,
-C<< wrap => 79 >>, an empty whitespace prefix, directive names, and closing
+C<< wrap => 79 >>, an empty whitespace prefix, operation names, and closing
 brackets on their own lines for wrapped containers. C<< close => 'inline' >>
 attaches those brackets to the final argument instead.
 
-Nested directives with more than one argument start on new lines. Logical pairs
+Nested operations with more than one argument start on new lines. Logical pairs
 such as COPY assignments and IF branches share a line when they fit. Arguments
 reserve one column for their following comma or closing bracket. If wrapping
 would leave fewer than 40 columns after indentation, the local width doubles
@@ -190,9 +190,9 @@ remain unchanged. The whitespace prefix is ignored in compact mode.
 
 The prefix is included on every line. With the default empty prefix and names,
 the output begins C<["JGRAFT",> for a JGRAFT node. Numeric IDs change actual
-directives only; literal strings and array escaping are preserved. The
+operations only; literal strings and array escaping are preserved. The
 L<jg-format> command provides the same formatting options for UTF-8 graft files.
-It also accepts arbitrary JSON, formatting valid embedded grafts as directives
+It also accepts arbitrary JSON, formatting valid embedded grafts as operations
 and invalid ones as ordinary JSON; see L<JGraft/jgformat>.
 
 =cut
@@ -200,6 +200,35 @@ and invalid ones as ordinary JSON; see L<JGraft/jgformat>.
 sub format {
    require JGraft::_Format;
    return JGraft::_Format->format(@_);
+}
+
+sub _metadata {
+   my ($value, $parse, $seen)= @_;
+   ref $value eq 'HASH' or invalid_graft('JGRAFT metadata must be a literal object');
+   my $addr= Scalar::Util::refaddr($value);
+   $seen->{$addr} and invalid_graft('Cyclic metadata');
+   local $seen->{$addr}= 1;
+   my %copy;
+   for my $key (keys %$value) {
+      if ($key eq 'const' || $key eq 'expr') {
+         my $list= $value->{$key};
+         ref $list eq 'ARRAY' && @$list % 2 == 0 or invalid_graft("Metadata $key must contain name/value pairs");
+         my @defs;
+         for (my $i= 0; $i < @$list; $i += 2) {
+            my $name= JGraft::Op::_argument($list->[$i], 'prop', 0, $seen);
+            push @defs, $name, JGraft::Op::_tree($list->[$i+1], $parse, $seen);
+         }
+         $copy{$key}= \@defs;
+      }
+      else { $copy{$key}= JGraft::Op::_tree($value->{$key}, 0, $seen, 1) }
+   }
+   if (exists $copy{v}) {
+      JGraft::Util::is_integer($copy{v}) && $copy{v} >= 1 or invalid_graft('Metadata v must be a positive integer');
+   }
+   for my $key ('writer', 'comment') {
+      !exists $copy{$key} || JGraft::Util::type_mask($copy{$key}) == JGraft::Util::TYPE_STRING() or invalid_graft("Metadata $key must be a string");
+   }
+   return \%copy;
 }
 
 sub _define_action {
@@ -219,7 +248,7 @@ sub _define_action {
    *{$class.'::id'}= sub { $id };
    *{$class.'::name'}= sub { $name };
    *{$class.'::forms'}= sub { \@forms };
-   *{$class.'::new'}= \&JGraft::_Node::_new;
+   *{$class.'::new'}= \&JGraft::Op::_new;
    for (keys %attrs) {
       my $attr= $_;
       *{$class.'::'.$attr}= sub { $_[0]{$attr} };
