@@ -34,6 +34,17 @@ for my $token ('0','-0','1e20','100000000000000000000','-2.5e-7') {
    my $string=Test2AndUtils::_conformance_json('"'.$token.'"');
    is(type_mask($string),TYPE_STRING,'the quoted spelling remains a string');
 }
+{
+   my $value=Test2AndUtils::_conformance_json(
+      '{"duplicate":1,"duplicate":2,"nested":[{"number":1e20,"text":"\\u0031","boolean":true,"null":null}]}');
+   ok(!tied(%$value) && !tied(%{$value->{nested}[0]}),'native fixtures use untied hashes at every level');
+   is($value->{duplicate},2,'native fixtures keep the last duplicate member');
+   is(type_mask($value->{nested}[0]{number}),TYPE_NUMBER,'nested fixture numbers use native numeric scalars');
+   is($value->{nested}[0]{text},'1','native fixtures decode escaped strings to ordinary text');
+   is(type_mask($value->{nested}[0]{text}),TYPE_STRING,'decoded fixture strings keep their string type');
+   is($value->{nested}[0]{boolean},JSON::PP::true(),'native fixtures retain JSON booleans');
+   ok(exists($value->{nested}[0]{null}) && !defined($value->{nested}[0]{null}),'native fixtures retain explicit nulls');
+}
 ok(Test2AndUtils::_conformance_same(1e20,0+'100000000000000000000'),'conformance comparison accepts equal numeric representations');
 ok(!Test2AndUtils::_conformance_same(1,'1'),'conformance comparison distinguishes strings from numbers');
 ok(!Test2AndUtils::_conformance_same(JSON::PP::true(),1),'conformance comparison distinguishes booleans from numbers');

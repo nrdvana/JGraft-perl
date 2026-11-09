@@ -59,9 +59,24 @@ sub test_conformance {
 
 # Use the same strict transport decoder for fixtures and serialized undo.
 sub _conformance_json {
-   require JGraft::_JSON;
-   my $value=eval { JGraft::_JSON::decode(@_) };
+   my ($text)=@_;
+   require JGraft::JSON;
+   my $value=eval {
+      _conformance_native(JGraft::JSON->new(utf8=>!utf8::is_utf8($text))->decode($text));
+   };
    die "conformance JSON: $@" if $@;
+   return $value;
+}
+
+# Native fixtures deliberately discard token spelling and duplicate members.
+# Keep that test-only conversion out of the public exact JSON codec.
+sub _conformance_native {
+   no warnings 'recursion';
+   my ($value)=@_;
+   return 0+$value->token if ref($value) eq 'JGraft::JSON::Number';
+   return $value->value if ref($value) eq 'JGraft::JSON::String';
+   return [map _conformance_native($_),@$value] if ref($value) eq 'ARRAY';
+   return {map +($_=>_conformance_native($value->{$_})),keys %$value} if ref($value) eq 'HASH';
    return $value;
 }
 

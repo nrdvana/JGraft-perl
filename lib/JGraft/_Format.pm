@@ -103,15 +103,13 @@ sub _scan {
    local $active->{$id}=1;
    if (ref($value) eq 'ARRAY' && @$value) {
       my $head=$value->[0];
-      my $token=ref($head) eq 'JGraft::_JSON::Number'? $$head
-         : blessed($head) && (type_mask($head)==TYPE_NUMBER || type_mask($head)==JGraft::Util::TYPE_STRING())? "$head" : $head;
-      my $graft_id=ref($head) eq 'JGraft::_JSON::Number'? $token eq '-1'
-         : type_mask($head)==TYPE_NUMBER && $head==-1;
+      my $token=blessed($head) && (type_mask($head)==TYPE_NUMBER || type_mask($head)==JGraft::Util::TYPE_STRING())? "$head" : $head;
+      my $graft_id=type_mask($head)==TYPE_NUMBER && $head==-1;
       if (defined($token) && !ref($token) && ($token eq 'JGRAFT' || $graft_id)) {
          require JGraft::Action;
-         my $node=eval { JGraft::Action->new_from_json_data($self->_copy($value,1,{})) };
+         my $node=eval { JGraft::Action->new_from_json_data($value) };
          if ($node) {
-            my $copy=$self->_copy($value,0,{});
+            my $copy=$self->_copy($value,{});
             $self->_notation($copy,$node,'value');
             return $copy;
          }
@@ -125,24 +123,16 @@ sub _scan {
    return $out;
 }
 sub _copy {
-   my ($self,$value,$native,$active)=@_;
-   if (ref($value) eq 'JGraft::_JSON::Number') {
-      return $value unless $native;
-      my $n=0+$$value;
-      ($n-$n)==0 or die "Number outside native range\n";
-      my ($mantissa)=split /[eE]/,$$value,2;
-      $n!=0 || $mantissa !~ /[1-9]/ or die "Number underflows native range\n";
-      return $n;
-   }
+   my ($self,$value,$active)=@_;
    return $value unless ref($value) eq 'ARRAY' || ref($value) eq 'HASH';
    my $id=refaddr($value);
    $active->{$id} and croak 'Cannot format cyclic JSON data';
    local $active->{$id}=1;
-   return [map $self->_copy($_,$native,$active),@$value] if ref($value) eq 'ARRAY';
+   return [map $self->_copy($_,$active),@$value] if ref($value) eq 'ARRAY';
    my $tie=tied %$value;
-   return $tie->_clone(sub { $self->_copy($_[0],$native,$active) })
+   return $tie->_clone(sub { $self->_copy($_[0],$active) })
       if $tie && $tie->isa('JGraft::JSON::Object');
-   return {map +($_=>$self->_copy($value->{$_},$native,$active)),keys %$value};
+   return {map +($_=>$self->_copy($value->{$_},$active)),keys %$value};
 }
 sub _notation {
    my ($self,$raw,$node,$context)=@_;
@@ -188,7 +178,6 @@ sub _notation {
 sub _scalar {
    no warnings 'utf8';
    my ($self,$value)=@_;
-   return $$value if ref($value) eq 'JGraft::_JSON::Number';
    my $text;
    if (blessed($value) && !JSON::PP::is_bool($value)
       && (type_mask($value)==TYPE_NUMBER || type_mask($value)==JGraft::Util::TYPE_STRING())) {

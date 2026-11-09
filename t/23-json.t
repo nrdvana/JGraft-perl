@@ -172,6 +172,19 @@ is($rejected->error,'UNSUPPORTED_GRAFT','wrapped string participates in codepoin
 is($json->encode(jgexec(COPY(SLICE(NODE(),1,1),NODE()),$wide)),'"'.chr(0x100).'"','wrapped wide string uses character positions');
 is(JGraft::jgformat($json->decode('{"x":1,"x":2}'),indent=>0,wrap=>0),'{"x":1,"x":2}','formatter retains duplicate occurrences');
 is(JGraft::jgformat($json->decode('{"x":1,"x":2}'),wrap=>0),'{"x": 1, "x": 2}','indented formatter retains duplicate occurrences');
+{
+   my $text='[-1,{},[5,{"number":-0.00e+99,"number":1e999999,"text":"\\u0061"},[0]]]';
+   my $value=$json->decode($text);
+   is(JGraft::jgformat($value,indent=>0,wrap=>0),
+      '["JGRAFT",{},["COPY",{"number":-0.00e+99,"number":1e999999,"text":"\\u0061"},["NODE"]]]',
+      'formatter uses public exact numbers for directive IDs and untouched literal tokens');
+   is(JGraft::jgformat($value,ids=>1,indent=>0,wrap=>0),$text,
+      'numeric directive formatting preserves the exact public number representation');
+   is($json->encode($value),$text,'formatting leaves the original exact notation unchanged');
+   my $invalid='["JGRAFT",{},["COPY",1e999999]]';
+   is(JGraft::jgformat($json->decode($invalid),indent=>0,wrap=>0),$invalid,
+      'invalid grafts fall back to JSON while preserving exact number tokens');
+}
 
 {
    my $object=$json->decode('{"drop":0,"x":1,"x":2,"spelling":"\\u0061"}');
