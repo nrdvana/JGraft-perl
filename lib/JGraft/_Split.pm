@@ -4,7 +4,7 @@ package JGraft::_Split;
 use strict;
 use warnings;
 use JGraft::Util qw(:types type_mask is_expr);
-use JGraft::_String;
+use JGraft::CodepointArray;
 use JGraft::_Match;
 use JGraft::_Sequence;
 
@@ -63,8 +63,7 @@ sub _view {
    my ($class,$exec,$view,$offset,$size)=@_;
    $exec->_tick($size*.001+1);
    # The caller covers this bounded view until its final span test returns.
-   return bless {width=>$view->{width},size=>$size,
-      buffer=>substr($view->{buffer},$offset*$view->{width},$size*$view->{width})},'JGraft::_String';
+   return $view->slice($offset,$size);
 }
 sub _text {
    my ($class,$exec,$text,$offset,$size)=@_;
@@ -78,9 +77,9 @@ sub _field {
    if (exists($config->{ltrim}) || exists($config->{rtrim})) {
       my $scratch_base=$exec->{scratch_mem};
       local $exec->{scratch_mem}=$scratch_base;
-      $exec->_scratch_set($scratch_base,JGraft::_String->_workspace($text)
+      $exec->_scratch_set($scratch_base,JGraft::CodepointArray->_workspace($text)
          +(exists($config->{rtrim})?128+4*length($text):0));
-      my $view=JGraft::_String->_new($exec,$text,'split field',undef,1);
+      my $view=JGraft::CodepointArray->_new($exec,$text,'split field',undef,1);
       my $start=0;
       if (exists $config->{ltrim}) {
          $start=$class->_span($exec,$config->{ltrim},$view,0,$depth+1) || 0;
@@ -89,9 +88,9 @@ sub _field {
       my $end=length($text);
       if (exists $config->{rtrim}) {
          my $remainder=$class->_view($exec,$view,$start,$end-$start);
-         for (my $i=0;$i<=$remainder->{size};++$i) {
+         for (my $i=0;$i<=$remainder->size;++$i) {
             $exec->_tick(1);
-            my $length=$class->_span($exec,$config->{rtrim},$remainder,$i,$depth+1,$remainder->{size});
+            my $length=$class->_span($exec,$config->{rtrim},$remainder,$i,$depth+1,$remainder->size);
             if (defined $length) { $end=$start+$i; last }
          }
          $right=$class->_text($exec,$text,$end,length($text)-$end);
@@ -110,25 +109,25 @@ sub _split {
    type_mask($text)==TYPE_STRING or $exec->_fail('INVALID_TARGET','SPLIT expects a string');
    my $scratch_base=$exec->{scratch_mem};
    local $exec->{scratch_mem}=$scratch_base;
-   $exec->_scratch_set($scratch_base,JGraft::_String->_workspace($text)
+   $exec->_scratch_set($scratch_base,JGraft::CodepointArray->_workspace($text)
       +(exists($config->{element})?128+4*length($text):0));
-   my $view=JGraft::_String->_new($exec,$text,'split subject',undef,1);
+   my $view=JGraft::CodepointArray->_new($exec,$text,'split subject',undef,1);
    my $array=$exec->_alloc_array(0);
    my ($start,$field_start,$position,$last_sep,$tail)=(0,0,0,'',1);
    my $keep=$config->{keep} || '';
    my $separators=!$keep && is_expr($config->{sep});
    my $trims=!$config->{discard} && (exists($config->{ltrim}) || exists($config->{rtrim}));
    my $rows=$separators || $trims? [] : undef;
-   while ($position<=$view->{size}) {
+   while ($position<=$view->size) {
       $exec->_tick(1);
       my $length=$class->_span($exec,$config->{sep},$view,$position,$depth+1);
       if (!defined($length) || (!$length && $position==$start)) {
-         $tail=0 if !$view->{size} && defined($length) && !$length;
+         $tail=0 if !$view->size && defined($length) && !$length;
          ++$position; next;
       }
       if (exists $config->{element}) {
          my $element=$class->_view($exec,$view,$start,$position-$start);
-         unless (defined $class->_span($exec,$config->{element},$element,0,$depth+1,$element->{size})) {
+         unless (defined $class->_span($exec,$config->{element},$element,0,$depth+1,$element->size)) {
             ++$position; next;
          }
       }
@@ -138,7 +137,7 @@ sub _split {
       $class->_field($exec,$config,$last_sep,'',$array,$rows,$depth+1) if $keep eq '@';
       $start=$position+$length;
       $field_start=$keep eq '>'? $position : $start;
-      if (!$length && $position==$view->{size}) { $tail=0; last }
+      if (!$length && $position==$view->size) { $tail=0; last }
       $position=$start;
    }
    $class->_field($exec,$config,$class->_text($exec,$text,$field_start,length($text)-$field_start),$last_sep,$array,$rows,$depth+1) if $tail;

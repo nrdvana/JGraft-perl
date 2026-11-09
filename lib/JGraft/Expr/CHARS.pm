@@ -147,11 +147,11 @@ sub _point {
       $cp<=0x10ffff or _bad($exec,'Invalid CHARS codepoint');
       return $cp unless $exec && exists($exec->{options}{codepoint_policy})
          && (ref($exec->{options}{codepoint_policy}) || $exec->{options}{codepoint_policy} ne 'preserve');
-      require JGraft::_String;
+      require JGraft::CodepointArray;
       my $scratch_base=$exec->{scratch_mem};
       local $exec->{scratch_mem}=$scratch_base;
-      $exec->_scratch_set($scratch_base,JGraft::_String->_workspace($v));
-      return JGraft::_String->_new($exec,$v,'character class',undef,1)->_at(0);
+      $exec->_scratch_set($scratch_base,JGraft::CodepointArray->_workspace($v));
+      return JGraft::CodepointArray->_new($exec,$v,'character class',undef,1)->at(0);
    }
    return;
 }
@@ -270,11 +270,11 @@ sub _build {
             my @pairs;
             $exec->_tick(4*length($v)+1) if $exec;
             if ($exec) {
-               require JGraft::_String;
-               $workspace->[1]+=144*length($v)+JGraft::_String->_workspace($v);
+               require JGraft::CodepointArray;
+               $workspace->[1]+=144*length($v)+JGraft::CodepointArray->_workspace($v);
                $exec->_scratch_set(@$workspace);
-               my $view=JGraft::_String->_new($exec,$v,'character class',undef,1);
-               for my $at (0..$view->{size}-1) { my $cp=$view->_at($at); push @pairs,[$cp,$cp] }
+               my $view=JGraft::CodepointArray->_new($exec,$v,'character class',undef,1);
+               for my $at (0..$view->size-1) { my $cp=$view->at($at); push @pairs,[$cp,$cp] }
             }
             else {
                for my $cp (unpack('U*',$v)) {

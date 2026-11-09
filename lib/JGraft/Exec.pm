@@ -817,16 +817,16 @@ sub _compare_values {
          $self->_tick((length($a)+length($b))*.001);
          return $a cmp $b;
       }
-      require JGraft::_String;
+      require JGraft::CodepointArray;
       my $scratch_base=$self->{scratch_mem};
       local $self->{scratch_mem}=$scratch_base;
-      $self->_scratch_set($scratch_base,JGraft::_String->_workspace($a)+JGraft::_String->_workspace($b));
-      my $av=JGraft::_String->_new($self,$a,'comparison',undef,1);
-      my $bv=JGraft::_String->_new($self,$b,'comparison',undef,1);
-      my $size=$av->{size}<$bv->{size}?$av->{size}:$bv->{size};
+      $self->_scratch_set($scratch_base,JGraft::CodepointArray->_workspace($a)+JGraft::CodepointArray->_workspace($b));
+      my $av=JGraft::CodepointArray->_new($self,$a,'comparison',undef,1);
+      my $bv=JGraft::CodepointArray->_new($self,$b,'comparison',undef,1);
+      my $size=$av->size<$bv->size?$av->size:$bv->size;
       $self->_tick($size);
-      for my $i (0..$size-1) { my $c=$av->_at($i)<=>$bv->_at($i); return $c if $c }
-      return $av->{size}<=>$bv->{size};
+      for my $i (0..$size-1) { my $c=$av->at($i)<=>$bv->at($i); return $c if $c }
+      return $av->size<=>$bv->size;
    }
    if ($type==TYPE_ARRAY) {
       my $size=@$a<@$b?scalar @$a:scalar @$b;

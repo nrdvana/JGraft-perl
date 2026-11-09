@@ -17,7 +17,7 @@ sub _new {
    $match->{exec}->_scratch_set(@$workspace);
    return bless {match=>$match,exec=>$match->{exec},value=>$value,parent=>$cursor,
       offset=>$offset,exact=>$exact,suffix=>$suffix,workspace=>$workspace,
-      string=>ref($value) eq 'JGraft::_String',groups=>[],reserved=>{%{$match->{reserved} || {}}}},$class;
+      string=>blessed($value) && $value->isa('JGraft::CodepointArray'),groups=>[],reserved=>{%{$match->{reserved} || {}}}},$class;
 }
 sub _scratch {
    my ($self,$bytes)=@_;
@@ -45,13 +45,13 @@ sub _vector_bytes {
    $bytes+=$_->{bytes} for @$states;
    return $bytes;
 }
-sub _size { $_[0]{string}? $_[0]{value}{size} : scalar @{$_[0]{value}} }
+sub _size { $_[0]{string}? $_[0]{value}->size : scalar @{$_[0]{value}} }
 sub _present { $_[0]{string}? $_[1]<$_[0]->_size : $_[0]{exec}->_present($_[0]{value},$_[1]) }
 sub _cursor {
    my ($self,$position)=@_;
    my $value=$self->{value};
    my $exists=$self->_present($position);
-   my $cursor=$self->{match}->_cursor($exists? ($self->{string}? $value->_at($position) : $value->[$position]) : undef,$exists,$position,
+   my $cursor=$self->{match}->_cursor($exists? ($self->{string}? $value->at($position) : $value->[$position]) : undef,$exists,$position,
       [$self->{parent}{path},$position],$self->{parent}{anchored});
    $cursor->{$self->{string}? 'string' : 'array'}=$value;
    return $cursor;
@@ -383,7 +383,7 @@ sub _text {
       $size=$self->{value}->_literal($exec,$spec,$state->{pos});
    }
    elsif ($type==TYPE_NUMBER && is_integer($spec) && $spec>=0 && $spec<=0x10ffff) {
-      $size=1 if $self->_present($state->{pos}) && $self->{value}->_at($state->{pos})==$spec;
+      $size=1 if $self->_present($state->{pos}) && $self->{value}->at($state->{pos})==$spec;
    }
    else { $exec->_fail('INVALID_OPERAND','Regex literal must be a string or Unicode codepoint') }
    return [] unless defined $size;

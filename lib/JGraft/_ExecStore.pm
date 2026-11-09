@@ -264,8 +264,8 @@ sub _inspect {
 
 sub _check_string {
    my ($self,$value,$kind)=@_;
-   require JGraft::_String;
-   JGraft::_String->_check($self,$value,$kind);
+   require JGraft::CodepointArray;
+   JGraft::CodepointArray->_check($self,$value,$kind);
 }
 
 sub _cow {

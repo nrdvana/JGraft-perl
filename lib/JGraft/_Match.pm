@@ -210,7 +210,7 @@ sub _expression {
    if ($name eq 'START' || $name eq 'END') {
       return 0 unless ($cursor->{array} || $cursor->{string}) && defined $cursor->{prop};
       return $name eq 'START'? $cursor->{prop}==0
-         : !$cursor->{exists} && $cursor->{prop}==($cursor->{string}? $cursor->{string}{size} : @{$cursor->{array}});
+         : !$cursor->{exists} && $cursor->{prop}==($cursor->{string}? $cursor->{string}->size : @{$cursor->{array}});
    }
    if ($name eq 'SEQ' || $name eq 'SEQMIN' || $name eq 'SEQMAX' || $name eq 'REP') {
       $exec->_fail('INVALID_GRAFT',"$name is not valid at this matching position");
@@ -257,13 +257,13 @@ sub _expression {
    if ($name eq 'STR' || $name eq 'BOOL') {
       return 0 unless $cursor->{exists} && type_mask($cursor->{value})==($name eq 'STR'?TYPE_STRING:TYPE_BOOLEAN);
       if (exists $expr->{regex_expr}) {
-         require JGraft::_String;
+         require JGraft::CodepointArray;
          require JGraft::_Sequence;
          my $scratch_base=$exec->{scratch_mem};
          local $exec->{scratch_mem}=$scratch_base;
-         my $workspace=[$scratch_base,JGraft::_String->_workspace($cursor->{value})];
+         my $workspace=[$scratch_base,JGraft::CodepointArray->_workspace($cursor->{value})];
          $exec->_scratch_set(@$workspace);
-         my $text=JGraft::_String->_new($exec,$cursor->{value},'subject',undef,1);
+         my $text=JGraft::CodepointArray->_new($exec,$cursor->{value},'subject',undef,1);
          my $sequence=JGraft::_Sequence->_new($self,$text,$cursor,0,0,undef,$workspace);
          return $sequence->_regex($expr->{regex_expr},$depth+1);
       }

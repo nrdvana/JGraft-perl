@@ -4,13 +4,23 @@ use lib 't/lib';
 use Test2AndUtils;
 use JGraft qw(:constructors jgexec);
 use JGraft::Exec;
-use JGraft::_String;
+use JGraft::CodepointArray;
 use Encode ();
 use utf8 ();
 no warnings 'utf8'; # These tests deliberately construct surrogates/noncharacters.
 
 my $true=JSON::PP::true;
 my $false=JSON::PP::false;
+for my $text ('',"a\xff\0",'a'.chr(0x100).chr(0xd800).chr(0x1f600)) {
+   my $before=$text;
+   my $view=JGraft::CodepointArray->new($text);
+   isa_ok($view,['JGraft::CodepointArray']);
+   is($view->size,length($text),'public packed view derives its codepoint count');
+   is([map $view->at($_),0..length($text)-1],[unpack('U*',$text)],'public packed view preserves codepoints');
+   my $copy=$view->slice(0,$view->size);
+   is([map $copy->at($_),0..$copy->size-1],[unpack('U*',$text)],'slices retain the representation and codepoints');
+   is($text,$before,'public construction preserves caller strings');
+}
 sub matches {
    my ($subject,$pattern,$expected,$name)=@_;
    is(jgexec(COPY(STR($pattern),NODE()),$subject),$expected,$name);
@@ -43,10 +53,10 @@ my @warnings;
 my $view;
 {
    local $SIG{__WARN__}=sub {push @warnings,@_};
-   $view=JGraft::_String->_new($context,$text,'test');
+   $view=JGraft::CodepointArray->_new($context,$text,'test');
 }
-is([unpack('N*',$view->{buffer})],[97,@special,122],'every surrogate/noncharacter survives packed conversion');
-is(utf8::is_utf8($view->{buffer})?1:0,0,'packed buffer has byte semantics');
+is([unpack('N*',$$view)],[97,@special,122],'every surrogate/noncharacter survives packed conversion');
+is(utf8::is_utf8($$view)?1:0,0,'packed buffer has byte semantics');
 is($text,$before,'conversion preserves source text');
 is(pos($text),1,'conversion preserves caller regex position');
 is(\@warnings,[],'known legacy conversion warnings stay local');
@@ -97,20 +107,20 @@ my $raw;
 }
 $context=JGraft::Exec->new(jgraft=>COPY(NODE(),NODE()),codepoint_policy=>'substitute');
 $context->apply('');
-$view=JGraft::_String->_new($context,$text,'test');
-is($view->{buffer},$raw,'substitute leaves the default Encode output intact');
+$view=JGraft::CodepointArray->_new($context,$text,'test');
+is($$view,$raw,'substitute leaves the default Encode output intact');
 $context=JGraft::Exec->new(jgraft=>COPY(NODE(),NODE()),codepoint_policy=>sub {$_[0]==0xd800?'substitute':'preserve'});
 $context->apply('');
-$view=JGraft::_String->_new($context,$text,'test');
+$view=JGraft::CodepointArray->_new($context,$text,'test');
 my @expected=(97,@special,122);
 $expected[1]=vec($raw,1,32);
-is([unpack('N*',$view->{buffer})],\@expected,'callback can substitute one codepoint while preserving the others');
+is([unpack('N*',$$view)],\@expected,'callback can substitute one codepoint while preserving the others');
 @warnings=();
 $context=JGraft::Exec->new(jgraft=>COPY(NODE(),NODE()),codepoint_policy=>sub {warn "policy notification\n"; 'preserve'});
 $context->apply('');
 {
    local $SIG{__WARN__}=sub {push @warnings,@_};
-   JGraft::_String->_new($context,chr(0xd800),'test');
+   JGraft::CodepointArray->_new($context,chr(0xd800),'test');
 }
 is(\@warnings,["policy notification\n"],'unrelated callback warnings retain their handler');
 for my $option (undef,'bad',0,[]) {
