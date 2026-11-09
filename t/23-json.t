@@ -215,6 +215,73 @@ for my $number (Math::BigInt->new('123456789012345678901234567890'),Math::BigFlo
 is($json->encode(jgexec(COPY(ADD(NODE(0),NODE(1)),NODE()),$json->decode('[0.1,0.2]'))),'0.3','exact arithmetic through JSON tree');
 is($json->encode(jgexec(COPY(DIV(NODE(0),NODE(1)),NODE()),[Math::BigInt->new(1),Math::BigInt->new(8)])),'0.125','BigInt division promotes to rational');
 is($json->encode(jgexec(COPY(MOD(NODE(0),NODE(1)),NODE()),[Math::BigRat->new('-7/10'),Math::BigRat->new('1/5')])),'0.1','rational modulo uses floor');
+{
+   my $power=COPY(POW(NODE('base'),NODE('exponent')),'result');
+   my $input={base=>Math::BigInt->new(3),exponent=>Math::BigInt->new(40)};
+   my $before=$json->encode($input);
+   my $out=jgexec($power,$input);
+   is($json->encode($out->{result}),'12157665459056928801','POW keeps integer powers beyond NV precision exact');
+   is($json->encode($input),$before,'POW preserves caller-owned numeric operands');
+   is($json->encode(jgexec(COPY(POW(2,-80),NODE()),undef)),
+      '0.00000000000000000000000082718061255302767487140869206996285356581211090087890625',
+      'negative integer powers can use exact rational storage');
+   my $root=jgexec(COPY(POW(NODE(),Math::BigRat->new('1/1000')),NODE()),Math::BigFloat->new('1e1000'));
+   ok(abs($root-10)<1e-10,'POW handles large operands with representable fractional powers');
+   my $log=jgexec(COPY(LOG(NODE(0),NODE(1)),NODE()),
+      [Math::BigInt->new(10),Math::BigFloat->new('1e1000')]);
+   ok(abs($log-1000)<1e-10,'LOG supports values outside native operand range');
+   $log=jgexec(COPY(LOG(NODE(0),NODE(1)),NODE()),
+      [Math::BigRat->new('1.000000000000000000000000000001'),Math::BigInt->new(2)]);
+   ok($log>6.9e29 && $log<7e29,'LOG preserves bases close to one during conversion');
+   for my $case ([POW(0,-1),'INVALID_TARGET'],[POW(-1,0),'INVALID_TARGET'],
+      [LOG(1,1),'INVALID_TARGET'],[POW(1e300,1.5),'UNSUPPORTED_GRAFT'],
+      [POW(1e-300,1.5),'UNSUPPORTED_GRAFT']) {
+      my $exec=JGraft::Exec->new(jgraft=>COPY($case->[0],NODE()));
+      $exec->apply(undef);
+      is($exec->error,$case->[1],'power/log domain and range failures have distinct codes');
+      is($exec->{scratch_mem},0,'power/log failure releases workspace');
+   }
+   for my $value (Math::BigInt->new('123456789012345678901234567890'),
+      Math::BigFloat->new('1.235'),Math::BigRat->new('247/200'),$json->decode('1.235')) {
+      my $before=$json->encode($value);
+      my $expected=$value>2?'123456789012345678901234567890.00':'1.24';
+      is(jgexec(COPY(ROUND({at=>2,as=>'STR'}),NODE()),$value),$expected,
+         'ROUND accepts supported numeric representations');
+      is($json->encode($value),$before,'ROUND preserves numeric operands and their precision');
+   }
+   my $huge=$json->decode('1.25e1000000');
+   is(jgexec(COPY(ROUND({shift=>-1000000,at=>2,as=>'STR'}),NODE()),$huge),'1.25',
+      'ROUND shifts exact number tokens without expanding their original exponent');
+   is(jgexec(COPY(ROUND({shift=>-1000000,at=>2,as=>'STR'}),NODE()),Math::BigFloat->new('1.25e1000000')),'1.25',
+      'ROUND shifts compact BigFloat exponents before formatting');
+   is(jgexec(COPY(ROUND({as=>'SIG'}),NODE()),'1.25e100000000000000000000'),
+      '1.25e100000000000000000000','SIG keeps huge exponents compact and exact');
+   is(jgexec(COPY(ROUND({as=>'SIG',at=>1000000}),NODE()),'1.25e-1000000'),
+      '1e-1000000','SIG keeps tiny nonzero results compact');
+   is(jgexec(COPY(ROUND({as=>'SIG',at=>1000000}),NODE()),'0e-1000000'),
+      '0e-1000000','SIG keeps tiny zero precision compact');
+   is($json->encode(jgexec(COPY(ROUND({as=>'INT'}),NODE()),'123456789012345678901234567890')),
+      '123456789012345678901234567890','ROUND INT preserves large integer precision');
+   is(jgexec(COPY(ROUND({at=>1000000,as=>'SIG'}),NODE()),'1.000'),'1.000',
+      'SIG does not pad to an unnecessarily fine at');
+   for my $case ([POW(3,NODE()),1000000],
+      [ROUND({as=>'STR'}),'1e1000000'],
+      [ROUND({as=>'INT'}),'1e1000000']) {
+      my ($expr,$value)=@$case;
+      my $input={value=>$value};
+      my $graft=JGRAFT(COPY(1,'changed'),AT('value',COPY($expr,NODE())));
+      my $exec=JGraft::Exec->new(jgraft=>$graft,undo=>1,limits=>{mem=>100000});
+      $exec->apply($input);
+      is($exec->error,'RESOURCE_LIMIT','large numeric construction is reserved before work');
+      is($exec->output,{value=>$value,changed=>1},'numeric resource failure preserves earlier edits');
+      is($input,{value=>$value},'numeric resource failure preserves the input');
+      is($exec->{scratch_mem},0,'numeric resource failure releases scratch');
+      is($json->encode(jgexec($exec->undo,$exec->output)),$json->encode($input),
+         'undo restores partial output after numeric resource failure');
+      $exec->apply({value=>1});
+      ok($exec->success,'numeric context can be reused after a resource failure');
+   }
+}
 is($json->encode(jgexec($json->decode('["COPY",["SLICE",["NODE"],1,2],["NODE"]]'),$json->decode('[0,1,2,3]'))),'[1,2]','wrapped slice bounds iterate without changing their source');
 my $inc=$json->decode('1');
 my $previous=$inc;

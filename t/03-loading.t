@@ -51,6 +51,13 @@ my $graft= JGraft::JGRAFT(JGraft::COPY(JGraft::ADD(1,JGraft::NODE('x')),'y'));
 ok(!exists($INC{'JGraft/Exec.pm'}) && !exists($INC{'JGraft/_ExecStore.pm'}),
    'static node descriptors do not load execution or its store');
 is(thaw(nfreeze($graft))->to_json_data, $graft->to_json_data, 'Storable round trip retains node behavior');
+my $common=thaw(nfreeze(JGraft::EXPR('answer')));
+is($common->name,'EXPR','Storable preserves the declared EXPR operation name');
+is($common->expr_name,'answer','Storable preserves the renamed EXPR operand');
+for my $node (JGraft::POW(2),JGraft::LOG(10,100),JGraft::Expr::ROUND->new(value_expr=>'1.235')) {
+   is(thaw(nfreeze($node))->to_json_data,$node->to_json_data,
+      'numeric expressions preserve operands through Storable');
+}
 my $dir= tempdir(CLEANUP=>1);
 my $file= "$dir/graft.storable";
 nstore($graft, $file);

@@ -248,6 +248,18 @@ Divide numbers
 
 Calculate Modulus
 
+=item L<JGraft::Expr::POW>
+
+Calculate powers
+
+=item L<JGraft::Expr::LOG>
+
+Calculate logarithms
+
+=item L<JGraft::Expr::ROUND>
+
+Round decimal numbers and strings
+
 =back
 
 =cut
@@ -281,17 +293,20 @@ sub get_class {
    # optionally called as a class method
    shift if @_ == 2 && ($_[0] eq __PACKAGE__ || $_[0]->isa(__PACKAGE__));
    @_ == 1 or invalid_graft("Expected one argument");
-   my $name= $_[0];
-   if (ref $name) {
-      my $type=JGraft::Util::type_mask($name);
-      if ($type==JGraft::Util::TYPE_NUMBER() && JGraft::Util::is_integer($name)) {
-         my $id=int($name); $name="$id";
-      }
-      $name="$name" if $type==JGraft::Util::TYPE_STRING();
-   }
-   defined $name && !ref $name or invalid_graft("Expected an expression name or ID");
-   $to_class{$name} or invalid_graft("Unknown JGraft expression: '$name'");
+   $to_class{$_[0]}
+      or invalid_graft(
+            $_[0] =~ /^([A-Z]+|[0-9]+)\z/? "Unknown JGraft expression: '$_[0]'"
+                                         : "Expected an expression name or ID"
+         );
 }
+
+=attribute name
+
+The directive's symbolic operation name, such as C<EXPR> or C<ADD>, available
+on both classes and instances. Names are installed when the concrete classes
+are declared; subclasses inherit that name unless they override the method.
+The common-expression reference's operand is accessed through
+L<JGraft::Expr::EXPR/expr_name>.
 
 =attribute id
 
@@ -448,7 +463,7 @@ sub _define_expr {
 
 # Name, protocol ID, potential result types, operand forms.
 _define_expr(EXPR => -5, TYPE_ANY,
-   {  fields => [[ name => 'name' ]],
+   {  fields => [[ expr_name => 'name' ]],
       min => 1
    }
 );
@@ -767,6 +782,15 @@ _define_expr(MOD => 78, TYPE_NUMBER,
                  [ value_expr2 => 'value' ]],
       min => 2
    }
+);
+_define_expr(POW => 79, TYPE_NUMBER,
+   { fields => [[base => 'value'], [exponent => 'value']], min => 1 }
+);
+_define_expr(LOG => 80, TYPE_NUMBER,
+   { fields => [[base => 'value'], [value => 'value']], min => 1 }
+);
+_define_expr(ROUND => 81, TYPE_NUMBER | TYPE_STRING,
+   { fields => [[options => 'value', {}], [value_expr => 'value']], min => 0 }
 );
 
 sub JGraft::Expr::LOCAL::returns {

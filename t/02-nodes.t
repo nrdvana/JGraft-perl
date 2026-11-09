@@ -47,16 +47,28 @@ my %examples= (
    CASTBOOL=>[[],[1]], CASTNUM=>[[],['12']], CASTSTR=>[[],[12]], CASTDATE=>[[],['2026-01-01']],
    LESS=>[[2],[1,2]], LESSEQ=>[[2],[1,2]], ADD=>[[],[1,2],[[1,2]]],
    SUB=>[[3,1]], MUL=>[[],[2,3],[[2,3]]], DIV=>[[6,2]], MOD=>[[5,2]],
+   POW=>[[2],[2,3]], LOG=>[[10],[10,100]], ROUND=>[[],[2],[{at=>2},'1.235']],
 );
+
+is(JGraft::Expr::ROUND->new(value_expr=>'1.25')->to_json_data,
+   ['ROUND',{},'1.25'],'named ROUND input inserts default options');
+ok(!exists(ROUND()->{options}),'omitted ROUND options remain absent');
+is(ROUND(undef)->to_json_data,['ROUND',undef],'explicit null ROUND options remain present');
+my $common=JGraft::Expr::EXPR->new(expr_name=>'example');
+is($common->name,'EXPR','EXPR operation name is independent of its operand');
+is($common->expr_name,'example','named EXPR constructor exposes the renamed operand');
+is($common->to_json_data,['EXPR','example'],'EXPR notation keeps the operation and reference names distinct');
 
 for my $registry ('JGraft::Action', 'JGraft::Expr') {
    no strict 'refs';
    my $names= \%{$registry.'::by_name'};
    for my $name (sort keys %$names) {
       my $class= $registry->get_class($name);
+      is($class->name,$name,"$name public class name");
       ok(exists $examples{$name}, "$name has constructor examples");
       for my $args (@{$examples{$name}}) {
          my $obj= $class->new($args);
+         is($obj->name,$name,"$name public instance name");
          isa_ok($obj, [$class, $registry]);
          is($obj->id, $names->{$name}, "$name ID");
          my $data= $obj->to_json_data;

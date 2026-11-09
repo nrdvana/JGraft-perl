@@ -152,8 +152,8 @@ sub _deferred {
    local $active->{$id}=1;
    my $name=$spec->name;
    if ($name eq 'EXPR') {
-      return 1 if is_expr($spec->name);
-      my $key=$spec->name; $key="$key";
+      return 1 if is_expr($spec->expr_name);
+      my $key=$spec->expr_name; $key="$key";
       return exists($self->{exec}{expr}[0]{$key}) && $self->_deferred($self->{exec}{expr}[0]{$key},$active);
    }
    return 1 if $name eq 'WITH';
@@ -178,8 +178,8 @@ sub _potential {
    return $self->_potential($spec->match_spec,$active,$depth+1)
       if ($name eq 'HAS' || $name eq 'IS') && !exists $spec->{value_expr};
    if ($name eq 'EXPR') {
-      return 1 if is_expr($spec->name);
-      my $key=$spec->name; $key="$key";
+      return 1 if is_expr($spec->expr_name);
+      my $key=$spec->expr_name; $key="$key";
       return 0 unless exists $self->{exec}{expr}[0]{$key};
       return $self->_potential($self->{exec}{expr}[0]{$key},$active,$depth+1);
    }

@@ -350,7 +350,7 @@ sub _match {
 
 sub _macro {
    my ($self,$expr,$depth)= @_;
-   my $name=$self->_eval($expr->{name},$depth+1);
+   my $name=$self->_eval($expr->{expr_name},$depth+1);
    my $t=type_mask($name);
    $t==TYPE_STRING || ($t==TYPE_NUMBER && is_integer($name)) or $self->_fail('INVALID_OPERAND','Invalid EXPR name');
    my $key="$name";
@@ -1037,6 +1037,249 @@ sub JGraft::Expr::MOD::_execute {
    return $self->_finite_result($a-$floor*$b);
 }
 
+# POW/LOG validate domains at execution time, including literal operands in probes.
+sub _power_values {
+   my ($self,$expr,$field,$depth,$workspace)=@_;
+   my $a=$self->_eval($expr->{base},$depth+1);
+   my $b=$self->_input_value($expr,$field,$depth);
+   for ($a,$b) {
+      type_mask($_)==TYPE_NUMBER && is_finite($_)
+         or $self->_fail('INVALID_TARGET','POW/LOG expects finite numbers');
+   }
+   if (ref($a) || ref($b)) {
+      ($a,$b)=($self->_number($a,$workspace),$self->_number($b,$workspace));
+   }
+   return ($a,$b);
+}
+sub JGraft::Expr::POW::_execute {
+   my ($expr,$self,$depth)=@_;
+   my $base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$base;
+   my $workspace=[$base,256];
+   $self->_scratch_set(@$workspace);
+   my ($a,$b)=$self->_power_values($expr,'exponent',$depth,$workspace);
+   $a>=0 && ($a!=0 || $b>=0) or $self->_fail('INVALID_TARGET','Invalid POW domain');
+   return 1 if $b==0 || $a==1;
+   return 0 if $a==0;
+   if (is_integer($b)) {
+      $a=$self->_number($a,$workspace) unless ref $a;
+      my $size=JGraft::Util::estimate_number_digits($a);
+      my $exponent=abs(JGraft::Util::to_native_number($b));
+      my $digits=($size+1)*$exponent+8;
+      # Bound the result, intermediate products and exponentiation work before bpow.
+      $self->_scratch_set($base,$workspace->[1]+512+32*$digits);
+      $self->_reserve(1+$digits*$digits*.01,192+8*$digits,1);
+      local ($Math::BigRat::accuracy,$Math::BigRat::precision);
+      my $out=$a->bpow($b);
+      is_finite($out) or $self->_fail('UNSUPPORTED_GRAFT','POW outside supported range');
+      return $out;
+   }
+   my $out;
+   if (ref $a) {
+      my $size=JGraft::Util::estimate_number_digits($a)+JGraft::Util::estimate_number_digits($b);
+      my ($n,$d)=JGraft::Util::_rational_shape($a,ref($a)->config('lib'));
+      my $precision=40+($n<$d?$n:$d);
+      $self->_scratch_set($base,$workspace->[1]+1024+128*($size+$precision));
+      $self->_reserve(1+$size*$precision,$precision*8+192,1);
+      local ($Math::BigFloat::accuracy,$Math::BigFloat::precision);
+      $out=0+$a->as_float($precision)->bpow($b->as_float($precision),$precision)->numify;
+   }
+   else { $self->_tick(1); $out=$a**$b }
+   is_finite($out) && $out!=0 or $self->_fail('UNSUPPORTED_GRAFT','POW overflow or underflow');
+   return $out;
+}
+sub JGraft::Expr::LOG::_execute {
+   my ($expr,$self,$depth)=@_;
+   my $base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$base;
+   my $workspace=[$base,256];
+   $self->_scratch_set(@$workspace);
+   my ($a,$b)=$self->_power_values($expr,'value',$depth,$workspace);
+   $a>0 && $a!=1 && $b>0 or $self->_fail('INVALID_TARGET','Invalid LOG domain');
+   return 0 if $b==1;
+   return 1 if $a==$b;
+   my $out;
+   if (ref $a) {
+      my $size=JGraft::Util::estimate_number_digits($a)+JGraft::Util::estimate_number_digits($b);
+      my $lib=ref($a)->config('lib');
+      my ($an,$ad)=JGraft::Util::_rational_shape($a,$lib);
+      my ($bn,$bd)=JGraft::Util::_rational_shape($b,$lib);
+      my $ap=$an<$ad?$an:$ad;
+      my $bp=$bn<$bd?$bn:$bd;
+      my $precision=40+($ap>$bp?$ap:$bp);
+      $self->_scratch_set($base,$workspace->[1]+1024+128*($size+$precision));
+      $self->_reserve(1+$size*$precision*.1,$precision*8+192,1);
+      local ($Math::BigFloat::accuracy,$Math::BigFloat::precision);
+      # Extra digits preserve a base arbitrarily close to one before taking log.
+      my $la=$a->as_float($precision)->blog(undef,$precision);
+      my $lb=$b->as_float($precision)->blog(undef,$precision);
+      $la->is_zero and $self->_fail('UNSUPPORTED_GRAFT','LOG base outside supported precision');
+      $out=$lb->bdiv($la,$precision)->numify;
+      $out=0+$out;
+   }
+   else { $self->_tick(1); $out=log($b)/log($a) }
+   is_finite($out) && $out!=0 or $self->_fail('UNSUPPORTED_GRAFT','LOG overflow or underflow');
+   return $out;
+}
+
+sub _round_choice {
+   my ($self,$v,$names)=@_;
+   my $type=type_mask($v);
+   if ($type==TYPE_STRING) {
+      $self->_tick(length($v));
+      for my $i (0..$#$names) { return $i if $v eq $names->[$i] }
+   }
+   elsif ($type==TYPE_NUMBER && is_integer($v) && $v>=0 && $v<@$names) {
+      return JGraft::Util::to_native_number($v);
+   }
+   $self->_fail('INVALID_OPERAND','Invalid ROUND mode or output format');
+}
+sub _round_integer {
+   my ($self,$v,$workspace)=@_;
+   is_integer($v) or $self->_fail('INVALID_OPERAND','ROUND position must be an integer');
+   my $r=$self->_number($v,$workspace);
+   return $r->numerator;
+}
+# Decimal values are a sign, a compact coefficient, and a base-ten exponent.
+# All exponent arithmetic stays exact; only bounded string indices become native.
+sub JGraft::Expr::ROUND::_execute {
+   my ($expr,$self,$depth)=@_;
+   my $base=$self->{scratch_mem};
+   local $self->{scratch_mem}=$base;
+   my $workspace=[$base,1024];
+   $self->_scratch_set(@$workspace);
+   require Math::BigInt;
+   local ($Math::BigInt::accuracy,$Math::BigInt::precision,
+      $Math::BigRat::accuracy,$Math::BigRat::precision);
+   my ($mode,$as,$at,$shift)=(1,undef,Math::BigInt->new(0),Math::BigInt->new(0));
+   if (exists $expr->{options}) {
+      my $opt=$self->_eval($expr->{options},$depth+1);
+      if (type_mask($opt)==TYPE_NUMBER) { $shift=$self->_round_integer($opt,$workspace) }
+      elsif (ref($opt) eq 'HASH') {
+         $mode=$self->_round_choice($opt->{mode},[qw(DOWN HALF_UP HALF_EVEN CEILING FLOOR UP)]) if exists $opt->{mode};
+         $as=$self->_round_choice($opt->{as},[qw(NUM INT STR SIG)]) if exists $opt->{as};
+         $at=$self->_round_integer($opt->{at},$workspace) if exists $opt->{at};
+         $shift=$self->_round_integer($opt->{shift},$workspace) if exists $opt->{shift};
+      }
+      else { $self->_fail('INVALID_OPERAND','ROUND options must be an integer or object') }
+   }
+   my $v=$self->_input_value($expr,'value_expr',$depth);
+   my $type=type_mask($v);
+   $type==TYPE_STRING || ($type==TYPE_NUMBER && is_finite($v))
+      or $self->_fail('INVALID_TARGET','ROUND expects a finite number or decimal string');
+   $as=$type==TYPE_STRING?2:0 unless defined $as;
+   my $text;
+   if ($type==TYPE_STRING) {
+      $workspace->[1]+=32*length($v);
+      $self->_scratch_set(@$workspace);
+      $text="$v";
+   }
+   elsif (ref $v) {
+      my ($compact,$expanded)=JGraft::Util::_number_sizes($v);
+      my $size=$v->isa('Math::BigRat')?$expanded:$compact;
+      $workspace->[1]+=512+256*$size;
+      $self->_scratch_set(@$workspace);
+      $self->_tick(1+$size*$size);
+      $text=eval { $v->isa('JGraft::JSON::Number')?$v->token
+         :$v->isa('Math::BigFloat')?$v->bsstr:JGraft::Util::to_decimal_string($v,0) };
+      my $error=$@;
+      die $error if ref $error;
+      $self->_fail('UNSUPPORTED_GRAFT',"ROUND decimal conversion: $error") if $error;
+   }
+   else { $text=$v?"$v":sprintf('%g',$v) }
+   my $size=length($text);
+   $workspace->[1]+=512+32*$size;
+   $self->_scratch_set(@$workspace);
+   $self->_tick(1+$size);
+   $text =~ /\A([+-]?)(0|[1-9][0-9]*)(?:\.([0-9]*))?(?:[eE]([+-]?[0-9]+))?\z/
+      or $self->_fail('INVALID_TARGET','Invalid ROUND decimal input');
+   my ($sign,$whole,$fraction,$exponent)=($1,$2,defined($3)?$3:'',defined($4)?$4:'0');
+   $sign=$sign eq '-'?'-':'';
+   my $digits=$whole.$fraction;
+   my $e=Math::BigInt->new($exponent)->badd($shift)->bsub(length($fraction));
+   my $precision=$e->copy;
+   # Whole-number trailing zeros do not establish significant precision.
+   if (!length $fraction) {
+      my ($zeros)=$digits =~ /(0*)\z/;
+      $precision->badd(length($zeros)) if $digits =~ /[1-9]/;
+   }
+   my $place=$at->copy->bneg;
+   $precision=$place->copy if $precision<$place;
+   $digits =~ s/^0+//;
+   $digits='0' unless length $digits;
+   my $cut=$place-$e;
+   if ($cut>0 && $digits ne '0') {
+      my ($kept,$discard,$half)=('0',1,-1);
+      if ($cut<=length($digits)) {
+         my $n=$cut->numify;
+         my $tail=substr($digits,length($digits)-$n);
+         $kept=substr($digits,0,length($digits)-$n) || '0';
+         $discard=$tail =~ /[1-9]/?1:0;
+         my $first=ord(substr($tail,0,1))-48;
+         $half=$first<5?-1:$first>5?1:substr($tail,1)=~/[1-9]/?1:0;
+      }
+      my $up=$discard && ($mode==5 || ($mode==3 && !$sign) || ($mode==4 && $sign)
+         || ($mode==1 && $half>=0) || ($mode==2 && ($half>0 || (!$half && substr($kept,-1)%2))));
+      if ($up) {
+         # String carry avoids native numeric coercion of long coefficients.
+         my $i=length($kept)-1;
+         while ($i>=0 && substr($kept,$i,1) eq '9') { substr($kept,$i--,1)='0' }
+         if ($i<0) { $kept='1'.$kept }
+         else { substr($kept,$i,1)=chr(ord(substr($kept,$i,1))+1) }
+      }
+      ($digits,$e)=($kept,$place->copy);
+   }
+   if ($digits ne '0') {
+      $digits =~ s/(0+)\z// and $e->badd(length($1));
+   }
+   else { $e=Math::BigInt->new(0) }
+   if ($as==0) {
+      my $out=0+($sign.$digits.'e'.$e->bstr);
+      is_finite($out) && ($out!=0 || $digits eq '0')
+         or $self->_fail('UNSUPPORTED_GRAFT','ROUND number overflow or underflow');
+      return $out;
+   }
+   if ($as==1) {
+      $digits eq '0' || $e>=0 or $self->_fail('INVALID_TARGET','ROUND INT result is fractional');
+      return 0 if $digits eq '0';
+      my $length=length($digits)+$e->numify;
+      $self->_scratch_set($base,$workspace->[1]+512+16*$length);
+      $self->_reserve(1+$length*$length*.01,192+8*$length,1);
+      return Math::BigInt->new($sign.$digits)->bmul(Math::BigInt->new(10)->bpow($e));
+   }
+   # SIG can remain compact at any exponent. Plain decimals are used when they
+   # express the requested precision without trailing whole-number zeroes.
+   my $top=$digits eq '0'?$precision->copy:$e+length($digits)-1;
+   my $scientific=$as==3 && ($precision>0 || $top< -6
+      || ($precision==0 && $digits ne '0' && $e>0));
+   my $p=$as==2?$place:$precision;
+   if ($scientific) {
+      my $count=$top-$p+1;
+      my $length=$count->numify+length($top->bstr)+4;
+      $self->_reserve($length,$length,0);
+      $self->_scratch_set($base,$workspace->[1]+2*$length);
+      my $out=$digits.('0'x($count->numify-length($digits)));
+      substr($out,1,0)='.' if length($out)>1;
+      return $sign.$out.'e'.$top->bstr;
+   }
+   my $point=$digits eq '0'?1:length($digits)+$e->numify;
+   my $places=$p<0?(-$p)->numify:0;
+   my $length=($point>0?$point:1)+($places?1+$places:0)+length($sign);
+   $self->_reserve($length,$length,0);
+   $self->_scratch_set($base,$workspace->[1]+3*$length);
+   my $out;
+   if ($point<=0) { $out='0.'.('0'x(-$point)).$digits }
+   elsif ($point>=length($digits)) { $out=$digits.('0'x($point-length($digits))) }
+   else { $out=substr($digits,0,$point).'.'.substr($digits,$point) }
+   if ($places) {
+      $out.='.' unless $out =~ /\./;
+      my $have=length($out)-index($out,'.')-1;
+      $out.='0'x($places-$have) if $places>$have;
+   }
+   return $sign.$out;
+}
+
+
 sub _slice {
    my ($self,$expr,$depth)= @_;
    my $scratch_base=$self->{scratch_mem};
@@ -1106,6 +1349,23 @@ rounding settings. Native-only arithmetic retains its usual fast path. Exact
 results can be serialized by L<JGraft::JSON>; nonterminating rational results
 require explicit rounding before JSON emission. Conversion and arithmetic costs
 include conservative charges for digit counts and decimal exponent expansion.
+POW uses exact rational exponentiation for integer exponents, including integer
+results beyond native floating point precision. Fractional exponents return native
+floating point; exact numeric operands retain decimal precision during calculation.
+Results outside native range fail with C<UNSUPPORTED_GRAFT>.
+LOG accepts exact numeric operands, preserving bases close
+to one during logarithm calculation, and returns a native floating point result.
+Both reject nonfinite inputs with C<INVALID_TARGET>; overflow and nonzero results
+that underflow to zero fail with C<UNSUPPORTED_GRAFT>.
+
+ROUND implements all six decimal rounding modes and the C<NUM>, C<INT>, C<STR>,
+and C<SIG> output formats. C<INT> can return Math::BigInt without precision loss;
+C<NUM> uses native numeric storage and fails on overflow or nonzero underflow.
+String rounding and significant-digit formatting operate on compact coefficients
+and exact exponents, without expanding the input's exponent first. Numeric input
+uses its CASTSTR decimal representation; rationals without a finite decimal
+representation fail with C<UNSUPPORTED_GRAFT>, as for CASTSTR. Numeric objects
+and caller-supplied Math precision settings remain unchanged.
 Structural matching supports HAS, IS, ANY, ALL, NONE, EXISTS, ARRAY, NUM, BOOL,
 STR, CHARS, DATE, and WITH. Array and string sequences support SEQ, SEQMIN, SEQMAX, REP, START, END,
 successor unions/coverage assertions, and preferred named captures.

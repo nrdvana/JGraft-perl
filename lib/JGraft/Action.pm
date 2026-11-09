@@ -108,6 +108,12 @@ sub get_class {
    $to_class{$name} or invalid_graft("Unknown JGraft action: '$name'");
 }
 
+=attribute name
+
+The directive's symbolic operation name, such as C<COPY>, available on both
+classes and instances. Names are installed when the concrete classes are declared;
+subclasses inherit that name unless they override the method.
+
 =attribute forms
 
 An arrayref describing the possible patterns of arguments which are accepted by the constructor.
