@@ -3,6 +3,7 @@ package JGraft::JSON::Object;
 # ABSTRACT: Ordered JSON object storage with duplicate members
 use strict;
 use warnings;
+use JGraft::JSON::_Layout q(same_origin);
 our $EXEC;
 
 # Storage for {"a": first_a, "b": b, "a": last_a, ...}:
@@ -20,6 +21,8 @@ our $EXEC;
 # Live slots follow seq's previous/next links. Freed slots have undef tokens and
 # use seq[offset+1] as the next free offset. Neither list uses reference cycles.
 # Encoding visits all live slots; hash iteration yields only each key's last slot.
+# Decoding with retained layout adds doc, open, mod, and orig=>[...], the original
+# member index at each live key offset (see JGraft::JSON::_Layout).
 
 sub TIEHASH { bless {tokens=>[],index=>{},seq=>[]},shift }
 sub _lookup {
@@ -45,6 +48,7 @@ sub _add {
 sub _unlink {
    my ($s,$i)=@_;
    my ($prev,$next)=@{$s->{seq}}[$i,$i+1];
+   $s->{orig}[$i]=undef if $s->{orig};
    if (defined $prev) { $s->{seq}[$prev+1]=$next }
    else { $s->{head}=$next }
    if (defined $next) { $s->{seq}[$next]=$prev }
@@ -68,6 +72,7 @@ sub _append {
    if (!defined $offsets) { $s->{index}{$key}=$i }
    elsif (ref $offsets) { push @$offsets,$i }
    else { $s->{index}{$key}=[$offsets,$i] }
+   return $i;
 }
 sub FETCH {
    my ($s,$key)=@_;
@@ -89,12 +94,14 @@ sub _get {
 sub _replace_slot {
    my ($s,$slot,$value)=@_;
    $EXEC->_tick(1) if $EXEC;
+   $s->{mod}=1;
    $s->{tokens}[$slot+1]=$value;
 }
 sub EXISTS { defined $_[0]->_lookup($_[1]) }
 sub STORE {
    my ($s,$key,$value)=@_;
    my $i=$s->_lookup($key);
+   $s->{mod}=1;
    unless (defined $i) {
       $EXEC->_reserve(0,64+4*length($key),0) if $EXEC;
       $s->{index}{$key}=$s->_add($key,$value);
@@ -107,7 +114,8 @@ sub STORE {
       for my $j (0..$#$offsets-1) { $s->_unlink($offsets->[$j]) }
       $s->{index}{$key}=$i;
    }
-   @{$s->{tokens}}[$i,$i+1]=($key,$value);
+   # The member keeps its key token and its key layout.
+   $s->{tokens}[$i+1]=$value;
    return $value;
 }
 sub DELETE {
@@ -117,12 +125,16 @@ sub DELETE {
    my $last=ref($offsets)?$offsets->[-1]:$offsets;
    my $value=$s->{tokens}[$last+1];
    $EXEC->_tick(4*(ref($offsets)?scalar @$offsets:1)) if $EXEC;
+   $s->{mod}=1;
    delete $s->{index}{$key};
    if (ref $offsets) { $s->_unlink($_) for @$offsets }
    else { $s->_unlink($offsets) }
    return $value;
 }
-sub CLEAR { %{$_[0]}=(tokens=>[],index=>{},seq=>[]) }
+sub CLEAR {
+   my $s=shift;
+   %$s=(tokens=>[],index=>{},seq=>[],$s->{doc}? (doc=>$s->{doc},open=>$s->{open},orig=>[],mod=>1) : ());
+}
 sub SCALAR { scalar keys %{$_[0]{index}} }
 sub FIRSTKEY { $_[0]{iterator}=$_[0]{head}; shift->NEXTKEY }
 sub NEXTKEY {
@@ -136,13 +148,13 @@ sub NEXTKEY {
    }
    return;
 }
-sub _clone {
+sub clone {
    my ($s,$map)=@_;
    my $n=@{$s->{tokens}};
    my $keys=keys %{$s->{index}};
    if ($EXEC) {
-      $EXEC->_tick(2*$n+$keys);
-      $EXEC->_allocation(128+32*$n+64*$keys);
+      $EXEC->_tick(2*$n+$keys+($s->{doc}?$n:0));
+      $EXEC->_allocation(128+32*$n+64*$keys+($s->{doc}?8*$n:0));
       $EXEC->_reserve(0,0,4);
    }
    my %out;
@@ -150,6 +162,10 @@ sub _clone {
    $copy->{$_}=$s->{$_} for qw(head tail free);
    $copy->{tokens}=[@{$s->{tokens}}];
    $copy->{seq}=[@{$s->{seq}}];
+   if ($s->{doc}) {
+      @{$copy}{qw(doc open mod)}=@{$s}{qw(doc open mod)};
+      $copy->{orig}=[@{$s->{orig}}];
+   }
    {
       my $scratch_base=$EXEC?$EXEC->{scratch_mem}:0;
       local $EXEC->{scratch_mem}=$scratch_base if $EXEC;
@@ -167,10 +183,13 @@ sub _clone {
       for (my $i=$copy->{head};defined $i;$i=$copy->{seq}[$i+1]) {
          $EXEC->_tick(1) if $EXEC;
          $copy->{tokens}[$i+1]=$map->($copy->{tokens}[$i+1]);
+         # A mapped copy stays unmodified while its values are interchangeable.
+         $copy->{mod}=1 if $copy->{doc} && !$copy->{mod} && !same_origin($s->{tokens}[$i+1],$copy->{tokens}[$i+1]);
       }
    }
    return \%out;
 }
+*_clone=\&clone;
 
 =head1 DESCRIPTION
 
@@ -190,7 +209,27 @@ to accommodate peak member count, rather than the number of writes or distinct
 keys ever inserted. Deleted slots release their key and value references.
 
 During execution, lookups, key lengths, duplicate removal, traversal, and
-allocations contribute to JGraft's resource counters. No whitespace is retained.
+allocations contribute to JGraft's resource counters.
+
+When decoded with retained whitespace or comments, the object refers to its
+position in the original text, and each slot remembers its original member.
+Encoding reuses the whitespace around each original key, colon, value, and
+comma, and attached comments. Assigning to an existing key replaces only the
+value: comments attached to the value are discarded, while the key's token, its
+comments, and all whitespace remain. DELETE and duplicate collapse discard the
+removed members' layout. New members copy the whitespace (never comments) of
+the previous member. A new first member takes over the whitespace after the
+opening brace. An unmodified object can be reproduced from its original text. See
+L<JGraft::JSON::Array> for the equivalent array behavior.
+
+=method clone
+
+  my $ref= tied(%$object)->clone($map);
+
+Return a new hash reference tied to the same class, preserving duplicates,
+order, spellings, and layout. The optional callback maps each member value,
+including hidden duplicates. Callers can detect this interface with
+C<< tied(%$object)->can('clone') >>.
 
 =for Pod::Coverage TIEHASH FETCH EXISTS STORE DELETE CLEAR SCALAR FIRSTKEY NEXTKEY
 
