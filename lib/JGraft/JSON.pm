@@ -12,37 +12,73 @@ use JGraft::JSON::Number;
 use JGraft::JSON::String;
 use JGraft::JSON::Object;
 use JGraft::JSON::Array;
+use JGraft::JSON::Cursor;
 use JGraft::JSON::_Layout qw(V_PRE M_PRE POST K_PRE C_PRE C_POST final_ws has_comments
    container_layout document_layout arrange);
 
-my @FLAGS=qw(ascii utf8 json5 comments preserve_whitespace pretty);
-my $ID_START=qr/[\$_\p{L}\p{Nl}]/;
-my $ID_PART=qr/[\$_\p{L}\p{Nl}\p{Mn}\p{Mc}\p{Nd}\p{Pc}\x{200C}\x{200D}]/;
-my $EMPTY=[('') x 6];
+my @FLAGS= qw(ascii utf8 json5 comments preserve_whitespace pretty);
+my $ID_START= qr/[\$_\p{L}\p{Nl}]/;
+my $ID_PART= qr/[\$_\p{L}\p{Nl}\p{Mn}\p{Mc}\p{Nd}\p{Pc}\x{200C}\x{200D}]/;
+my $EMPTY= [('') x 6];
 
 sub new {
-   my ($class,%options)=@_;
-   my %defaults=((map +($_=>0),@FLAGS),indent_length=>2,wrap=>79,max_depth=>256,max_size=>0,
-      max_number_digits=>10000,number_overflow=>'reject');
+   my ($class, %options)= @_;
+   my %defaults= ((map +($_ => 0), @FLAGS), indent_length => 2, wrap => 79, max_depth => 256, max_size => 0,
+      max_number_digits => 10000, number_overflow => 'reject', layout => undef, sortkeys => undef);
    exists $defaults{$_} or croak "Unknown JSON option '$_'" for keys %options;
-   my $self=bless {%defaults,%options},$class;
+   my $self= bless {%defaults, %options}, $class;
    for my $key (qw(max_depth max_size max_number_digits indent_length wrap)) {
       defined($self->{$key}) && !ref($self->{$key}) && $self->{$key} =~ /\A[0-9]+\z/
          or croak "$key must be a nonnegative integer";
    }
-   defined($self->{number_overflow}) && $self->{number_overflow} =~ /\A(?:reject|native)\z/ or croak 'number_overflow must be reject or native';
+   defined($self->{number_overflow}) && $self->{number_overflow} =~ /\A(?:reject|native)\z/
+      or croak 'number_overflow must be reject or native';
+   !defined($self->{layout}) || ref($self->{layout}) eq 'CODE' or croak 'layout must be a code reference';
+   $self->{_sort}= _sorter($self->{sortkeys});
+   return $self;
+}
+sub sortkeys {
+   my ($self, $spec)= @_;
+   $self->{_sort}= _sorter($spec);
+   $self->{sortkeys}= $spec;
+   return $self;
+}
+# Compile a sortkeys specification into a function from an arrayref of names to
+# the sorted list. The sort runs in the package the comparator was compiled in,
+# which is where the comparator looks for $a and $b.
+my %SORT_IN;
+sub _sorter {
+   my $spec= shift;
+   return undef unless defined $spec;
+   if (ref($spec) eq 'ARRAY') {
+      my $n= @$spec;
+      my %pri= map +($spec->[$_] => $_-$n), 0..$n-1;
+      $spec= sub { ($pri{$a} || 0) <=> ($pri{$b} || 0) or $a cmp $b };
+   }
+   ref($spec) eq 'CODE' or croak 'sortkeys must be a code reference, an array reference, or undef';
+   require B;
+   my $pkg= eval { B::svref_2object($spec)->STASH->NAME };
+   $pkg= 'main' unless defined($pkg) && $pkg =~ /\A\w+(?:::\w+)*\z/;
+   my $make= $SORT_IN{$pkg} ||= eval "package $pkg; sub { my \$cmp= shift; sub { sort \$cmp \@{\$_[0]} } }"
+      || die $@;
+   return $make->($spec);
+}
+sub layout {
+   my ($self, $cb)= @_;
+   !defined($cb) || ref($cb) eq 'CODE' or croak 'layout must be a code reference';
+   $self->{layout}= $cb;
    return $self;
 }
 for my $flag (@FLAGS) {
    no strict 'refs';
-   *$flag=sub { $_[0]{$flag}=@_>1?!!$_[1]:1; $_[0] };
+   *$flag= sub { $_[0]{$flag}= @_ > 1? !!$_[1] : 1; $_[0] };
 }
 for my $key (qw(indent_length wrap)) {
    no strict 'refs';
-   *$key=sub {
-      my ($self,$n)=@_;
+   *$key= sub {
+      my ($self, $n)= @_;
       defined($n) && !ref($n) && $n =~ /\A[0-9]+\z/ or croak "$key must be a nonnegative integer";
-      $self->{$key}=$n;
+      $self->{$key}= $n;
       return $self;
    };
 }
@@ -525,12 +561,15 @@ sub _string {
    return $token eq $self->_quote($value)? $value
       : JGraft::JSON::String->_new($value, $token, $self->{ascii});
 }
-my %ESCAPES=('"'=>'"','\\'=>'\\','/'=>'/',b=>"\x08",f=>"\x0c",n=>"\n",r=>"\r",t=>"\x09");
-my %ESCAPES5=(%ESCAPES,v=>"\x0b",'0'=>"\0","\n"=>'',"\r"=>'',"\r\n"=>'',"\x{2028}"=>'',"\x{2029}"=>'');
+my %ESCAPES= ('"' => '"', '\\' => '\\', '/' => '/', b => "\x08", f => "\x0c", n => "\n", r => "\r", t => "\x09");
+my %ESCAPES5= (
+   %ESCAPES, v => "\x0b", '0' => "\0",
+   "\n" => '', "\r" => '', "\r\n" => '', "\x{2028}" => '', "\x{2029}" => '',
+);
 sub _escape {
    no warnings 'utf8';
-   my ($hi,$lo,$cp,$simple,$json5)=@_;
-   return chr(0x10000+((hex($hi)-0xd800)<<10)+hex($lo)-0xdc00) if defined $hi;
+   my ($hi, $lo, $cp, $simple, $json5)= @_;
+   return chr(0x10000+((hex($hi)-0xd800) << 10)+hex($lo)-0xdc00) if defined $hi;
    return chr(hex($cp)) if defined $cp;
    return $ESCAPES{$simple} unless $json5;
    return exists($ESCAPES5{$simple})? $ESCAPES5{$simple} : $simple;
@@ -539,15 +578,16 @@ sub _escape {
 # container, number, or string (wrapping a plain string), and discarded for
 # null and booleans.
 sub _attach_document {
-   my ($self,$doc,$out,$first,$last)=@_;
-   my $t=$doc->{t};
-   $doc->{root}=[$first,$last];
-   return $out if $t->[3*$first]==0 && $t->[3*$last+1]==length($doc->{text});
+   my ($self, $doc, $out, $first, $last)= @_;
+   my $t= $doc->{t};
+   $doc->{root}= [$first, $last];
+   return $out if $t->[3*$first] == 0 && $t->[3*$last+1] == length($doc->{text});
    if (ref($out) eq 'HASH' || ref($out) eq 'ARRAY') { }
-   elsif (blessed($out) && $out->isa('JGraft::JSON::Number')) { $out->{doc}=$doc }
-   elsif (blessed($out) && $out->isa('JGraft::JSON::String')) { $out->[4]=$doc }
+   elsif (blessed($out) && $out->isa('JGraft::JSON::Number')) { $out->{doc}= $doc }
+   elsif (blessed($out) && $out->isa('JGraft::JSON::String')) { $out->[4]= $doc }
    elsif (defined($out) && !ref($out)) {
-      $out=JGraft::JSON::String->_new($out,$self->_quote($out),$self->{ascii},0,$doc,$doc->{id},$t->[3*$first]);
+      $out= JGraft::JSON::String->_new($out, $self->_quote($out), $self->{ascii}, 0,
+         $doc, $doc->{id}, $t->[3*$first]);
    }
    return $out;
 }
@@ -556,92 +596,99 @@ sub _attach_document {
 
 sub _quote {
    no warnings 'utf8';
-   my ($self,$v)=@_;
-   my %simple=(8=>'\\b',9=>'\\t',10=>'\\n',12=>'\\f',13=>'\\r',34=>'\\"',92=>'\\\\');
-   my $out='"';
-   for my $ch (split //,"$v") {
-      my $cp=ord($ch);
-      $cp<=0x10ffff or croak 'Codepoint exceeds Unicode maximum';
-      if (exists $simple{$cp}) { $out.=$simple{$cp} }
-      elsif ($cp<32 || ($cp>=0xd800 && $cp<=0xdfff) || ($self->{ascii} && $cp>127)) {
-         $out.=$cp<=0xffff?sprintf('\\u%04x',$cp)
-            :sprintf('\\u%04x\\u%04x',0xd800+(($cp-0x10000)>>10),0xdc00+(($cp-0x10000)&1023));
+   my ($self, $v)= @_;
+   my %simple= (8 => '\\b', 9 => '\\t', 10 => '\\n', 12 => '\\f', 13 => '\\r', 34 => '\\"', 92 => '\\\\');
+   my $out= '"';
+   for my $ch (split //, "$v") {
+      my $cp= ord($ch);
+      $cp <= 0x10ffff or croak 'Codepoint exceeds Unicode maximum';
+      if (exists $simple{$cp}) { $out .= $simple{$cp} }
+      elsif ($cp < 32 || ($cp >= 0xd800 && $cp <= 0xdfff) || ($self->{ascii} && $cp > 127)) {
+         $out .= $cp <= 0xffff? sprintf('\\u%04x', $cp)
+            : sprintf('\\u%04x\\u%04x', 0xd800+(($cp-0x10000) >> 10), 0xdc00+(($cp-0x10000)&1023));
       }
-      else { $out.=$ch }
+      else { $out .= $ch }
    }
    return $out.'"';
 }
 sub encode {
-   my ($self,$v)=@_;
-   my $text=$self->{preserve_whitespace} || $self->{pretty} || $self->{comments}
-      ? $self->_document($v) : $self->_encode($v,1,{});
+   my ($self, $v)= @_;
+   my $text= $self->{preserve_whitespace} || $self->{pretty} || $self->{comments} || $self->{layout}
+      ? $self->_document($v) : $self->_encode($v, 1, {});
    if ($self->{utf8}) { utf8::encode($text) }
-   $self->{max_size} && length($text)>$self->{max_size} and croak 'JSON exceeds max_size';
+   $self->{max_size} && length($text) > $self->{max_size} and croak 'JSON exceeds max_size';
    return $text;
 }
 # Scalar token in the requested output dialect; undef for containers.
 sub _token {
-   my ($self,$v,$key)=@_;
+   my ($self, $v, $key)= @_;
    return 'null' unless defined $v;
-   return $v?'true':'false' if JSON::PP::is_bool($v);
+   return $v? 'true' : 'false' if JSON::PP::is_bool($v);
    if (blessed($v)) {
       return $self->{json5} || $v->is_json? $v->token : $v->json_token if $v->isa('JGraft::JSON::Number');
       if ($v->isa('JGraft::JSON::String')) {
-         my $flags=$v->[3] || 0;
-         return $v->[1] if $v->[2]==$self->{ascii} && (!($flags & 1) || $self->{json5}) && (!($flags & 2) || $key);
+         my $flags= $v->[3] || 0;
+         return $v->[1]
+            if $v->[2] == $self->{ascii} && (!($flags & 1) || $self->{json5}) && (!($flags & 2) || $key);
          return $self->_quote($v->[0]);
       }
       if (JGraft::Util::is_number_object($v)) {
-         return JGraft::Util::to_decimal_string($v,$self->{max_number_digits}) if is_finite($v);
+         return JGraft::Util::to_decimal_string($v, $self->{max_number_digits}) if is_finite($v);
          $self->{json5} or croak 'Cannot encode a non-finite JSON number';
          return $v->is_nan? 'NaN' : $v->is_inf('-')? '-Infinity' : 'Infinity';
       }
       croak 'Unsupported JSON object '.ref($v);
    }
-   my $type=type_mask($v);
-   return $self->_quote($v) if $type==TYPE_STRING;
-   if ($type==TYPE_NUMBER) {
+   my $type= type_mask($v);
+   return $self->_quote($v) if $type == TYPE_STRING;
+   if ($type == TYPE_NUMBER) {
       unless (is_finite($v)) {
          $self->{json5} or croak 'Cannot encode a non-finite JSON number';
-         return $v!=$v? 'NaN' : $v>0? 'Infinity' : '-Infinity';
+         return $v != $v? 'NaN' : $v > 0? 'Infinity' : '-Infinity';
       }
       return JSON::PP->new->allow_nonref->encode($v);
    }
-   $type==TYPE_ARRAY || $type==TYPE_OBJECT or croak 'Unsupported JSON reference '.ref($v);
+   $type == TYPE_ARRAY || $type == TYPE_OBJECT or croak 'Unsupported JSON reference '.ref($v);
    return undef;
 }
 # Compact encoding without layout or comments.
 sub _encode {
-   my ($self,$v,$depth,$active)=@_;
-   my $token=_token($self,$v);
+   my ($self, $v, $depth, $active)= @_;
+   my $token= _token($self, $v);
    return $token if defined $token;
-   my $type=ref($v) eq 'ARRAY'? TYPE_ARRAY : TYPE_OBJECT;
+   my $type= ref($v) eq 'ARRAY'? TYPE_ARRAY : TYPE_OBJECT;
    $self->_depth($depth);
-   my $id=refaddr($v);
+   my $id= refaddr($v);
    $active->{$id} and croak 'Cannot encode cyclic JSON data';
-   local $active->{$id}=1;
-   if ($type==TYPE_ARRAY) {
-      my $tie=tied @$v;
-      my $items=$tie && $tie->isa('JGraft::JSON::Array')? $tie->{items} : $v;
+   local $active->{$id}= 1;
+   if ($type == TYPE_ARRAY) {
+      my $tie= tied @$v;
+      my $items= $tie && $tie->isa('JGraft::JSON::Array')? $tie->{items} : $v;
       my @out;
       for my $i (0..$#$items) {
          exists $items->[$i] or croak 'Cannot encode a sparse JSON array';
-         push @out,$self->_encode($items->[$i],$depth+1,$active);
+         push @out, $self->_encode($items->[$i], $depth+1, $active);
       }
-      return '['.join(',',@out).']';
+      return '['.join(',', @out).']';
    }
-   my $tie=tied %$v;
+   my $tie= tied %$v;
    my @out;
-   if ($tie && $tie->isa('JGraft::JSON::Object')) {
-      for (my $i=$tie->{head};defined $i;$i=$tie->{seq}[$i+1]) {
+   if (my $sort= $self->{_sort}) {
+      $tie= undef unless $tie && $tie->isa('JGraft::JSON::Object');
+      push @out, _token($self, $_->[0], 1).':'.$self->_encode($_->[1], $depth+1, $active)
+         for $self->_members($v, $tie, 1, $sort);
+   }
+   elsif ($tie && $tie->isa('JGraft::JSON::Object')) {
+      for (my $i= $tie->{head}; defined $i; $i= $tie->{seq}[$i+1]) {
          $JGraft::JSON::Object::EXEC->_tick(1) if $JGraft::JSON::Object::EXEC;
-         push @out,_token($self,$tie->{tokens}[$i],1).':'.$self->_encode($tie->{tokens}[$i+1],$depth+1,$active);
+         push @out, _token($self, $tie->{tokens}[$i], 1).':'
+            .$self->_encode($tie->{tokens}[$i+1], $depth+1, $active);
       }
    }
    else {
-      push @out,$self->_quote($_).':'.$self->_encode($v->{$_},$depth+1,$active) for sort keys %$v;
+      push @out, $self->_quote($_).':'.$self->_encode($v->{$_}, $depth+1, $active) for sort keys %$v;
    }
-   return '{'.join(',',@out).'}';
+   return '{'.join(',', @out).'}';
 }
 
 # Layout-aware encoding appends to a state record:
@@ -652,25 +699,29 @@ sub _encode {
 #   ml/sp   enclosing retained container is multi-line / uses spaces
 #   active/flat  cycle detection and memoized inline renderings
 sub _document {
-   my ($self,$v)=@_;
-   my $st={out=>'',col=>0,ind=>'',pure=>1,nl=>0,active=>{},flat=>{},clean=>{},ml=>0,sp=>0,reserve=>0};
-   my $root=_root_document($v);
-   my $doc=$root? document_layout($root) : [];
-   my $ctx={base=>'',use_ws=>$self->{preserve_whitespace},moved=>0};
-   $self->_put_gap($st,$doc->[0],$ctx,'',"\n",'');
-   $self->_put_value($st,$v,1);
-   $self->_put_gap($st,$doc->[1],$ctx,'');
-   $self->_put_gap($st,$doc->[2],$ctx,'',"\n");
-   $st->{out}.="\n" if $st->{nl};
+   my ($self, $v)= @_;
+   my $st= {
+      out => '', col => 0, ind => '', pure => 1, nl => 0,
+      active => {}, flat => {}, wide => {}, clean => {}, ml => 0, sp => 0, reserve => 0,
+      sort => $self->{_sort},
+   };
+   my $root= _root_document($v);
+   my $doc= $root? document_layout($root) : [];
+   my $ctx= {base => '', use_ws => $self->{preserve_whitespace}, moved => 0};
+   $self->_put_gap($st, $doc->[0], $ctx, '', "\n", '');
+   if ($self->{layout}) { $self->_put_root($st, $v) } else { $self->_put_value($st, $v, 1) }
+   $self->_put_gap($st, $doc->[1], $ctx, '');
+   $self->_put_gap($st, $doc->[2], $ctx, '', "\n");
+   $st->{out} .= "\n" if $st->{nl};
    return $st->{out};
 }
 # The document whose surrounding layout belongs to a root value.
 sub _root_document {
-   my $v=shift;
-   my $tie=ref($v) eq 'HASH'? tied(%$v) : ref($v) eq 'ARRAY'? tied(@$v) : undef;
+   my $v= shift;
+   my $tie= ref($v) eq 'HASH'? tied(%$v) : ref($v) eq 'ARRAY'? tied(@$v) : undef;
    if ($tie) {
-      my $doc=_is_layout_tie($tie) && $tie->{doc};
-      return $doc && $doc->{root} && $tie->{open}==$doc->{root}[0]? $doc : undef;
+      my $doc= _is_layout_tie($tie) && $tie->{doc};
+      return $doc && $doc->{root} && $tie->{open} == $doc->{root}[0]? $doc : undef;
    }
    return $v->{doc} if blessed($v) && $v->isa('JGraft::JSON::Number');
    return $v->[4] if blessed($v) && $v->isa('JGraft::JSON::String');
@@ -678,224 +729,241 @@ sub _root_document {
 }
 sub _is_layout_tie { $_[0]->isa('JGraft::JSON::Object') || $_[0]->isa('JGraft::JSON::Array') }
 sub _layout_of {
-   my $v=shift;
-   my $tie=ref($v) eq 'HASH'? tied(%$v) : ref($v) eq 'ARRAY'? tied(@$v) : undef;
+   my $v= shift;
+   my $tie= ref($v) eq 'HASH'? tied(%$v) : ref($v) eq 'ARRAY'? tied(@$v) : undef;
    return unless $tie && _is_layout_tie($tie);
    return ($tie) unless $tie->{doc};
-   return ($tie,(container_layout($tie))[0]);
+   return ($tie, (container_layout($tie))[0]);
 }
 sub _put {
-   my ($self,$st,$text)=@_;
+   my ($self, $st, $text)= @_;
    return unless length $text;
    if ($st->{nl}) {
-      $st->{nl}=0;
       unless ($text =~ /\A[ \t]*[\r\n]/) {
+         # Whitespace alone leaves the newline pending.
          return if $text =~ /\A[ \t]+\z/;
          $text =~ s/\A[ \t]+//;
-         $text="\n".$st->{ind}.$text;
+         $text= "\n".$st->{ind}.$text;
       }
+      $st->{nl}= 0;
    }
-   $st->{out}.=$text;
+   $st->{out} .= $text;
    # The last character, kept separately: on older Perls, offsets from the end of
    # a growing UTF-8 string cost a scan of the whole string.
-   $st->{last}=substr($text,-1);
-   my $nl=rindex($text,"\n");
-   if ($nl>=0) {
-      my $rest=substr($text,$nl+1);
+   $st->{last}= substr($text, -1);
+   my $nl= rindex($text, "\n");
+   if ($nl >= 0) {
+      my $rest= substr($text, $nl+1);
       $rest =~ /\A([ \t]*)/;
-      @{$st}{qw(ind pure col)}=($1,length($1)==length($rest),length $rest);
+      @{$st}{qw(ind pure col)}= ($1, length($1) == length($rest), length $rest);
    }
    else {
       if ($st->{pure}) {
          $text =~ /\A([ \t]*)/;
-         $st->{ind}.=$1;
-         $st->{pure}=length($1)==length($text);
+         $st->{ind} .= $1;
+         $st->{pure}= length($1) == length($text);
       }
-      $st->{col}+=length $text;
+      $st->{col} += length $text;
    }
+}
+sub _ws_text {
+   my ($ws, $ctx, $default)= @_;
+   return $default if !defined($ws) || !$ctx->{use_ws};
+   if (substr($ws, 0, 1) eq "\0") {
+      my $nl= rindex($ws, "\n");
+      return substr($ws, 1, $nl).$ctx->{base}.substr($ws, $nl+1);
+   }
+   return $ctx->{moved} && $ws =~ /\n/? $default : $ws;
 }
 sub _put_ws {
-   my ($self,$st,$ws,$ctx,$default)=@_;
-   if (!defined($ws) || !$ctx->{use_ws}) { $ws=$default }
-   elsif (substr($ws,0,1) eq "\0") {
-      my $nl=rindex($ws,"\n");
-      $ws=substr($ws,1,$nl).$ctx->{base}.substr($ws,$nl+1);
-   }
-   elsif ($ctx->{moved} && $ws =~ /\n/) { $ws=$default }
-   $self->_put($st,$ws);
+   my ($self, $st, $ws, $ctx, $default)= @_;
+   $self->_put($st, _ws_text($ws, $ctx, $default));
 }
 sub _put_comment {
-   my ($self,$st,$c)=@_;
+   my ($self, $st, $c)= @_;
    if ($c =~ /\A\0([ \t]*)\0/) {
-      my $old=$1;
-      $c=substr($c,length($old)+2);
-      my $new=$st->{ind};
+      my $old= $1;
+      $c= substr($c, length($old)+2);
+      my $new= $st->{ind};
       $c =~ s/\n\Q$old\E/\n$new/g if $new ne $old;
    }
-   $self->_put($st,$c);
-   $st->{nl}=1 if substr($c,0,2) eq '//';
+   $self->_put($st, $c);
+   $st->{nl}= 1 if substr($c, 0, 2) eq '//';
 }
 # Default whitespace is $default before the next token and $inner before each
 # comment ($first before the first one). Comments in leading gaps start lines.
 sub _put_gap {
-   my ($self,$st,$gap,$ctx,$default,$inner,$first)=@_;
-   return $self->_put_ws($st,$gap,$ctx,$default) unless ref $gap;
-   my $n=@$gap;
+   my ($self, $st, $gap, $ctx, $default, $inner, $first)= @_;
+   return $self->_put_ws($st, $gap, $ctx, $default) unless ref $gap;
+   my $n= @$gap;
    unless ($self->{comments}) {
-      $self->_put_ws($st,$gap->[-1],$ctx,$default) if $n%2;
+      $self->_put_ws($st, $gap->[-1], $ctx, $default) if $n%2;
       return;
    }
-   $inner=' ' unless defined $inner;
-   $first=$inner unless defined $first;
+   $inner= ' ' unless defined $inner;
+   $first= $inner unless defined $first;
    for my $i (0..$n-1) {
-      if ($i%2) { $self->_put_comment($st,$gap->[$i]) }
-      else { $self->_put_ws($st,$gap->[$i],$ctx,$i==$n-1? $default : $i? $inner : $first) }
+      if ($i%2) { $self->_put_comment($st, $gap->[$i]) }
+      else { $self->_put_ws($st, $gap->[$i], $ctx, $i == $n-1? $default : $i? $inner : $first) }
    }
 }
 sub _put_value {
-   my ($self,$st,$v,$depth)=@_;
-   my $token=$self->_token($v);
-   return $self->_put($st,$token) if defined $token;
+   my ($self, $st, $v, $depth, $cur)= @_;
+   my $token= $self->_token($v);
+   return $self->_put($st, $token) if defined $token;
    $self->_depth($depth);
-   if ($self->{preserve_whitespace}) {
-      my $tie=ref($v) eq 'HASH'? tied(%$v) : tied(@$v);
-      return if $tie && _is_layout_tie($tie) && $tie->{doc} && $tie->{doc}{cw} && $self->_verbatim($st,$v,$tie,$depth);
+   # A different key order invalidates the memoized renderings beneath this node.
+   local @{$st}{qw(sort flat wide)}= ($cur->{sort}, {}, {})
+      if $cur && (refaddr($cur->{sort}) || 0) != (refaddr($st->{sort}) || 0);
+   my $forced= $cur && defined $cur->{layout};
+   if ($self->{preserve_whitespace} && !$st->{sort} && (!$cur || (!$cur->{cb} && !$forced))) {
+      my $tie= ref($v) eq 'HASH'? tied(%$v) : tied(@$v);
+      return if $tie && _is_layout_tie($tie) && $tie->{doc} && $tie->{doc}{cw}
+         && $self->_verbatim($st, $v, $tie, $depth);
    }
-   my ($tie,$outer)=_layout_of($v);
-   my $use_ws=$self->{preserve_whitespace} && $outer && $outer->{ws};
+   my ($tie, $outer)= _layout_of($v);
+   my $use_ws= $self->{preserve_whitespace} && $outer && $outer->{ws} && !$forced;
    # The pretty renderer does its own cycle detection.
-   if (!$use_ws && ($self->{pretty} || ($self->{preserve_whitespace} && $st->{ml}))) {
-      return $self->_put($st,$self->_render($st,$v,$st->{col},$self->{wrap},$st->{reserve},$st->{ind},$depth));
+   if (!$use_ws && ($forced || $self->{pretty} || ($self->{preserve_whitespace} && $st->{ml}))) {
+      return $self->_put($st,
+         $self->_render($st, $v, $st->{col}, $self->{wrap}, $st->{reserve}, $st->{ind}, $depth, $cur));
    }
-   my $id=refaddr($v);
+   my $id= refaddr($v);
    $st->{active}{$id} and croak 'Cannot encode cyclic JSON data';
-   local $st->{active}{$id}=1;
-   return $self->_put_container($st,$v,$tie,$outer,$depth,$use_ws);
+   local $st->{active}{$id}= 1;
+   return $self->_put_container($st, $v, $tie, $outer, $depth, $use_ws, $cur);
 }
 # Members as [key, value, record]; keys are undef for arrays. For a decoded
 # container, records come from matching current members with the original
-# tokens, unless $plain (only keys and values are needed).
+# tokens, unless $plain (only keys and values are needed). Untied hashes are
+# sorted by key; $sort, if given, orders the members of every object.
 sub _members {
-   my ($self,$v,$tie,$plain)=@_;
-   my $object=ref($v) eq 'HASH';
+   my ($self, $v, $tie, $plain, $sort)= @_;
+   my $object= ref($v) eq 'HASH';
    my @out;
    if ($object) {
-      return map [$_,$v->{$_}],sort keys %$v unless $tie;
-      my $tokens=$tie->{tokens};
-      for (my $i=$tie->{head};defined $i;$i=$tie->{seq}[$i+1]) {
+      return map [$_, $v->{$_}], ($sort? $sort->([keys %$v]) : sort keys %$v) unless $tie;
+      my $tokens= $tie->{tokens};
+      for (my $i= $tie->{head}; defined $i; $i= $tie->{seq}[$i+1]) {
          $JGraft::JSON::Object::EXEC->_tick(1) if $JGraft::JSON::Object::EXEC;
-         push @out,[$tokens->[$i],$tokens->[$i+1],$i];
+         push @out, [$tokens->[$i], $tokens->[$i+1], $i];
+      }
+      if ($sort && @out > 1) {
+         # Duplicate keys stay together, in their existing order.
+         my %at;
+         push @{$at{ref($out[$_][0])? "$out[$_][0]" : $out[$_][0]}}, $_ for 0..$#out;
+         @out= map @out[@{$at{$_}}], $sort->([keys %at]);
       }
    }
    else {
-      my $items=$tie? $tie->{items} : $v;
+      my $items= $tie? $tie->{items} : $v;
       for my $i (0..$#$items) {
          exists $items->[$i] or croak 'Cannot encode a sparse JSON array';
-         push @out,[undef,$items->[$i]];
+         push @out, [undef, $items->[$i]];
       }
    }
    return @out if $plain || !$tie || !$tie->{doc};
-   my $doc=$tie->{doc};
-   my (undef,$records,$members,$at)=container_layout($tie);
+   my $doc= $tie->{doc};
+   my (undef, $records, $members, $at)= container_layout($tie);
    my @origins;
    if ($object) {
-      my $orig=$tie->{orig};
+      my $orig= $tie->{orig};
       for my $m (@out) {
-         my $j=$orig->[$m->[2]];
-         push @origins,[$j,defined($j) && $tie->{mod} && !_same_value($doc,$members,$at,$m->[1],$j)];
+         my $j= $orig->[$m->[2]];
+         push @origins, [$j, defined($j) && $tie->{mod} && !_same_value($doc, $members, $at, $m->[1], $j)];
       }
    }
-   elsif (!$tie->{mod}) { @origins=map [$_,0],0..$#out }
-   else { @origins=_align($doc,$members,$at,\@out) }
-   my $recs=arrange($records,\@origins,$object? K_PRE : V_PRE,$object? 6 : 3);
-   $out[$_][2]=$recs->[$_] for 0..$#out;
+   elsif (!$tie->{mod}) { @origins= map [$_, 0], 0..$#out }
+   else { @origins= _align($doc, $members, $at, \@out) }
+   my $recs= arrange($records, \@origins, $object? K_PRE : V_PRE, $object? 6 : 3);
+   $out[$_][2]= $recs->[$_] for 0..$#out;
    return @out;
 }
 # The original member index of a value recognizable by identity: a container
 # by its position, a decoded number or string by its document and offset.
 # Returns an empty list for other values, which can only be compared as text.
 sub _identify {
-   my ($doc,$members,$at,$v)=@_;
-   my $t=$doc->{t};
+   my ($doc, $members, $at, $v)= @_;
+   my $t= $doc->{t};
    if (ref($v) eq 'HASH' || ref($v) eq 'ARRAY') {
-      my $tie=ref($v) eq 'HASH'? tied(%$v) : tied(@$v);
-      return undef unless $tie && _is_layout_tie($tie) && $tie->{doc} && $tie->{doc}==$doc;
-      my $j=$at->{$t->[3*$tie->{open}]};
-      return defined($j) && $members->[$j][2]==$tie->{open}? $j : undef;
+      my $tie= ref($v) eq 'HASH'? tied(%$v) : tied(@$v);
+      return undef unless $tie && _is_layout_tie($tie) && $tie->{doc} && $tie->{doc} == $doc;
+      my $j= $at->{$t->[3*$tie->{open}]};
+      return defined($j) && $members->[$j][2] == $tie->{open}? $j : undef;
    }
    return unless blessed($v);
-   my ($src,$off,$token);
-   if ($v->isa('JGraft::JSON::Number')) { ($src,$off,$token)=@{$v}{qw(src at token)} }
-   elsif ($v->isa('JGraft::JSON::String')) { ($src,$off,$token)=@{$v}[5,6,1] }
+   my ($src, $off, $token);
+   if ($v->isa('JGraft::JSON::Number')) { ($src, $off, $token)= @{$v}{qw(src at token)} }
+   elsif ($v->isa('JGraft::JSON::String')) { ($src, $off, $token)= @{$v}[5, 6, 1] }
    else { return }
-   return undef unless defined($off) && $src==$doc->{id};
-   my $j=$at->{$off};
+   return undef unless defined($off) && $src == $doc->{id};
+   my $j= $at->{$off};
    return undef unless defined $j;
    # The document id is an address; the token check rules out a reused one.
-   return _member_text($doc,$members,$j) eq $token? $j : undef;
+   return _member_text($doc, $members, $j) eq $token? $j : undef;
 }
 sub _member_text {
-   my ($doc,$members,$j)=@_;
-   my ($v,$end)=@{$members->[$j]}[2,3];
-   return '' if $v!=$end;
-   my $t=$doc->{t};
-   my $text=substr($doc->{text},$t->[3*$v],$t->[3*$v+1]-$t->[3*$v]);
+   my ($doc, $members, $j)= @_;
+   my ($v, $end)= @{$members->[$j]}[2, 3];
+   return '' if $v != $end;
+   my $t= $doc->{t};
+   my $text= substr($doc->{text}, $t->[3*$v], $t->[3*$v+1]-$t->[3*$v]);
    utf8::decode($text) if $doc->{wide};
    return $text;
 }
 # The original spelling a plain decoded scalar would have had.
 sub _plain_text {
-   my ($doc,$v)=@_;
+   my ($doc, $v)= @_;
    return 'null' unless defined $v;
-   return $v?'true':'false' if JSON::PP::is_bool($v);
-   return undef if ref($v) || type_mask($v)!=TYPE_STRING;
-   return _quote({ascii=>$doc->{ascii}},$v);
+   return $v? 'true' : 'false' if JSON::PP::is_bool($v);
+   return undef if ref($v) || type_mask($v) != TYPE_STRING;
+   return _quote({ascii => $doc->{ascii}}, $v);
 }
 sub _same_value {
-   my ($doc,$members,$at,$v,$j)=@_;
-   my @id=_identify($doc,$members,$at,$v);
-   return defined($id[0]) && $id[0]==$j if @id;
-   my $text=_plain_text($doc,$v);
-   return defined($text) && $text eq _member_text($doc,$members,$j);
+   my ($doc, $members, $at, $v, $j)= @_;
+   my @id= _identify($doc, $members, $at, $v);
+   return defined($id[0]) && $id[0] == $j if @id;
+   my $text= _plain_text($doc, $v);
+   return defined($text) && $text eq _member_text($doc, $members, $j);
 }
 # Original member indexes for the elements of a modified array. Plain scalars
 # match the next unused original with the same spelling.
 sub _align {
-   my ($doc,$members,$at,$elements)=@_;
-   my (%used,%queue,$queued,@origins);
-   my $next=0;
+   my ($doc, $members, $at, $elements)= @_;
+   my (%used, %queue, $queued, @origins);
+   my $next= 0;
    for my $e (@$elements) {
-      my $v=$e->[1];
-      my @id=_identify($doc,$members,$at,$v);
+      my $v= $e->[1];
+      my @id= _identify($doc, $members, $at, $v);
       my $j;
-      if (@id) { $j=$id[0] }
-      elsif (defined(my $text=_plain_text($doc,$v))) {
-         if ($next<@$members && !$used{$next} && _member_text($doc,$members,$next) eq $text) { $j=$next }
+      if (@id) { $j= $id[0] }
+      elsif (defined(my $text= _plain_text($doc, $v))) {
+         if ($next < @$members && !$used{$next} && _member_text($doc, $members, $next) eq $text) { $j= $next }
          else {
             unless ($queued++) {
                for my $k (0..$#$members) {
-                  my $m=_member_text($doc,$members,$k);
-                  push @{$queue{$m}},$k if length $m;
+                  my $m= _member_text($doc, $members, $k);
+                  push @{$queue{$m}}, $k if length $m;
                }
             }
-            my $q=$queue{$text} || [];
-            shift @$q while @$q && ($q->[0]<$next || $used{$q->[0]});
-            $j=$q->[0];
+            my $q= $queue{$text} || [];
+            shift @$q while @$q && ($q->[0] < $next || $used{$q->[0]});
+            $j= $q->[0];
          }
       }
-      $j=undef if defined($j) && $used{$j};
-      if (defined $j) { $used{$j}=1; $next=$j+1 }
-      push @origins,[$j,0];
+      $j= undef if defined($j) && $used{$j};
+      if (defined $j) { $used{$j}= 1; $next= $j+1 }
+      push @origins, [$j, 0];
    }
    return @origins;
 }
 # The indent step of a retained container's members, if they have one.
 sub _unit {
-   my ($self,$st,$members,$lead)=@_;
+   my ($self, $st, $members, $lead)= @_;
    for my $m (@$members) {
-      my $ws=defined($m->[2])? final_ws($m->[2][$lead]) : undef;
-      next unless defined($ws) && substr($ws,0,1) eq "\0";
-      my $rel=substr($ws,rindex($ws,"\n")+1);
+      my $ws= defined($m->[2])? final_ws($m->[2][$lead]) : undef;
+      next unless defined($ws) && substr($ws, 0, 1) eq "\0";
+      my $rel= substr($ws, rindex($ws, "\n")+1);
       return $rel if length $rel;
    }
    return defined($st->{unit})? $st->{unit} : ' ' x $self->{indent_length};
@@ -903,104 +971,382 @@ sub _unit {
 # Retained layout ($use_ws), or default whitespace: one member per line when
 # pretty, else compact. Comments are placed according to their attachments.
 sub _put_container {
-   my ($self,$st,$v,$tie,$outer,$depth,$use_ws)=@_;
-   my $object=ref($v) eq 'HASH';
-   my $base=$st->{ind};
-   my $ctx={base=>$base,use_ws=>$use_ws,
-      moved=>$use_ws && defined($outer->{base}) && $outer->{base} ne $base};
-   my @members=$self->_members($v,$tie);
-   my $lead_field=$object? K_PRE : V_PRE;
-   my $ml=$use_ws? $outer->{ml} : $self->{pretty};
-   my $sp=!$use_ws && ($self->{pretty} || $st->{sp});
-   my $unit=$self->_unit($st,$use_ws? \@members : [],$lead_field);
-   my $lead=$ml? "\n".$base.$unit : $sp? ' ' : '';
-   my $colon=$ml || $sp? ' ' : '';
+   my ($self, $st, $v, $tie, $outer, $depth, $use_ws, $cur)= @_;
+   my $forced= $cur && $cur->{layout};
+   $forced= $cur->{layout}= 'fill' if $forced && $forced eq 'wrap';
+   $cur= undef if $cur && !$cur->{cb};
+   my $object= ref($v) eq 'HASH';
+   my $base= $st->{ind};
+   my $ctx= {base => $base, use_ws => $use_ws,
+      moved => $use_ws && defined($outer->{base}) && $outer->{base} ne $base};
+   my @members= $self->_members($v, $tie, 0, $st->{sort});
+   my $lead_field= $object? K_PRE : V_PRE;
+   my $ml= $forced? $forced ne 'fit' : $use_ws? $outer->{ml} : $self->{pretty};
+   $cur->{auto}= $ml? 'stack' : 'fit' if $cur;
+   my $sp= !$use_ws && ($self->{pretty} || $st->{sp});
+   my $unit= $self->_unit($st, $use_ws? \@members : [], $lead_field);
+   my $lead= $ml? "\n".$base.$unit : $sp? ' ' : '';
+   my $colon= $ml || $sp? ' ' : '';
    # Whole-line comments without retained whitespace go on member-indent lines.
-   my $line="\n".$base.$unit;
-   $self->_put($st,$object?'{':'[');
-   $self->_put_gap($st,$outer->{open},$ctx,'') if $outer;
+   my $line= "\n".$base.$unit;
+   $self->_put($st, $object? '{' : '[');
+   $self->_put_gap($st, $outer->{open}, $ctx, '') if $outer;
    unless (@members) {
-      $self->_put_gap($st,$outer && $outer->{close},$ctx,'');
-      return $self->_put($st,$object?'}':']');
+      $self->_put_gap($st, $outer && $outer->{close}, $ctx, '');
+      return $self->_put($st, $object? '}' : ']');
    }
-   my $comma=$outer && $outer->{tc} && ($self->{json5} || $self->{comments});
+   my $comma= $outer && $outer->{tc} && ($self->{json5} || $self->{comments});
+   my $end= $ml? "\n".$base : '';
+   my $close= $outer && $outer->{close};
+   # $n counts the members written; a member whose emit is '' is omitted, and
+   # the comma written at $comma_at is withdrawn if no member follows it.
+   my ($n, $comma_at, $held)= (0);
    for my $i (0..$#members) {
-      my ($key,$value,$rec)=@{$members[$i]};
-      $rec=$EMPTY if $use_ws && !defined $rec;
-      $self->_put_gap($st,$rec && $rec->[$lead_field],$ctx,$i || $ml? $lead : '',$line,$line);
-      if ($object) {
-         $self->_put($st,$self->_token($key,1));
-         $self->_put_gap($st,$rec && $rec->[C_PRE],$ctx,'');
-         $self->_put($st,':');
-         $self->_put_gap($st,$rec && $rec->[C_POST],$ctx,'');
-         $self->_put_gap($st,$rec && $rec->[V_PRE],$ctx,$colon,$line);
+      my ($key, $value, $rec)= @{$members[$i]};
+      $rec= $EMPTY if $use_ws && !defined $rec;
+      my $start= $n || $ml? $lead : '';
+      my @head= ($ctx, $rec, $lead_field, $object && $self->_token($key, 1), $start, $line, $colon);
+      my $k;
+      if ($cur) {
+         $k= JGraft::JSON::Cursor->_new($cur, $i, $object? (ref($key)? "$key" : $key) : undef, $value);
+         @{$k}{qw(indent cindent last rec)}= ($base.$unit, $base, $i == $#members, $rec);
+         # Lazy attributes come from writing the member's head into a scratch state.
+         my $try= sub {
+            my %s= (%$st, out => '');
+            $self->_put_head(\%s, @head, $_[0]->prefix, $_[0]{before});
+            @s{qw(unit ml sp reserve)}= ($unit, $ml, ($s{last} || '') eq ' '? 1 : 0, 1);
+            return \%s;
+         };
+         # The first member written takes the place of omitted ones before it.
+         $k->{_pre}= sub { defined($held)? $held : $self->_gap_start($rec && $rec->[$lead_field], $ctx, $start, $line) };
+         $k->{_suf}= sub {
+            $i < $#members || (!$n && ($_[0]{emit} || 'x') eq '')? ''
+               : $self->_gap_start($close, $ctx, $end, $line)
+         };
+         $k->{_lay}= sub {
+            my $s= $try->($_[0]);
+            $self->_auto_layout($s, $value, $s->{col}, $self->{wrap}, 1, $depth+1, $_[0]);
+         };
+         $k->{_emit}= sub {
+            my $s= $try->($_[0]);
+            my $at= length $s->{out};
+            $self->_put_value($s, $value, $depth+1, $_[0]);
+            return substr($s->{out}, $at);
+         };
+         $self->_visit($k);
+         if (defined($k->{emit}) && !length $k->{emit}) {
+            $held= $k->{prefix} unless $n || defined $held;
+            if ($i == $#members) {
+               if (defined($comma_at) && !$comma) {
+                  substr($st->{out}, $comma_at, 1, '');
+                  --$st->{col} if index($st->{out}, "\n", $comma_at) < 0;
+                  $st->{last}= substr($st->{out}, -1);
+               }
+               $self->_put_lead($st, $close, $ctx, $end, $line, $k->suffix);
+               $close= undef;
+               $end= '';
+            }
+            _finish($k);
+            next;
+         }
+         $self->_put_head($st, @head, $k->prefix, $k->{before});
       }
+      else { $self->_put_head($st, @head) }
+      ++$n;
+      $held= undef;
       {
-         local @{$st}{qw(unit ml sp reserve)}=($unit,$ml,($st->{last}||'') eq ' '? 1 : 0,1);
-         $self->_put_value($st,$value,$depth+1);
+         local @{$st}{qw(unit ml sp reserve)}= ($unit, $ml, ($st->{last} || '') eq ' '? 1 : 0, 1);
+         if ($k && defined $k->{emit}) { $self->_put($st, $k->{emit}) }
+         else { $self->_put_value($st, $value, $depth+1, $k) }
       }
-      $self->_put_gap($st,$rec && $rec->[M_PRE],$ctx,'');
-      $self->_put($st,',') if $i<$#members || $comma;
-      $self->_put_gap($st,$rec && $rec->[POST],$ctx,'');
+      my ($mid, $post)= $rec? @{$rec}[M_PRE, POST] : ();
+      # Assigned comments replace those attached to the value.
+      ($mid, $post)= (ref($mid)? $mid->[0] : $mid, @{$k->{after}}? [map +(undef, $_), @{$k->{after}}] : undef)
+         if $k && $k->{after};
+      $self->_put_gap($st, $mid, $ctx, '');
+      $comma_at= $i < $#members? length $st->{out} : undef;
+      $self->_put($st, ',') if $i < $#members || $comma;
+      $self->_put_gap($st, $post, $ctx, '');
+      next unless $k;
+      my $suffix= $k->suffix;
+      if ($i < $#members) { $self->_put($st, $suffix) }
+      else {
+         $self->_put_lead($st, $close, $ctx, $end, $line, $suffix);
+         $close= undef;
+         $end= '';
+      }
+      _finish($k);
    }
-   $self->_put_gap($st,$outer && $outer->{close},$ctx,$ml? "\n".$base : '',$line);
-   $self->_put($st,$object?'}':']');
+   $self->_put_gap($st, $close, $ctx, $end, $line);
+   $self->_put($st, $object? '}' : ']');
+}
+# A member's leading gap, key, and colon. With a layout callback, $prefix
+# replaces the gap's first whitespace and $before (if defined) its comments.
+sub _put_head {
+   my ($self, $st, $ctx, $rec, $lead_field, $key, $start, $line, $colon, $prefix, $before)= @_;
+   if (defined $prefix) { $self->_put_lead($st, $rec && $rec->[$lead_field], $ctx, $start, $line, $prefix, $before) }
+   else { $self->_put_gap($st, $rec && $rec->[$lead_field], $ctx, $start, $line, $line) }
+   if (defined($key) && length $key) {
+      $self->_put($st, $key);
+      $self->_put_gap($st, $rec && $rec->[C_PRE], $ctx, '');
+      $self->_put($st, ':');
+      $self->_put_gap($st, $rec && $rec->[C_POST], $ctx, '');
+      $self->_put_gap($st, $rec && $rec->[V_PRE], $ctx, $colon, $line);
+   }
+}
+# The whitespace beginning a leading gap, as _put_gap would write it.
+sub _gap_start {
+   my ($self, $gap, $ctx, $default, $inner)= @_;
+   return _ws_text($gap, $ctx, $default) unless ref $gap;
+   my $n= @$gap;
+   return $n%2? _ws_text($gap->[-1], $ctx, $default) : '' unless $self->{comments};
+   return _ws_text($gap->[0], $ctx, $n == 1? $default : $inner);
+}
+# A leading gap whose first whitespace is given, optionally replacing its comments.
+sub _put_lead {
+   my ($self, $st, $gap, $ctx, $default, $inner, $prefix, $before)= @_;
+   $self->_put($st, $prefix);
+   return unless $self->{comments};
+   my @items= $before? map +($_, undef), @$before : ref($gap)? @{$gap}[1..$#$gap] : ();
+   for (my $i= 0; $i < @items; $i += 2) {
+      $self->_put_comment($st, $items[$i]);
+      $self->_put_ws($st, $items[$i+1], $ctx, $i+2 >= @items? $default : $inner);
+   }
+}
+
+# ---- Layout callback ----
+
+sub _put_root {
+   my ($self, $st, $v)= @_;
+   my $k= JGraft::JSON::Cursor->_new(undef, undef, undef, $v);
+   @{$k}{qw(indent cindent last sortkeys sort cb)}= ('', '', 1, $self->{sortkeys}, $self->{_sort}, $self->{layout});
+   my $try= sub {
+      my %s= (%$st, out => '');
+      $self->_put(\%s, $_[0]->prefix);
+      return \%s;
+   };
+   $k->{_pre}= $k->{_suf}= sub { '' };
+   $k->{_lay}= sub {
+      my $s= $try->($_[0]);
+      $self->_auto_layout($s, $v, $s->{col}, $self->{wrap}, $s->{reserve}, 1, $_[0]);
+   };
+   $k->{_emit}= sub {
+      my $s= $try->($_[0]);
+      my $at= length $s->{out};
+      $self->_put_value($s, $v, 1, $_[0]);
+      return substr($s->{out}, $at);
+   };
+   $self->_visit($k);
+   $self->_put($st, $k->prefix);
+   if (defined $k->{emit}) { $self->_put($st, $k->{emit}) } else { $self->_put_value($st, $v, 1, $k) }
+   $self->_put($st, $k->suffix);
+   _finish($k);
+}
+# Call the layout callback for a node, after which all but its suffix is final.
+# The builders are for the node's position before it is written; a later read
+# (by a descendant's callback) gets what was decided.
+sub _visit {
+   my ($self, $k)= @_;
+   # The node's own callback is the one it inherited; one it assigns is for
+   # its descendants.
+   my $cb= $k->{cb};
+   if ($cb && ($k->{leaves} || ref($k->{value}) eq 'ARRAY' || ref($k->{value}) eq 'HASH')) {
+      $cb->($k) for $k->{value};
+   }
+   $k->prefix;
+   delete @{$k}{qw(_pre _lay _emit)};
+   $k->{lock} |= 1;
+}
+sub _finish {
+   my $k= shift;
+   $k->{lock}= 3;
+   delete @{$k}{qw(_pre _suf _lay _emit)};
+}
+# The layout the encoder would choose for a container starting at $col.
+sub _auto_layout {
+   my ($self, $st, $v, $col, $width, $reserve, $depth, $k)= @_;
+   return undef unless ref($v) eq 'ARRAY' || ref($v) eq 'HASH';
+   if (($k->{layout} || '') eq 'wrap') {
+      return 'fill' if $self->_special($v, $k);
+      my $wide= $self->_inline($st, $v, $depth, 1);
+      return defined($wide) && (!$width || $col+length($wide) <= $width-$reserve)? 'fit' : 'fill';
+   }
+   my ($tie, $outer)= _layout_of($v);
+   return $outer->{ml}? 'stack' : 'fit' if $self->{preserve_whitespace} && $outer && $outer->{ws};
+   return 'fit' unless $self->{pretty} || ($self->{preserve_whitespace} && $st->{ml});
+   return 'stack' if $self->_special($v);
+   my $flat= $self->_inline($st, $v, $depth);
+   return 'fit' if defined($flat) && (!$width || $col+length($flat) <= $width-$reserve);
+   my (undef, undef, $groups)= $self->_shape($v, $st->{sort});
+   return $self->_stacked($st, $groups, $depth)? 'stack' : 'fill';
+}
+# The width a node needs to continue the current line, if it can.
+sub _node_width {
+   my ($self, $st, $k, $depth)= @_;
+   return length(($k->{emit} =~ /\A([^\n]*)/)[0]) if defined $k->{emit};
+   my $layout= $k->{layout} || '';
+   return undef if $layout eq 'fill' || $layout eq 'stack';
+   my $flat= $self->_inline($st, $k->{value}, $depth, $layout ne '');
+   return defined($flat)? length $flat : undef;
+}
+# The pretty renderer's members when a layout callback is active. $mode is the
+# container's layout; each member's default prefix follows from it.
+sub _render_members {
+   my ($self, $st, $cur, $mode, $open, $close, $groups, $column, $width, $base, $indent, $depth)= @_;
+   my ($out, $current, $line, $nl, $fresh, $n, $comma_at)= ($open, $column+length($open), $base, 0, 0, 0);
+   my $last= $#$groups;
+   my $comments= $self->{comments};
+   for my $i (0..$last) {
+      my $values= $groups->[$i]{values};
+      my $value= $values->[-1];
+      my ($key, $name);
+      if (@$values > 1) {
+         $name= ${$values->[0]};
+         $name= "$name" if ref $name;
+         $key= $self->_inline($st, $values->[0], $depth).':';
+      }
+      my $k= JGraft::JSON::Cursor->_new($cur, $i, $name, $value);
+      @{$k}{qw(indent cindent last)}= ($indent, $base, $i == $last);
+      my $scalar= ref($value) ne 'ARRAY' && ref($value) ne 'HASH';
+      # Text preceding the value, the column it ends at, and the line's indent
+      my $head= sub {
+         my $c= shift;
+         my $text= $c->prefix;
+         $text= "\n".$indent.$text if $nl && !$fresh && $text !~ /\n/;
+         my $broke= $text =~ /\n/;
+         if ($comments && $c->{before}) {
+            for (@{$c->{before}}) {
+               $broke ||= substr($_, 0, 2) eq '//';
+               $text .= $_.($broke? "\n".$indent : ' ');
+            }
+         }
+         my $col= $text =~ /\n([^\n]*)\z/? length($1) : $current+length($text);
+         if (defined $key) {
+            $text .= $key;
+            $col += length $key;
+            # A scalar too long for the key's line moves to its own line.
+            my $w= $scalar? $self->_node_width($st, $c, $depth+1) : 1;
+            if ($mode ne 'fit' && $width && $col+1+$w > $width-1) {
+               $text .= "\n".$indent.$st->{unit};
+               $col= length($indent.$st->{unit});
+            }
+            else { $text .= ' '; ++$col }
+         }
+         return ($text, $col, $broke? $indent : $line);
+      };
+      my $lead= defined($key)? length($key)+1 : 0;
+      $k->{_pre}= sub {
+         return '' if $fresh;
+         return "\n".$indent if $nl || $mode eq 'stack';
+         my $gap= $n? ' ' : '';
+         return $gap if $mode eq 'fit';
+         my $w= $self->_node_width($st, $_[0], $depth+1);
+         return defined($w) && (!$width || $current+length($gap)+$lead+$w <= $width-1)? $gap : "\n".$indent;
+      };
+      $k->{_suf}= sub {
+         $i < $last || (!$n && ($_[0]{emit} || 'x') eq '') || ($mode eq 'fit' && !$nl)? '' : "\n".$base
+      };
+      $k->{_lay}= sub {
+         my (undef, $col)= $head->($_[0]);
+         $self->_auto_layout($st, $value, $col, $width, 1, $depth+1, $_[0]);
+      };
+      $k->{_emit}= sub {
+         my (undef, $col, $at)= $head->($_[0]);
+         $self->_render($st, $value, $col, $width, 1, $at, $depth+1, $_[0]);
+      };
+      $self->_visit($k);
+      # A member whose emit is '' is omitted, apart from the closing whitespace.
+      if (defined($k->{emit}) && !length $k->{emit}) {
+         if ($i == $last) {
+            substr($out, $comma_at, 1, '') if defined $comma_at;
+            my $suffix= $k->suffix;
+            $suffix= "\n".$base.$suffix if $nl && $suffix !~ /\n/;
+            $out =~ s/\n[ \t]*\z// if $fresh && $suffix =~ /\A\n/;
+            $out .= $suffix;
+         }
+         _finish($k);
+         next;
+      }
+      ++$n;
+      my ($text, $col);
+      ($text, $col, $line)= $head->($k);
+      my $body= defined($k->{emit})? $k->{emit} : $self->_render($st, $value, $col, $width, 1, $line, $depth+1, $k);
+      ($nl, $fresh)= (0, 0);
+      $text .= $body;
+      $comma_at= $i < $last? length($out)+length($text) : undef;
+      $text .= ',' if $i < $last;
+      if ($comments && $k->{after}) {
+         for (@{$k->{after}}) {
+            $text .= ' '.$_;
+            $nl= 1 if substr($_, 0, 2) eq '//';
+         }
+      }
+      my $suffix= $k->suffix;
+      $suffix= "\n".$base.$suffix if $nl && $i == $last && $suffix !~ /\n/;
+      $text .= $suffix;
+      if ($suffix =~ /\n[ \t]*\z/) { ($fresh, $line)= (1, $indent) }
+      $out .= $text;
+      $current= $text =~ /\n([^\n]*)\z/? length($1) : $current+length($text);
+      _finish($k);
+   }
+   return $out.$close;
 }
 # An unmodified container is copied from its original text when the output
 # dialect matches the document's and its line indent is unchanged (or it has
 # no line breaks).
 sub _verbatim {
-   my ($self,$st,$v,$tie,$depth)=@_;
-   my $doc=$tie->{doc};
-   return 0 if $tie->{mod} || ($doc->{j5} && !$self->{json5}) || ($self->{ascii}?1:0)!=$doc->{ascii}
+   my ($self, $st, $v, $tie, $depth)= @_;
+   my $doc= $tie->{doc};
+   return 0 if $tie->{mod} || ($doc->{j5} && !$self->{json5}) || ($self->{ascii}? 1 : 0) != $doc->{ascii}
       || ($doc->{cm} && !($doc->{cc} && $self->{comments}));
-   my ($t,$open)=($doc->{t},$tie->{open});
-   my $start=$t->[3*$open];
-   my $text=substr($doc->{text},$start,$t->[3*$t->[3*$open+2]+1]-$start);
-   return 0 if $text =~ /\n/ && JGraft::JSON::_Layout::_line_indent(\$doc->{text},$start) ne $st->{ind};
-   return 0 unless $self->_clean($st,$v,$doc,$depth);
+   my ($t, $open)= ($doc->{t}, $tie->{open});
+   my $start= $t->[3*$open];
+   my $text= substr($doc->{text}, $start, $t->[3*$t->[3*$open+2]+1]-$start);
+   return 0 if $text =~ /\n/ && JGraft::JSON::_Layout::_line_indent(\$doc->{text}, $start) ne $st->{ind};
+   return 0 unless $self->_clean($st, $v, $doc, $depth);
    utf8::decode($text) if $doc->{wide};
-   $self->_put($st,$text);
+   $self->_put($st, $text);
    return 1;
 }
 sub _clean {
-   my ($self,$st,$v,$doc,$depth)=@_;
-   my $id=refaddr($v);
+   my ($self, $st, $v, $doc, $depth)= @_;
+   my $id= refaddr($v);
    return $st->{clean}{$id} if exists $st->{clean}{$id};
-   my $tie=ref($v) eq 'HASH'? tied(%$v) : tied(@$v);
-   my $ok=$tie && _is_layout_tie($tie) && $tie->{doc} && $tie->{doc}==$doc && !$tie->{mod};
+   my $tie= ref($v) eq 'HASH'? tied(%$v) : tied(@$v);
+   my $ok= $tie && _is_layout_tie($tie) && $tie->{doc} && $tie->{doc} == $doc && !$tie->{mod};
    if ($ok) {
       $self->_depth($depth);
       my @values;
       if (ref($v) eq 'HASH') {
-         for (my $i=$tie->{head};defined $i;$i=$tie->{seq}[$i+1]) { push @values,$tie->{tokens}[$i+1] }
+         for (my $i= $tie->{head}; defined $i; $i= $tie->{seq}[$i+1]) { push @values, $tie->{tokens}[$i+1] }
       }
-      else { @values=@{$tie->{items}} }
+      else { @values= @{$tie->{items}} }
       for (@values) {
          next unless ref($_) eq 'HASH' || ref($_) eq 'ARRAY';
-         next if $self->_clean($st,$_,$doc,$depth+1);
-         $ok=0;
+         next if $self->_clean($st, $_, $doc, $depth+1);
+         $ok= 0;
          last;
       }
    }
-   return $st->{clean}{$id}=$ok? 1 : 0;
+   return $st->{clean}{$id}= $ok? 1 : 0;
 }
 # Render a container needing _put_container into a string, starting at $col
 # on a line indented by $base.
 sub _sub_render {
-   my ($self,$st,$v,$col,$base,$depth)=@_;
-   my ($tie,$outer)=_layout_of($v);
-   my %sub=(%$st,out=>'',last=>'',col=>$col,ind=>$base,pure=>!$col,nl=>0);
-   $self->_put_container(\%sub,$v,$tie,$outer,$depth,$self->{preserve_whitespace} && $outer && $outer->{ws});
+   my ($self, $st, $v, $col, $base, $depth, $cur)= @_;
+   my ($tie, $outer)= _layout_of($v);
+   my %sub= (%$st, out => '', last => '', col => $col, ind => $base, pure => !$col, nl => 0);
+   $self->_put_container(\%sub, $v, $tie, $outer, $depth,
+      $self->{preserve_whitespace} && $outer && $outer->{ws} && !($cur && defined $cur->{layout}), $cur);
    return $sub{out};
 }
 # Containers that cannot use the generic layout rules.
 sub _special {
-   my ($self,$v)=@_;
-   my ($tie,$outer)=_layout_of($v);
+   my ($self, $v, $cur)= @_;
+   my ($tie, $outer)= _layout_of($v);
    return 0 unless $tie;
-   return 1 if $self->{preserve_whitespace} && $outer && $outer->{ws};
-   return $self->{comments} && $outer && has_comments([map $_->[2],$self->_members($v,$tie)],$outer)? 1 : 0;
+   return 1 if $self->{preserve_whitespace} && $outer && $outer->{ws} && !($cur && defined $cur->{layout});
+   return $self->{comments} && $outer && has_comments([map $_->[2], $self->_members($v, $tie)], $outer)? 1 : 0;
 }
 
 # Generic layout rules shared with jg-format: a container stays on one line if
@@ -1008,120 +1354,140 @@ sub _special {
 # multi-member container (or cannot be inlined), in which case each member
 # gets its own line.
 sub _shape {
-   my ($self,$v)=@_;
-   my ($tie)=_layout_of($v);
-   my @members=$self->_members($v,$tie,1);
-   return ('[',']',[map +{values=>[$_->[1]]},@members]) if ref($v) eq 'ARRAY';
-   return ('{','}',[map +{values=>[bless(\(my $k=$_->[0]),'JGraft::JSON::_Key'),$_->[1]],separator=>': '},@members]);
+   my ($self, $v, $sort)= @_;
+   my ($tie)= _layout_of($v);
+   my @members= $self->_members($v, $tie, 1, $sort);
+   return ('[', ']', [map +{values => [$_->[1]]}, @members]) if ref($v) eq 'ARRAY';
+   return ('{', '}', [
+      map +{values => [bless(\(my $k= $_->[0]), 'JGraft::JSON::_Key'), $_->[1]], separator => ': '},
+         @members
+   ]);
 }
 sub _size {
-   my $v=shift;
-   my ($tie)=_layout_of($v);
-   return ref($v) eq 'ARRAY'? scalar @{$tie? $tie->{items} : $v} : $tie? scalar keys %{$tie->{index}} : scalar keys %$v;
+   my $v= shift;
+   my ($tie)= _layout_of($v);
+   return ref($v) eq 'ARRAY'? scalar @{$tie? $tie->{items} : $v}
+      : $tie? scalar keys %{$tie->{index}}
+      : scalar keys %$v;
 }
+# $loose (the 'wrap' layout) omits the rule that members which are themselves
+# multi-member containers each get a line.
 sub _inline {
-   my ($self,$st,$v,$depth)=@_;
-   return $self->_token(${$v},1) if ref($v) eq 'JGraft::JSON::_Key';
-   my $token=$self->_token($v);
+   my ($self, $st, $v, $depth, $loose)= @_;
+   return $self->_token(${$v}, 1) if ref($v) eq 'JGraft::JSON::_Key';
+   my $token= $self->_token($v);
    return $token if defined $token;
-   my $id=refaddr($v);
-   return $st->{flat}{$id} if exists $st->{flat}{$id};
+   my $id= refaddr($v);
+   my $flat= $loose? ($st->{wide} ||= {}) : $st->{flat};
+   return $flat->{$id} if exists $flat->{$id};
    $self->_depth($depth);
    $st->{active}{$id} and croak 'Cannot encode cyclic JSON data';
-   local $st->{active}{$id}=1;
+   local $st->{active}{$id}= 1;
    if ($self->_special($v)) {
-      my ($tie,$outer)=_layout_of($v);
-      return $st->{flat}{$id}=undef if !$outer->{ws} || $outer->{ml};
-      my $text=$self->_sub_render($st,$v,0,'',$depth);
-      return $st->{flat}{$id}=$text =~ /\n/? undef : $text;
+      my ($tie, $outer)= _layout_of($v);
+      return $flat->{$id}= undef if !$outer->{ws} || $outer->{ml};
+      my $text= $self->_sub_render($st, $v, 0, '', $depth);
+      return $flat->{$id}= $text =~ /\n/? undef : $text;
    }
-   my ($open,$close,$groups)=$self->_shape($v);
-   return $st->{flat}{$id}=undef if $self->_stacked($st,$groups,$depth);
+   my ($open, $close, $groups)= $self->_shape($v, $st->{sort});
+   return $flat->{$id}= undef if !$loose && $self->_stacked($st, $groups, $depth);
    my @parts;
    for my $group (@$groups) {
       my @items;
       for my $item (@{$group->{values}}) {
-         my $text=$self->_inline($st,$item,$depth+1);
-         return $st->{flat}{$id}=undef unless defined $text;
-         push @items,$text;
+         my $text= $self->_inline($st, $item, $depth+1, $loose);
+         return $flat->{$id}= undef unless defined $text;
+         push @items, $text;
       }
-      push @parts,join($group->{separator} || ', ',@items);
+      push @parts, join($group->{separator} || ', ', @items);
    }
-   return $st->{flat}{$id}=$open.join(', ',@parts).$close;
+   return $flat->{$id}= $open.join(', ', @parts).$close;
 }
 sub _stacked {
-   my ($self,$st,$groups,$depth)=@_;
+   my ($self, $st, $groups, $depth)= @_;
    for my $group (@$groups) {
       for my $item (@{$group->{values}}) {
          next if ref($item) eq 'JGraft::JSON::_Key';
-         return 1 if (ref($item) eq 'ARRAY' || ref($item) eq 'HASH') && _size($item)>1;
-         return 1 unless defined $self->_inline($st,$item,$depth+1);
+         return 1 if (ref($item) eq 'ARRAY' || ref($item) eq 'HASH') && _size($item) > 1;
+         return 1 unless defined $self->_inline($st, $item, $depth+1);
       }
    }
    return 0;
 }
 sub _group {
-   my ($self,$st,$group,$indent,$width,$depth)=@_;
-   my ($out,$current)=('',length $indent);
-   my $separator=$group->{separator} || ', ';
+   my ($self, $st, $group, $indent, $width, $depth)= @_;
+   my ($out, $current)= ('', length $indent);
+   my $separator= $group->{separator} || ', ';
    for my $value (@{$group->{values}}) {
-      my $flat=$self->_inline($st,$value,$depth);
+      my $flat= $self->_inline($st, $value, $depth);
       if (length $out) {
-         my $fits=defined($flat) && (!$width || $current+length($separator)+length($flat)<=$width-1);
+         my $fits= defined($flat) && (!$width || $current+length($separator)+length($flat) <= $width-1);
          if (!$fits && (ref($value) eq 'ARRAY' || ref($value) eq 'HASH')) {
-            $fits=!$width || $current+length($separator)+1<=$width-1;
+            $fits= !$width || $current+length($separator)+1 <= $width-1;
          }
-         if ($fits) { $out.=$separator; $current+=length $separator }
+         if ($fits) { $out .= $separator; $current += length $separator }
          else {
-            (my $punctuation=$separator) =~ s/ +\z//;
-            $out.=$punctuation."\n".$indent.$st->{unit};
-            $current=length($indent.$st->{unit});
+            (my $punctuation= $separator) =~ s/ +\z//;
+            $out .= $punctuation."\n".$indent.$st->{unit};
+            $current= length($indent.$st->{unit});
          }
       }
-      my $text=$self->_render($st,$value,$current,$width,1,$indent,$depth);
-      $out.=$text;
-      $current=$text =~ /\n([^\n]*)\z/? length($1) : $current+length($text);
+      my $text= $self->_render($st, $value, $current, $width, 1, $indent, $depth);
+      $out .= $text;
+      $current= $text =~ /\n([^\n]*)\z/? length($1) : $current+length($text);
    }
    return $out;
 }
 sub _render {
-   my ($self,$st,$v,$column,$width,$reserve,$base,$depth)=@_;
-   local $st->{unit}=defined($st->{unit})? $st->{unit} : ' ' x $self->{indent_length};
-   my $flat=$self->_inline($st,$v,$depth);
-   my $container=ref($v) eq 'ARRAY' || ref($v) eq 'HASH';
-   return $flat if !$container || (defined($flat) && (!$width || $column+length($flat)<=$width-$reserve));
-   return $self->_sub_render($st,$v,$column,$base,$depth) if $self->_special($v);
-   my $id=refaddr($v);
+   my ($self, $st, $v, $column, $width, $reserve, $base, $depth, $cur)= @_;
+   local $st->{unit}= defined($st->{unit})? $st->{unit} : ' ' x $self->{indent_length};
+   local @{$st}{qw(sort flat wide)}= ($cur->{sort}, {}, {})
+      if $cur && (refaddr($cur->{sort}) || 0) != (refaddr($st->{sort}) || 0);
+   my $flat= $self->_inline($st, $v, $depth);
+   my $container= ref($v) eq 'ARRAY' || ref($v) eq 'HASH';
+   # A cursor without a callback still matters to its own node if it was assigned a layout.
+   $cur= undef if $cur && !$cur->{cb} && !defined $cur->{layout};
+   my $fit= defined($flat) && (!$width || $column+length($flat) <= $width-$reserve);
+   return $flat if !$container || ($fit && !$cur);
+   if ($cur && ($cur->{layout} || '') eq 'wrap') {
+      my $wide= $self->_inline($st, $v, $depth, 1);
+      $cur->{layout}= defined($wide) && (!$width || $column+length($wide) <= $width-$reserve)? 'fit' : 'fill';
+   }
+   return $self->_sub_render($st, $v, $column, $base, $depth, $cur) if $self->_special($v, $cur);
+   my $id= refaddr($v);
    $self->_depth($depth);
-   local $st->{active}{$id}=1;
-   my ($open,$close,$groups)=$self->_shape($v);
+   local $st->{active}{$id}= 1;
+   my ($open, $close, $groups)= $self->_shape($v, $st->{sort});
    return $open.$close unless @$groups;
-   my $indent=$base.$st->{unit};
-   $width*=2 while $width && $width-length($indent)<40;
-   my $stacked=$self->_stacked($st,$groups,$depth);
-   my $out=$open;
-   my $written=0;
-   my $current=$column+length($open);
+   my $indent= $base.$st->{unit};
+   $width *= 2 while $width && $width-length($indent) < 40;
+   my $mode= $cur && (defined($cur->{layout})? $cur->{layout} : $fit? 'fit' : undef);
+   my $stacked= $mode? $mode eq 'stack' : $self->_stacked($st, $groups, $depth);
+   return $self->_render_members($st, $cur, $cur->{auto}= $mode || ($stacked? 'stack' : 'fill'), $open, $close,
+      $groups, $column, $width, $base, $indent, $depth) if $cur;
+   my $out= $open;
+   my $written= 0;
+   my $current= $column+length($open);
    for my $group (@$groups) {
-      my (@items,$force);
-      $force=$stacked;
+      my (@items, $force);
+      $force= $stacked;
       for my $item (@{$group->{values}}) {
-         my $text=$self->_inline($st,$item,$depth+1);
-         if (defined $text) { push @items,$text } else { $force=1 }
+         my $text= $self->_inline($st, $item, $depth+1);
+         if (defined $text) { push @items, $text } else { $force= 1 }
       }
-      my $text=@items==@{$group->{values}}? join($group->{separator} || ', ',@items) : undef;
-      if (!$force && defined($text) && (!$width || $current+($written?2:0)+length($text)<=$width-1)) {
-         $out.=', ' if $written;
-         $out.=$text;
-         $current+=($written?2:0)+length($text);
+      my $text= @items == @{$group->{values}}? join($group->{separator} || ', ', @items) : undef;
+      if (!$force && defined($text) && (!$width || $current+($written? 2 : 0)+length($text) <= $width-1)) {
+         $out .= ', ' if $written;
+         $out .= $text;
+         $current += ($written? 2 : 0)+length($text);
       }
       else {
-         $out.=',' if $written;
-         $text=$self->_group($st,$group,$indent,$width,$depth+1);
-         $out.="\n".$indent.$text;
-         $current=$text =~ /\n([^\n]*)\z/? length($1) : length($indent)+length($text);
+         $out .= ',' if $written;
+         $text= $self->_group($st, $group, $indent, $width, $depth+1);
+         $out .= "\n".$indent.$text;
+         $current= $text =~ /\n([^\n]*)\z/? length($1) : length($indent)+length($text);
       }
-      $written=1;
+      $written= 1;
    }
    return $out."\n".$base.$close;
 }
@@ -1228,6 +1594,51 @@ its own line if any member is a container with more than one member, and short
 members are packed onto lines of at most C<wrap> columns otherwise. Indents use
 C<indent_length> spaces. Untied hashes use sorted keys.
 
+=head2 Key order
+
+By default the members of an untied hash are written in the order of C<sort>,
+and those of a decoded object in their source order. The C<sortkeys> option
+orders the members of every object, decoded or not:
+
+  JGraft::JSON->new(sortkeys => sub { lc($a) cmp lc($b) });
+  JGraft::JSON->new(sortkeys => ['id', 'name']);
+
+A code reference is used as the comparator of C<sort>, receiving two keys as
+Perl strings in the C<$a> and C<$b> of the package it was compiled in. An array
+reference lists keys to be written first, in that order, followed by all other
+keys in the default order. Duplicate keys of a decoded object stay together in
+their existing order. Whitespace and comments retained with a member move with
+it, but a document being sorted is never copied verbatim, and separators at the
+places where members changed neighbors may be normalized.
+
+A L</Layout callback> can change the order for a subtree with the cursor's
+C<sortkeys> attribute.
+
+=head2 Layout callback
+
+  my $json= JGraft::JSON->new(pretty => 1, layout => sub {
+     my $cursor= shift;                # $_ is the node about to be written
+     $cursor->layout('stack') if ref eq 'HASH';
+  });
+
+C<layout> is called for every node, in document order, immediately before the
+node is written, with C<$_> aliased to the node and a L<JGraft::JSON::Cursor>
+as its argument. The cursor gives the node's position (C<name>, C<idx>,
+C<parent>) and its layout attributes, which the callback may read or assign:
+the C<layout> of a container (C<'fit'>, C<'fill'>, C<'stack'>, or C<'wrap'>),
+the whitespace C<prefix> and C<suffix> around the node, the C<emit> text of
+the node itself (empty to omit the node), and its C<comments>. Unassigned attributes are decided by the
+encoder exactly as without a callback, and can be read to learn that decision.
+A callback can keep a C<state> that descendants inherit, and assign the cursor's
+C<callback> to hand a subtree to a different callback, or to none
+(C<< $cursor->callback(undef) >>), in which case the subtree is encoded as fast
+as without a callback.
+
+The callback applies with or without C<pretty> and to documents with retained
+whitespace, whose retained text is what the attributes read as. A container
+whose members are visited by the callback is never copied verbatim from the
+original text, so remove the callback from what does not need inspection.
+
 =constructor new
 
 Options are:
@@ -1249,6 +1660,10 @@ Options are:
 =item C<indent_length> - pretty indent step in spaces (default 2)
 
 =item C<wrap> - pretty line width, zero for unlimited (default 79)
+
+=item C<layout> - callback deciding layout per node; see L</Layout callback>
+
+=item C<sortkeys> - comparator or list of leading keys; see L</Key order>
 
 =item C<max_depth> - nesting limit (default 256)
 
@@ -1298,6 +1713,16 @@ codec for chaining. These methods do not change already decoded values.
 =method wrap
 
 Set the corresponding nonnegative integer, returning the codec for chaining.
+
+=method layout
+
+Set or (with C<undef>) remove the L</Layout callback>, returning the codec for
+chaining.
+
+=method sortkeys
+
+Set or (with C<undef>) remove the L</Key order>, returning the codec for
+chaining.
 
 =cut
 

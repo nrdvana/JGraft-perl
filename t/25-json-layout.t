@@ -365,4 +365,260 @@ subtest 'pretty layout matches jg-format rules' => sub {
    is(JGraft::JSON->new(pretty=>1,wrap=>0)->encode([1..40]),'['.join(', ',1..40).']','unlimited width');
 };
 
+subtest 'layout callback' => sub {
+   my $enc=sub { my ($data,$cb,%options)=@_; JGraft::JSON->new(pretty=>1,%options,layout=>$cb)->encode($data) };
+   my $text_of=sub { my $t=shift; chomp $t; $t };
+   my @data=(
+      {a=>[1,2],b=>{c=>3,d=>[4,5]},e=>[map "item$_",1..20]},
+      [[1,[2,3]],{}], [{a=>1},{b=>2}], {k=>'x' x 90,j=>[1,{q=>'y' x 80}]}, [], 5,
+      [map [map "v$_",1..12],1..3],
+   );
+   my $calls=0;
+   for my $wrap (79,30,0) {
+      for my $data (@data) {
+         my $plain=JGraft::JSON->new(pretty=>1,wrap=>$wrap)->encode($data);
+         is($enc->($data,sub { ++$calls },wrap=>$wrap),$plain,"callback changing nothing, wrap $wrap");
+         is($enc->($data,sub { $_[0]->prefix; $_[0]->layout; $_[0]->emit; $_[0]->suffix },wrap=>$wrap),$plain,
+            "reading every attribute, wrap $wrap");
+      }
+   }
+   ok($calls>100,'callback was called');
+   is($enc->($data[0],sub { 1 },pretty=>0),$strict->encode($data[0]),'compact output is unchanged');
+   is(JGraft::JSON->new(layout=>sub { 1 })->layout(undef)->encode([1,[2]]),'[1,[2]]','layout accessor');
+   like(dies { JGraft::JSON->new(layout=>1) },qr/layout must be a code reference/,'layout option is validated');
+
+   my @seen;
+   $enc->({a=>[10,{b=>undef}],c=>'s'},sub {
+      my $c=shift;
+      push @seen,join(':',$c->depth,map(defined($_)? $_ : '-',$c->idx,$c->name),ref($_) || (defined($_)? $_ : 'null'),
+         $c->parent? ref($c->parent->value) : 'root',defined($c->state)? $c->state : '-');
+      $c->state($c->depth) if ref;
+   });
+   is(\@seen,['0:-:-:HASH:root:-','1:0:a:ARRAY:HASH:0','2:0:-:10:ARRAY:1','2:1:-:HASH:ARRAY:1','3:0:b:null:HASH:2',
+      '1:1:c:s:HASH:0'],'document order, $_, position, and inherited state');
+   my $tree=[1,[2,3,[4]],{a=>5}];
+   $calls=0;
+   is($enc->($tree,sub { ++$calls; $_[0]->callback(undef) if $_[0]->depth==1 }),JGraft::JSON->new(pretty=>1)->encode($tree),'removing the callback keeps the default output');
+   is($calls,4,'and stops calls beneath a node');
+   my (@outer,@inner);
+   my $inner=sub { push @inner,$_[0]->depth; $_[0]->layout('stack') if ref($_) eq 'ARRAY' };
+   my $outer; $outer=sub {
+      my $c=shift;
+      push @outer,$c->depth;
+      ref($c->callback) eq 'CODE' or die 'callback not inherited';
+      $c->callback($inner) if defined($c->name) && $c->name eq 'in';
+   };
+   is($enc->({a=>[1,2],in=>{x=>[1,2]}},$outer),qq|{\n  "a": [1, 2],\n  "in": {\n    "x": [\n      1,\n      2\n    ]\n  }\n}|,'a subtree can have its own callback');
+   is([\@outer,\@inner],[[0,1,2,2,1],[2,3,3]],'which replaces the inherited one beneath the node');
+   like(dies { $enc->([1],sub { $_[0]->callback(1) }) },qr/callback must be/,'invalid callback rejected');
+   like(dies { $enc->([1],sub { $_[0]->parent->callback(undef) if $_[0]->parent }) },qr/Cannot change callback/,
+      'callback of a visited node is locked');
+   $calls=0;
+   $enc->($tree,sub { ++$calls; $_[0]->leaves(0) unless $_[0]->depth });
+   is($calls,4,'leaves(0) skips scalars');
+
+   # Operation-style layout: a head beside the bracket, pairs, and a tail
+   my $local=["LOCAL","x",1,"y",["ADD",["TEMP","x"],2],["ADD",["TEMP","x"],["TEMP","y"]]];
+   my $ops=sub {
+      my $c=shift;
+      my $p=$c->parent;
+      if ($p && ref($p->value) eq 'ARRAY') {
+         if ($c->idx==0) { $c->prefix('') }
+         elsif ($p->state eq 'pairs' && $p->layout ne 'fit') {
+            $c->prefix($c->idx%2 || $c->idx==$#{$p->value}? "\n" : ' ');
+         }
+      }
+      return unless ref eq 'ARRAY';
+      $c->state($_->[0] eq 'LOCAL'? 'pairs' : 'op');
+      $c->layout('wrap');
+      $c->layout('fill') if grep ref eq 'ARRAY' && @$_>2,@$_;
+   };
+   is($enc->($local,$ops),$text_of->(<<'END'),'head, pairs, and tail from prefixes');
+["LOCAL",
+  "x", 1,
+  "y", ["ADD", ["TEMP", "x"], 2],
+  ["ADD", ["TEMP", "x"], ["TEMP", "y"]]
+]
+END
+   is($enc->({lit=>[[{a=>1,b=>[1,2]},"two",[3,4]]]},sub {
+      my $c=shift;
+      if (ref eq 'ARRAY' && @$_==1 && ref $_->[0] eq 'ARRAY') { $c->layout('fit')->state('hug') }
+      elsif (($c->state || '') eq 'hug') { $c->state(undef)->layout('stack') }
+   }),$text_of->(<<'END'),'fit around a stacked member hugs its brackets');
+{
+  "lit": [[
+    {
+      "a": 1,
+      "b": [1, 2]
+    },
+    "two",
+    [3, 4]
+  ]]
+}
+END
+   my $nested=[map [$_,$_+1],1..8];
+   is($enc->($nested,sub { $_[0]->layout('wrap') if ref },wrap=>50),
+      "[[1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7],\n  [7, 8], [8, 9]\n]",'wrap packs members the default would stack');
+   is($enc->([[1,2],[3,4]],sub { $_[0]->layout('wrap') if ref }),'[[1, 2], [3, 4]]','wrap stays on one line when it fits');
+   is($enc->($nested,sub { my $c=shift; $c->layout('stack') if ref && $c->layout('wrap')->layout eq 'fill' },wrap=>50),
+      "[\n".join(",\n",map "  [$_, ".($_+1)."]",1..8)."\n]",'reading a wrap layout resolves it');
+   is($enc->([1..7],sub { my $c=shift; $c->layout('fit') unless $c->parent; $c->suffix("\n") if $c->depth && $c->idx%2 }),
+      "[1, 2,\n  3, 4,\n  5, 6,\n  7]",'a newline suffix is completed with the indent');
+   is($enc->($local,sub { my $c=shift; $c->layout('stack') unless $c->parent; $c->callback(undef)->suffix('') if $c->depth==1 && $c->idx==5 }) =~ /\]\]\z/? 1 : 0,
+      1,'the last suffix places the closing bracket');
+   is($enc->([1,[2,3],{a=>4}],sub { my $c=shift; $c->prefix(' ') if $c->depth==1 && $c->idx; $c->layout('stack') if ref eq 'HASH' },pretty=>0),
+      "[1, [2, 3], {\n  \"a\": 4\n}]",'attributes apply without pretty');
+
+   is($enc->($local,sub { ref($_)? $_[0]->layout('wrap') : $_ eq 'ADD' && $_[0]->emit(74) },wrap=>0),
+      '["LOCAL", "x", 1, "y", [74, ["TEMP", "x"], 2], [74, ["TEMP", "x"], ["TEMP", "y"]]]','emit replaces a scalar');
+   $calls=0;
+   is($enc->({k=>[1,2]},sub { my $c=shift; ++$calls; if (ref eq 'ARRAY') { (my $text=$c->emit) =~ tr/[]/()/; $c->emit($text) } }),
+      "{\n  \"k\": (1, 2)\n}",'a built emit can be edited');
+   is($calls,4,'members were visited once while building it');
+   is($enc->([[1,2,3]],sub { my $c=shift; if (ref && $c->depth) { $c->emit; $c->layout('stack')->emit(undef) } }),
+      "[\n  [\n    1,\n    2,\n    3\n  ]\n]",'a built emit can be discarded');
+   is($enc->({a=>{b=>[1]}},sub { my $c=shift; $c->emit(length $c->indent) unless ref }),'{"a": {"b": [2]}}','indent is relative to the line');
+   is($enc->({a=>{b=>[1]}},sub { my $c=shift; ref($_)? $c->layout('stack') : $c->emit(length $c->indent) }),
+      "{\n  \"a\": {\n    \"b\": [\n      6\n    ]\n  }\n}",'indent of a nested member');
+
+   like(dies { $enc->([1],sub { $_[0]->parent->prefix(' ') if $_[0]->parent }) },qr/Cannot change prefix: .*already been written/,
+      'a written prefix is locked');
+   like(dies { $enc->([1],sub { $_[0]->parent->layout('stack') if $_[0]->parent }) },qr/Cannot change layout/,'a used layout is locked');
+   is($enc->([1,[2]],sub { $_[0]->parent->suffix(' ') if $_[0]->parent }),'[1, [2] ] ','a suffix stays open to descendants');
+   my ($first,@late);
+   $enc->([1,2],sub {
+      my $c=shift;
+      return unless $c->depth;
+      if ($c->idx) { push @late,dies { $first->suffix(' ') } } else { $first=$c }
+   });
+   like($late[0],qr/Cannot change suffix/,'a finished node is locked');
+   like(dies { $enc->([1],sub { $_[0]->layout('bogus') }) },qr/layout must be/,'layout values are validated');
+
+   # Comments and retained layout
+   is($enc->({a=>1,b=>[1,2],c=>3},sub {
+      my $c=shift;
+      my $name=defined($c->name)? $c->name : '';
+      $c->comments(before=>['// lead']) if $name eq 'b';
+      $c->comments(after=>['/* t */']) if !ref && $_ eq '1';
+      $c->comments(after=>['// end']) if $name eq 'c';
+   },comments=>1),$text_of->(<<'END'),'assigned comments');
+{
+  "a": 1, /* t */
+  // lead
+  "b": [1, /* t */ 2],
+  "c": 3 // end
+}
+END
+   is($enc->([1],sub { $_[0]->comments(after=>['// x']) }),'[1]','comments need the comments option');
+   like(dies { $enc->([1],sub { $_[0]->comments(before=>['nope']) }) },qr/complete \/\/ or/,'comment text is validated');
+   like(dies { $enc->([1],sub { $_[0]->comments(open=>[]) }) },qr/cannot be assigned/,'only before and after can be assigned');
+
+   my $text="// top\n{\n  // about a\n  a: 1, // trailing a\n  b: [1, 2,\n      3], /* open */\n  c: {/* in */ x:1 /* out */}\n}\n";
+   my $doc=$full->decode($text);
+   my $codec=JGraft::JSON->new(json5=>1,comments=>1,preserve_whitespace=>1);
+   my %read;
+   $codec->layout(sub {
+      my $c=shift;
+      my $id=join '.',map defined($_)? $_ : '',$c->depth,defined($c->name)? $c->name : $c->idx;
+      $read{$id}=[$c->prefix,$c->suffix,$c->layout,map [$c->comments($_)],qw(before after open close)];
+   });
+   is($codec->encode($doc),$text,'reading attributes keeps retained layout');
+   is($read{'1.a'},["\n  ",'',undef,['// about a'],['// trailing a'],[],[]],'retained member whitespace and comments');
+   is($read{'1.b'},["\n  ",'','stack',[],['/* open */'],[],[]],'retained multi-line container');
+   is($read{'2.2'},["\n      ",'',undef,[],[],[],[]],'retained continuation indent');
+   is($read{'1.c'},["\n  ","\n",'fit',[],[],['/* in */'],[]],'retained closing whitespace and inner comments');
+   is($read{'2.x'}[4],['/* out */'],'a comment after the last member belongs to it');
+   $codec->layout(sub {
+      my $c=shift;
+      my $name=defined($c->name)? $c->name : '';
+      $c->layout('fit') if $name eq 'b';
+      $c->prefix("\n\n") if $name eq 'c';
+      $c->comments(before=>['/* new */'])->comments(after=>[]) if $name eq 'a';
+      $c->emit(2) if $name eq 'x';
+   });
+   is($codec->encode($doc),"// top\n{\n  /* new */\n  a: 1,\n  b: [1, 2, 3], /* open */\n\n  c: {/* in */ x:2 /* out */}\n}\n",
+      'assigned attributes override retained layout');
+   $calls=0;
+   $codec->layout(sub { ++$calls; $_[0]->callback(undef) });
+   is($codec->encode($doc),$text,'a root without a callback beneath it is copied verbatim');
+   is($calls,1,'without further calls');
+};
+
+subtest 'sortkeys' => sub {
+   my $data={b=>1,a=>[1,2],c=>{z=>1,y=>2},id=>7};
+   is(JGraft::JSON->new->encode($data),'{"a":[1,2],"b":1,"c":{"y":2,"z":1},"id":7}','default order of untied hashes');
+   is(JGraft::JSON->new(sortkeys=>['id','c'])->encode($data),'{"id":7,"c":{"y":2,"z":1},"a":[1,2],"b":1}',
+      'listed keys first, in list order, at every level');
+   # The comparator finds $a and $b in the package it was compiled in.
+   my $reverse=sub { $b cmp $a };
+   my $other=eval 'package Local::Elsewhere; sub { length($a) <=> length($b) or $a cmp $b }' or die $@;
+   is(JGraft::JSON->new(sortkeys=>$reverse)->encode($data),'{"id":7,"c":{"z":1,"y":2},"b":1,"a":[1,2]}','comparator');
+   is(JGraft::JSON->new->sortkeys($other)->encode($data),'{"a":[1,2],"b":1,"c":{"y":2,"z":1},"id":7}',
+      'comparator from another package');
+   is(JGraft::JSON->new(pretty=>1,wrap=>20,sortkeys=>$reverse)->encode($data),
+      qq|{\n  "id": 7,\n  "c": {"z": 1, "y": 2},\n  "b": 1,\n  "a": [1, 2]\n}|,'pretty output');
+   my $codec=JGraft::JSON->new(sortkeys=>$reverse);
+   is($codec->sortkeys(undef)->encode($data),JGraft::JSON->new->encode($data),'undef restores the default');
+   like(dies { JGraft::JSON->new(sortkeys=>1) },qr/sortkeys must be/,'invalid sortkeys rejected');
+
+   my $text="{ b: 1, // bee\n  a: [1, 2],\n  a: 3, c: {y:1, x:2} }\n";
+   my $doc=$full->decode($text);
+   is($full->encode($doc),$text,'decoded objects keep their order by default');
+   my $sorted=JGraft::JSON->new(json5=>1,comments=>1,preserve_whitespace=>1,sortkeys=>['c']);
+   is($sorted->encode($doc),"{ c: {x:2, y:1},\n  a: [1, 2],\n  a: 3,\n  b: 1 // bee\n  }\n",
+      'decoded objects are sorted on request, keeping duplicates and attached layout');
+   is(JGraft::JSON->new(sortkeys=>['c'])->encode($doc),'{"c":{"x":2,"y":1},"a":[1,2],"a":3,"b":1}','and in compact output');
+
+   my @seen;
+   my $cb=sub {
+      my $c=shift;
+      push @seen,ref($c->sortkeys) if $c->depth == 2;
+      $c->sortkeys($reverse) if defined($c->name) && $c->name eq 'c';
+      $c->sortkeys(undef) if defined($c->name) && $c->name eq 'n';
+   };
+   my $nested={c=>{b=>1,a=>{y=>1,x=>2},n=>{q=>1,p=>2}},a=>{y=>1,x=>2}};
+   is(JGraft::JSON->new(layout=>$cb,sortkeys=>['y'])->encode($nested),
+      '{"a":{"y":1,"x":2},"c":{"n":{"p":2,"q":1},"b":1,"a":{"y":1,"x":2}}}','the cursor overrides it for a subtree');
+   is([sort @seen],[qw(ARRAY ARRAY CODE CODE CODE)],'and descendants read the inherited value');
+   is(JGraft::JSON->new(pretty=>1,layout=>$cb,sortkeys=>['y'])->encode($nested),
+      qq|{\n  "a": {"y": 1, "x": 2},\n  "c": {\n    "n": {"p": 2, "q": 1},\n    "b": 1,\n    "a": {"y": 1, "x": 2}\n  }\n}|,'also when pretty');
+   is(JGraft::JSON->new(pretty=>1,layout=>sub { $cb->($_[0]); $_[0]->callback(undef) if $_[0]->depth == 1 },sortkeys=>['y'])->encode($nested),
+      qq|{\n  "a": {"y": 1, "x": 2},\n  "c": {\n    "n": {"q": 1, "p": 2},\n    "b": 1,\n    "a": {"y": 1, "x": 2}\n  }\n}|,'and beneath a node whose callback was removed');
+   like(dies { JGraft::JSON->new(layout=>sub { $_[0]->sortkeys({}) })->encode({}) },qr/sortkeys must be/,
+      'invalid cursor sortkeys rejected');
+};
+
+subtest 'omitting nodes' => sub {
+   my $data={k=>[1,2,3],h=>{k1=>1,k2=>2,k3=>3}};
+   my %expect=(
+      '1'=>['{"h":{"k2":2,"k3":3},"k":[2,3]}',qq|{\n  "h": {"k2": 2, "k3": 3},\n  "k": [2, 3]\n}|],
+      '3'=>['{"h":{"k1":1,"k2":2},"k":[1,2]}',qq|{\n  "h": {"k1": 1, "k2": 2},\n  "k": [1, 2]\n}|],
+      '2'=>['{"h":{"k1":1,"k3":3},"k":[1,3]}',qq|{\n  "h": {"k1": 1, "k3": 3},\n  "k": [1, 3]\n}|],
+      '12'=>['{"h":{"k3":3},"k":[3]}',qq|{\n  "h": {"k3": 3},\n  "k": [3]\n}|],
+      '23'=>['{"h":{"k1":1},"k":[1]}',qq|{\n  "h": {"k1": 1},\n  "k": [1]\n}|],
+      '123'=>['{"h":{},"k":[]}',qq|{\n  "h": {},\n  "k": []\n}|],
+   );
+   for my $omit (sort keys %expect) {
+      my $cb=sub { $_[0]->emit('') if !ref($_) && index($omit,$_) >= 0 };
+      is(JGraft::JSON->new(layout=>$cb)->encode($data),$expect{$omit}[0],"omit $omit");
+      is(JGraft::JSON->new(layout=>$cb,pretty=>1,wrap=>12)->encode($data),$expect{$omit}[1],"omit $omit, pretty");
+   }
+   my $stack=sub { $_[0]->layout('stack') if ref($_) eq 'ARRAY'; $_[0]->emit('') if !ref($_) && $_ > 1 };
+   is(JGraft::JSON->new(layout=>$stack,pretty=>1)->encode([1,2,3]),"[\n  1\n]",'closing whitespace follows omitted members');
+   is(JGraft::JSON->new(layout=>sub { $_[0]->emit('') if ref($_) eq 'ARRAY' })->encode({a=>[1],b=>2}),'{"b":2}',
+      'an omitted container is not visited');
+
+   my $text="{ b: 1, // bee\n  a: 3,\n  c: {y:1, x:2} }\n";
+   my $doc=$full->decode($text);
+   my $codec=JGraft::JSON->new(json5=>1,comments=>1,preserve_whitespace=>1);
+   my $names=sub { my $re=shift; sub { $_[0]->emit('') if defined($_[0]->name) && $_[0]->name =~ $re } };
+   is($codec->layout($names->(qr/^[bx]/))->encode($doc),"{ a: 3,\n  c: {y:1} }\n",'first member of a retained layout');
+   is($codec->layout($names->(qr/^[cy]/))->encode($doc),"{ b: 1, // bee\n  a: 3 }\n",'last member of a retained layout');
+   is($codec->layout($names->(qr/^a/))->encode($doc),"{ b: 1, // bee\n  c: {y:1, x:2} }\n",'middle member');
+   my $trailing=$codec->decode("[1, 2,]\n");
+   is($codec->layout(sub { $_[0]->emit('') if ($_[0]->idx || 0) == 1 })->encode($trailing),"[1,]\n",'a retained trailing comma stays');
+   my $reset=sub { my $c=shift; return if ref($_); $c->emit('')->emit(undef); $c->emit('') if $c->emit eq '2' };
+   is(JGraft::JSON->new(layout=>$reset)->encode([1,2,3]),'[1,3]','undef only discards the assignment');
+};
+
 done_testing;
