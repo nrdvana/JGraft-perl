@@ -84,9 +84,9 @@ no warnings 'recursion';
 BEGIN { require JGraft::Expr; }
 use Scalar::Util qw(refaddr reftype);
 #__p5.28__
-#__p5.8__
+#__p<5.28__
 #use B ();
-#__end__
+#__pEND__
 use JGraft::Util qw(:types type_mask is_expr is_integer);
 use JSON::PP ();
 
@@ -94,7 +94,7 @@ sub _is_regexp {
    my $value=shift;
 #__p5.28__
    return ref($value) && (reftype($value) || '') eq 'REGEXP';
-#__p5.8__
+#__p<5.28__
 #   return 0 unless ref $value;
 #   my $type=reftype($value) || '';
 #   return 1 if $type eq 'REGEXP';
@@ -105,7 +105,7 @@ sub _is_regexp {
 #      return 1 if $magic->TYPE eq 'r';
 #   }
 #   return 0;
-#__end__
+#__pEND__
 }
 {
    no warnings 'redefine';
@@ -352,14 +352,14 @@ sub _regexp_invlist {
    require re;
 #__p5.28__
    my ($source,$modifiers)=re::regexp_pattern($regexp);
-#__p5.8__
+#__p<5.28__
 #   my ($source,$modifiers);
 #   if (re->can('regexp_pattern')) { ($source,$modifiers)=re::regexp_pattern($regexp) }
 #   else {
 #      "$regexp" =~ /\A\(\?([a-z]*)(?:-[a-z]*)?:(.*)\)\z/s or die 'Cannot read regexp wrapper';
 #      ($source,$modifiers)=($2,$1);
 #   }
-#__end__
+#__pEND__
    my %flags;
    ++$flags{$_} for split //,$modifiers;
    local $_=$source;
@@ -377,9 +377,9 @@ sub _regexp_invlist {
    # over one Unicode character at a time, including full casefold exceptions.
 #__p5.28__
    return _enumerate($regexp) if $modifiers =~ /[ial]/;
-#__p5.8__
+#__p<5.28__
 #   return _enumerate($regexp) if $modifiers =~ /[ial]/ || $parsed->{native};
-#__end__
+#__pEND__
    my @pairs=map [$_,$_],@{$parsed->{codepoints} || []};
    my $ranges=$parsed->{codepoint_ranges} || [];
    for (my $i=0;$i<@$ranges;$i+=2) { push @pairs,[@$ranges[$i,$i+1]] }
@@ -399,10 +399,10 @@ sub _escape {
    return $simple{$ch} if exists $simple{$ch};
    if ($ch =~ /[dDsSwWhHvV]/) {
 #__p5.28__
-#__p5.8__
+#__p<5.28__
 #      $parsed->{native}=1 if $]<5.018;
 #      return ord($ch) if $]<5.010 && $ch =~ /[hHvV]/;
-#__end__
+#__pEND__
       my %class=(d=>'Digit',s=>'Space',w=>'Word',h=>'HorizSpace',v=>'VertSpace');
       push @{$parsed->{classes}},($ch eq lc($ch)?'':'^').$class{lc $ch};
       return;
@@ -411,9 +411,9 @@ sub _escape {
       # Old Perls can resolve even built-in-looking property names through
       # caller-package functions. The original compiled regexp owns that scope.
 #__p5.28__
-#__p5.8__
+#__p<5.28__
 #      $parsed->{native}=1 if $]<5.018;
-#__end__
+#__pEND__
       /\G(?:\{([^}]+)\}|([A-Za-z]))/gc or die 'Invalid property escape '._context();
       my $name=defined($1)?$1:$2;
       $name =~ s/^\^// and $ch=$ch eq 'p'?'P':'p';
@@ -471,9 +471,9 @@ sub _parse_charset {
          }
          elsif ($token eq '[:') {
 #__p5.28__
-#__p5.8__
+#__p<5.28__
 #            $parse{native}=1 if $]<5.018;
-#__end__
+#__pEND__
             /\G([^:]+):\]/gc or die 'Invalid POSIX character class '._context();
             my $name=$1;
             my $negative=$name =~ s/^\^//;
@@ -505,9 +505,9 @@ sub _class_invlist {
    require Unicode::UCD;
 #__p5.28__
    my $count=Unicode::UCD::prop_invlist($name);
-#__p5.8__
+#__p<5.28__
 #   my $count=Unicode::UCD->can('prop_invlist')? Unicode::UCD::prop_invlist($name) : undef;
-#__end__
+#__pEND__
    if (defined $count) {
       my @native=Unicode::UCD::prop_invlist($name);
       my @pairs;

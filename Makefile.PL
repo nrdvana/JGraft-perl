@@ -8,7 +8,7 @@ use warnings;
 use 5.008009;
 use ExtUtils::MakeMaker '7.70';
 
-require './maint/JGraftBuild.pm';
+require './inc/ExtUtils/PerlVersionFilter.pm';
 
 my %WriteMakefileArgs = (
   "ABSTRACT" => "Apply or create structural diffs between trees of data",
@@ -71,7 +71,7 @@ my %WriteMakefileArgs = (
 
 %WriteMakefileArgs = (
     %WriteMakefileArgs,
-    JGraftBuild::makefile_args(),
+    ExtUtils::PerlVersionFilter::makefile_args(),
 );
 
 my %FallbackPrereqs = (

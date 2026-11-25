@@ -267,10 +267,10 @@ Round decimal numbers and strings
 #__p5.28__
 use v5.28;
 use experimental 'signatures';
-#__p5.8__
+#__p<5.28__
 #use strict;
 #use warnings;
-#__end__
+#__pEND__
 use Carp;
 use JGraft::Util qw(:types is_expr type_mask invalid_graft);
 require JGraft::Op;
@@ -377,11 +377,11 @@ context, recursively inflating expressions and unescaping literal arrays.
 
 #__p5.28__
 sub new_from_json_data($class, $in) {
-#__p5.8__
+#__p<5.28__
 #sub new_from_json_data {
 #   my ($class, $in)= @_;
 #   croak "Expected one argument" unless @_ == 2;
-#__end__
+#__pEND__
    local $JGraft::Util::_construction_context={class=>$class,method=>'new_from_json_data',
       parent=>$JGraft::Util::_construction_context};
    ref $in eq 'ARRAY' && @$in

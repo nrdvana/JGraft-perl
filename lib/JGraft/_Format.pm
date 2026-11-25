@@ -56,9 +56,9 @@ sub _tag {
    # Registry lookups can add string flags to cached IDs on old interpreters.
 #__p5.28__
    $data->[0]=$self->{options}{ids}? $node->id : $node->name;
-#__p5.8__
+#__p<5.28__
 #   $data->[0]=$self->{options}{ids}? 0+$node->id : $node->name;
-#__end__
+#__pEND__
    my $form=ref($node)? $node->{_form} : $node->forms->[0];
    my @groups;
    my $i=1;
